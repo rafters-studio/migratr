@@ -1,0 +1,11 @@
+[package]
+name = "migratr-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "migratr"
+path = "src/main.rs"
+
+[dependencies]
+migratr.workspace = true
