@@ -1,0 +1,11 @@
+[package]
+name = "sqlx-coexist"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+migratr = { path = "../../../crates/migratr", default-features = false }
+sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio"] }
+
+[workspace]

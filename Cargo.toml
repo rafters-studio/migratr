@@ -1,6 +1,13 @@
-[package]
-name = "migratr"
+[workspace]
+resolver = "3"
+members = ["crates/migratr", "crates/migratr-cli", "crates/migratr-oracle"]
+exclude = ["tests/fixtures/sqlx-coexist"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[workspace.dependencies]
+migratr = { path = "crates/migratr" }
+rusqlite = { version = "0.40", features = ["bundled"] }
+thiserror = "2"

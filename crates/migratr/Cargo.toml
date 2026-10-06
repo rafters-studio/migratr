@@ -1,0 +1,12 @@
+[package]
+name = "migratr"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["rusqlite"]
+rusqlite = ["dep:rusqlite"]
+
+[dependencies]
+rusqlite = { workspace = true, optional = true }
+thiserror.workspace = true

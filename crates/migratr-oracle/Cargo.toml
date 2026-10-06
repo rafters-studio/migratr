@@ -1,0 +1,5 @@
+[package]
+name = "migratr-oracle"
+version.workspace = true
+edition.workspace = true
+publish = false
