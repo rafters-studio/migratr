@@ -82,8 +82,11 @@ pub struct IndexDef {
 }
 
 /// One schema operation.
+///
+/// Serde represents it externally tagged (`{"add_column": {...}}`); a migration file
+/// writes the tag as an `op` field instead, and the loader converts between the two.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Op {
     CreateTable {
         table: String,
@@ -201,11 +204,17 @@ pub fn load_dir(path: &Path) -> Result<Vec<Migration>, MigrateError> {
 
     found.sort_by(|a, b| (a.1.version, &a.0).cmp(&(b.1.version, &b.0)));
 
-    if let Some(pair) = found.windows(2).find(|w| w[0].1.version == w[1].1.version) {
-        return Err(MigrateError::DuplicateVersion {
-            version: pair[0].1.version,
-            files: vec![pair[0].0.clone(), pair[1].0.clone()],
-        });
+    if let Some(first) = found
+        .windows(2)
+        .position(|w| w[0].1.version == w[1].1.version)
+    {
+        let version = found[first].1.version;
+        let files = found[first..]
+            .iter()
+            .take_while(|(_, m)| m.version == version)
+            .map(|(file, _)| file.clone())
+            .collect();
+        return Err(MigrateError::DuplicateVersion { version, files });
     }
 
     Ok(found.into_iter().map(|(_, m)| m).collect())
@@ -239,13 +248,27 @@ fn parse(file: &str, contents: &str) -> Result<Migration, MigrateError> {
         )
     })?;
 
-    let mut de = serde_json::Deserializer::from_str(contents);
-    let body: FileBody = serde_path_to_error::deserialize(&mut de).map_err(|e| {
-        let message = match op_name(contents, e.path()) {
+    let mut doc: serde_json::Value =
+        serde_json::from_str(contents).map_err(|e| parse_err(".", e.to_string()))?;
+    let tags = retag_ops(&mut doc).map_err(|(path, message)| parse_err(&path, message))?;
+    let body: FileBody = serde_path_to_error::deserialize(doc).map_err(|e| {
+        let segments: Vec<_> = e.path().iter().collect();
+        let tag = match segments.as_slice() {
+            [
+                Segment::Map { key },
+                Segment::Seq { index },
+                Segment::Map { key: op } | Segment::Enum { variant: op },
+                ..,
+            ] if key == "up" && tags.get(*index).and_then(Option::as_ref) == Some(op) => {
+                Some(op.as_str())
+            }
+            _ => None,
+        };
+        let message = match tag {
             Some(op) => format!("operation `{op}`: {}", e.inner()),
             None => e.inner().to_string(),
         };
-        parse_err(&e.path().to_string(), message)
+        parse_err(&render_path(&segments, tag.is_some()), message)
     })?;
 
     let canonical = serde_json::to_vec(&Canonical {
@@ -264,23 +287,53 @@ fn parse(file: &str, contents: &str) -> Result<Migration, MigrateError> {
     })
 }
 
-/// The `op` tag of the operation an error path points into, when it points into one.
-fn op_name(contents: &str, path: &serde_path_to_error::Path) -> Option<String> {
-    let mut segments = path.iter();
-    let (Some(Segment::Map { key }), Some(Segment::Seq { index })) =
-        (segments.next(), segments.next())
-    else {
-        return None;
+/// Rewrites each `{"op": "x", ...fields}` in `up` to the externally tagged
+/// `{"x": {...fields}}` serde reads, so error paths reach into the operation's fields.
+/// Returns each element's tag, or `None` for an element that is not an object.
+fn retag_ops(doc: &mut serde_json::Value) -> Result<Vec<Option<String>>, (String, String)> {
+    let Some(serde_json::Value::Array(ops)) = doc.get_mut("up") else {
+        return Ok(Vec::new());
     };
-    if key != "up" {
-        return None;
+    let mut tags = Vec::with_capacity(ops.len());
+    for (i, op) in ops.iter_mut().enumerate() {
+        let serde_json::Value::Object(fields) = op else {
+            tags.push(None);
+            continue;
+        };
+        let tag = match fields.remove("op") {
+            Some(serde_json::Value::String(tag)) => tag,
+            Some(_) => return Err((format!("up[{i}].op"), "`op` must be a string".to_string())),
+            None => return Err((format!("up[{i}]"), "missing field `op`".to_string())),
+        };
+        let mut wrapper = serde_json::Map::new();
+        wrapper.insert(
+            tag.clone(),
+            serde_json::Value::Object(std::mem::take(fields)),
+        );
+        *op = serde_json::Value::Object(wrapper);
+        tags.push(Some(tag));
     }
-    let doc: serde_json::Value = serde_json::from_str(contents).ok()?;
-    doc.get("up")?
-        .get(index)?
-        .get("op")?
-        .as_str()
-        .map(str::to_string)
+    Ok(tags)
+}
+
+/// Renders a path as `up[0].column.name`, leaving out the variant segment (the third)
+/// when `skip_tag` is set, since the file spells that tag as an `op` field.
+fn render_path(segments: &[&Segment], skip_tag: bool) -> String {
+    let mut out = String::new();
+    for (i, segment) in segments.iter().enumerate() {
+        match segment {
+            _ if skip_tag && i == 2 => {}
+            Segment::Seq { index } => out.push_str(&format!("[{index}]")),
+            Segment::Map { key } | Segment::Enum { variant: key } => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(key);
+            }
+            Segment::Unknown => out.push_str(".?"),
+        }
+    }
+    if out.is_empty() { ".".to_string() } else { out }
 }
 
 #[cfg(test)]
@@ -338,22 +391,53 @@ mod tests {
     }
 
     #[test]
-    fn unknown_field_is_refused_with_file_and_path() {
-        let (path, message) =
-            parse_err(r#"{"up": [{"op": "rename_table", "from": "a", "to": "b", "extra": 1}]}"#);
+    fn unknown_and_malformed_fields_are_refused_at_their_exact_path() {
+        let cases = [
+            (
+                r#"{"up": [{"op": "rename_table", "from": "a", "to": "b", "extra": 1}]}"#,
+                "up[0].extra",
+                "extra",
+            ),
+            (
+                r#"{"up": [{"op": "add_column", "table": "t", "column":
+                    {"name": "c", "type": "TEXT", "bogus": 1}}]}"#,
+                "up[0].column.bogus",
+                "bogus",
+            ),
+            (
+                r#"{"up": [{"op": "add_column", "table": "t", "column": {"name": "c"}}]}"#,
+                "up[0].column",
+                "type",
+            ),
+            (
+                r#"{"up": [{"op": "drop_table", "table": "t", "definition":
+                    {"name": "t", "columns": [], "sql": "x", "bogus": 1}}]}"#,
+                "up[0].definition.bogus",
+                "bogus",
+            ),
+            (
+                r#"{"up": [{"op": "create_table", "table": "t", "columns":
+                    [{"name": "c", "type": "TEXT", "primary_key": "x"}]}]}"#,
+                "up[0].columns[0].primary_key",
+                "primary_key",
+            ),
+            (r#"{"up": [], "author": "x"}"#, "author", "author"),
+        ];
+        for (contents, expected_path, expected_text) in cases {
+            let (path, message) = parse_err(contents);
+            assert_eq!(path, expected_path, "{message}");
+            assert!(
+                message.contains(expected_text) || path.contains(expected_text),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn operation_without_op_tag_is_refused() {
+        let (path, message) = parse_err(r#"{"up": [{"table": "t"}]}"#);
         assert_eq!(path, "up[0]");
-        assert!(message.contains("extra"), "{message}");
-
-        let (path, message) = parse_err(
-            r#"{"up": [{"op": "add_column", "table": "t", "column":
-                {"name": "c", "type": "TEXT", "bogus": 1}}]}"#,
-        );
-        assert!(path.starts_with("up[0]"), "{path}");
-        assert!(message.contains("bogus"), "{message}");
-
-        let (path, message) = parse_err(r#"{"up": [], "author": "x"}"#);
-        assert_eq!(path, "author");
-        assert!(message.contains("author"), "{message}");
+        assert!(message.contains("op"), "{message}");
     }
 
     #[test]
@@ -425,12 +509,21 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write(dir.path(), "20260101000000_a.json", r#"{"up": []}"#);
         write(dir.path(), "20260101000000_b.json", r#"{"up": []}"#);
+        write(dir.path(), "20260101000000_c.json", r#"{"up": []}"#);
+        write(dir.path(), "20260201000000_d.json", r#"{"up": []}"#);
 
         match load_dir(dir.path()) {
             Err(MigrateError::DuplicateVersion { version, mut files }) => {
                 files.sort();
                 assert_eq!(version, 20260101000000);
-                assert_eq!(files, ["20260101000000_a.json", "20260101000000_b.json"]);
+                assert_eq!(
+                    files,
+                    [
+                        "20260101000000_a.json",
+                        "20260101000000_b.json",
+                        "20260101000000_c.json"
+                    ]
+                );
             }
             other => panic!("expected duplicate version, got {other:?}"),
         }
