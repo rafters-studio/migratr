@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -184,7 +183,7 @@ pub fn load_dir(path: &Path) -> Result<Vec<Migration>, MigrateError> {
         source,
     };
 
-    let mut migrations = Vec::new();
+    let mut found: Vec<(String, Migration)> = Vec::new();
     for entry in fs::read_dir(path).map_err(io_err)? {
         let entry = entry.map_err(io_err)?;
         let file_path = entry.path();
@@ -196,27 +195,20 @@ pub fn load_dir(path: &Path) -> Result<Vec<Migration>, MigrateError> {
             path: file_path.clone(),
             source,
         })?;
-        migrations.push(parse(&file, &contents)?);
+        let migration = parse(&file, &contents)?;
+        found.push((file, migration));
     }
 
-    migrations.sort_by_key(|m| m.version);
+    found.sort_by(|a, b| (a.1.version, &a.0).cmp(&(b.1.version, &b.0)));
 
-    let mut by_version: BTreeMap<u64, Vec<String>> = BTreeMap::new();
-    for m in &migrations {
-        by_version
-            .entry(m.version)
-            .or_default()
-            .push(file_name(m.version, &m.name));
-    }
-    if let Some((version, files)) = by_version.into_iter().find(|(_, files)| files.len() > 1) {
-        return Err(MigrateError::DuplicateVersion { version, files });
+    if let Some(pair) = found.windows(2).find(|w| w[0].1.version == w[1].1.version) {
+        return Err(MigrateError::DuplicateVersion {
+            version: pair[0].1.version,
+            files: vec![pair[0].0.clone(), pair[1].0.clone()],
+        });
     }
 
-    Ok(migrations)
-}
-
-fn file_name(version: u64, name: &str) -> String {
-    format!("{version}_{name}.json")
+    Ok(found.into_iter().map(|(_, m)| m).collect())
 }
 
 /// Splits `<YYYYMMDDHHMMSS>_<snake_name>.json` into version and name.
