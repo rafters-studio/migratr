@@ -6,6 +6,8 @@ mod executor;
 mod ledger;
 mod migration;
 mod rebuild;
+mod scaffold;
+mod schema_file;
 mod snapshot;
 mod sql_ddl;
 mod up;
@@ -19,6 +21,8 @@ pub use executor::{
 pub use migration::{
     Column, ForeignKey, GeneratedColumn, IndexDef, MigrateError, Migration, Op, TableDef, load_dir,
 };
+pub use scaffold::scaffold;
+pub use schema_file::write_schema;
 pub use snapshot::RestoreReport;
 pub use up::{UpReport, up};
 
