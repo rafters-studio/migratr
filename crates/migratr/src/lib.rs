@@ -19,7 +19,7 @@ pub use executor::{
 pub use migration::{
     Column, ForeignKey, GeneratedColumn, IndexDef, MigrateError, Migration, Op, TableDef, load_dir,
 };
-pub use snapshot::{Direction, RestoreReport, is_destructive, snapshot};
+pub use snapshot::RestoreReport;
 pub use up::{UpReport, up};
 
 #[cfg(feature = "rusqlite")]

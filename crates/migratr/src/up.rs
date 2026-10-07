@@ -5,6 +5,7 @@ use crate::rebuild::{
     FK_VIOLATION_MESSAGE, TableChange, add_needs_rebuild, fk_check, needs_rebuild,
     rebuild_statements,
 };
+use crate::snapshot::{Direction, snapshot_before};
 use crate::sql_ddl::quote_ident as ident;
 
 /// What an `up` run applied.
@@ -39,6 +40,7 @@ pub fn up(
         apply(
             exec,
             migration.version,
+            Direction::Up,
             &migration.up,
             &[ledger::CREATE_LEDGER.to_string()],
             ledger::insert_row(migration),
@@ -53,6 +55,7 @@ pub fn up(
 pub(crate) fn apply(
     exec: &mut impl Executor,
     version: u64,
+    direction: Direction,
     ops: &[Op],
     prelude: &[String],
     record: String,
@@ -141,6 +144,7 @@ pub(crate) fn apply(
     statements.push(record);
     origins.push(None);
 
+    snapshot_before(exec, ops, version, direction)?;
     exec.run_atomic(&statements, has_rebuild)
         .map_err(|failure| {
             let violation = failure

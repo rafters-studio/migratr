@@ -12,7 +12,7 @@ const DEFAULT_KEEP: usize = 1;
 
 /// Which way a step runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
+pub(crate) enum Direction {
     Up,
     Down,
 }
@@ -69,7 +69,7 @@ impl fmt::Display for RestoreReport {
 }
 
 /// Whether running `ops` loses data: any drop, or raw SQL migratr cannot see into.
-pub fn is_destructive(ops: &[Op]) -> bool {
+pub(crate) fn is_destructive(ops: &[Op]) -> bool {
     ops.iter().any(|op| {
         matches!(
             op,
@@ -78,36 +78,37 @@ pub fn is_destructive(ops: &[Op]) -> bool {
     })
 }
 
-/// Writes a snapshot of the database before a destructive step, then deletes the oldest
-/// snapshots beyond the retention count. The step must not run when this fails.
-pub fn snapshot(
+/// Before a destructive step, has the executor write a snapshot named for the step, then
+/// deletes the oldest snapshots beyond the retention count. The step must not run when this
+/// fails. A step that is not destructive, or a database that needs no snapshot, passes.
+pub(crate) fn snapshot_before(
     exec: &mut impl Executor,
-    db_path: &Path,
+    ops: &[Op],
     version: u64,
     direction: Direction,
-) -> Result<PathBuf, MigrateError> {
-    let dir = snapshot_dir(db_path);
-    let target = dir.join(format!(
+) -> Result<(), MigrateError> {
+    if !is_destructive(ops) {
+        return Ok(());
+    }
+    let file_name = format!(
         "{}_{version}_{}.db",
         timestamp(SystemTime::now()),
         direction.as_str()
-    ));
-    let failed = |source: Box<dyn std::error::Error + Send + Sync>| MigrateError::SnapshotFailed {
-        path: target.clone(),
-        source,
+    );
+    let failed = |path: &Path, source: Box<dyn std::error::Error + Send + Sync>| {
+        MigrateError::SnapshotFailed {
+            path: path.to_path_buf(),
+            source,
+        }
     };
-
-    fs::create_dir_all(&dir).map_err(|e| failed(Box::new(e)))?;
-    let written = exec.snapshot(&target).map_err(|e| failed(Box::new(e)))?;
-    if !written {
-        return Err(failed(Box::new(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "this executor cannot write snapshots",
-        ))));
-    }
-
-    prune(&dir, &target, DEFAULT_KEEP)?;
-    Ok(target)
+    let written = exec
+        .snapshot(&file_name)
+        .map_err(|e| failed(Path::new(&file_name), Box::new(e)))?;
+    let Some(path) = written else {
+        return Ok(());
+    };
+    let dir = path.parent().unwrap_or(Path::new("."));
+    prune(dir, &path, DEFAULT_KEEP)
 }
 
 /// Replaces the database at `db_path` with a snapshot, the newest by default. The caller must
@@ -198,6 +199,7 @@ pub fn restore(
     Ok(report)
 }
 
+#[cfg(feature = "rusqlite")]
 fn snapshot_dir(db_path: &Path) -> PathBuf {
     let parent = match db_path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,

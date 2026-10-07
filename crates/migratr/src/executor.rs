@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::PathBuf;
 
 use thiserror::Error;
 
@@ -103,9 +103,11 @@ pub trait Executor {
         suspend_foreign_keys: bool,
     ) -> Result<(), AtomicError<Self::Error>>;
 
-    /// Write a consistent copy of the whole database to `path`.
-    /// Returns Ok(false) when this executor cannot write snapshots.
-    fn snapshot(&mut self, path: &Path) -> Result<bool, Self::Error>;
+    /// Write a consistent copy of the whole database named `file_name`, to a location the
+    /// executor chooses beside the database, and return its path. Returns `Ok(None)` when the
+    /// database is not durable and needs no snapshot. An executor that cannot snapshot a
+    /// durable database returns an error.
+    fn snapshot(&mut self, file_name: &str) -> Result<Option<PathBuf>, Self::Error>;
 }
 
 #[cfg(feature = "rusqlite")]
@@ -113,7 +115,7 @@ pub use rusqlite_executor::RusqliteExecutor;
 
 #[cfg(feature = "rusqlite")]
 mod rusqlite_executor {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use rusqlite::Connection;
 
@@ -272,12 +274,25 @@ mod rusqlite_executor {
             applied
         }
 
-        fn snapshot(&mut self, path: &Path) -> Result<bool, Self::Error> {
-            let target = path
+        fn snapshot(&mut self, file_name: &str) -> Result<Option<PathBuf>, Self::Error> {
+            let db_file = match self.conn.path() {
+                Some(path) if !path.is_empty() => Path::new(path),
+                _ => return Ok(None),
+            };
+            let dir = db_file
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+                .join(".migratr")
+                .join("snapshots");
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            let target = dir.join(file_name);
+            let target_str = target
                 .to_str()
-                .ok_or_else(|| rusqlite::Error::InvalidPath(path.to_path_buf()))?;
-            self.conn.execute("VACUUM INTO ?1", [target])?;
-            Ok(true)
+                .ok_or_else(|| rusqlite::Error::InvalidPath(target.clone()))?;
+            self.conn.execute("VACUUM INTO ?1", [target_str])?;
+            Ok(Some(target))
         }
     }
 
@@ -461,27 +476,39 @@ mod rusqlite_executor {
         }
 
         #[test]
-        fn snapshot_writes_a_consistent_copy() {
-            let dir = std::env::temp_dir().join(format!("migratr-snap-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).expect("mkdir");
-            let path = dir.join("copy.db");
-            let _ = std::fs::remove_file(&path);
-
-            let mut ex = executor();
+        fn snapshot_writes_a_consistent_copy_beside_a_file_database() {
+            let dir = tempfile::TempDir::new().expect("tmp");
+            let db = dir.path().join("app.db");
+            let mut ex = RusqliteExecutor::new(Connection::open(&db).expect("open"));
             ex.run_atomic(
                 &[s("CREATE TABLE a (x)"), s("INSERT INTO a VALUES (7)")],
                 false,
             )
             .expect("seed");
-            assert!(ex.snapshot(&path).expect("snapshot"));
 
+            let path = ex
+                .snapshot("copy.db")
+                .expect("snapshot")
+                .expect("a file database is durable");
+
+            // SQLite reports the database's resolved path, so compare resolved paths.
+            assert_eq!(
+                path.canonicalize().expect("snapshot exists"),
+                dir.path()
+                    .join(".migratr/snapshots/copy.db")
+                    .canonicalize()
+                    .expect("expected path exists")
+            );
             let copy = Connection::open(&path).expect("open copy");
             let x: i64 = copy
                 .query_row("SELECT x FROM a", [], |r| r.get(0))
                 .expect("read copy");
             assert_eq!(x, 7);
-            drop(copy);
-            std::fs::remove_dir_all(&dir).expect("cleanup");
+        }
+
+        #[test]
+        fn snapshot_of_an_in_memory_database_reports_none_needed() {
+            assert_eq!(executor().snapshot("copy.db").expect("snapshot"), None);
         }
     }
 }
