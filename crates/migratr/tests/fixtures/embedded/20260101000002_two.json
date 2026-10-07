@@ -1,0 +1,1 @@
+{"up": [{"op": "create_table", "table": "two", "columns": [{"name": "id", "type": "INTEGER", "primary_key": 1}]}]}

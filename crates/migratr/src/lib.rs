@@ -1,8 +1,10 @@
 //! Schema migrations for SQLite.
 
 mod down;
+mod embed;
 mod error;
 mod executor;
+mod format;
 mod ledger;
 mod migration;
 mod rebuild;
@@ -13,6 +15,7 @@ mod sql_ddl;
 mod up;
 
 pub use down::{DownReport, down};
+pub use embed::{MigrationStatus, Migrator};
 pub use error::Error;
 pub use executor::{
     AtomicError, ColumnInfo, Executor, ForeignKeyInfo, LedgerRow, SchemaObject, SchemaSnapshot,
@@ -21,6 +24,7 @@ pub use executor::{
 pub use migration::{
     Column, ForeignKey, GeneratedColumn, IndexDef, MigrateError, Migration, Op, TableDef, load_dir,
 };
+pub use migratr_macros::embed;
 pub use scaffold::scaffold;
 pub use schema_file::write_schema;
 pub use snapshot::RestoreReport;
