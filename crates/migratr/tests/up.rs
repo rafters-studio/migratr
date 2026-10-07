@@ -339,20 +339,23 @@ fn failure_at_every_statement_position_leaves_the_database_untouched() {
     // The ledger create, six operations, and the ledger insert.
     let statement_count = migrations[0].up.len() + 2;
 
-    // The statement each position holds. `None` marks the two ledger statements.
-    let expected: [Option<&str>; 8] = [
-        None,
-        Some(r#"CREATE TABLE "extra" ("id" INTEGER, PRIMARY KEY ("id"))"#),
-        Some(r#"ALTER TABLE "base" ADD COLUMN "note" TEXT"#),
-        Some("UPDATE base SET v = v + 1"),
-        Some(r#"CREATE INDEX "base_v" ON "base" ("v")"#),
-        Some(r#"ALTER TABLE "base" RENAME TO "renamed""#),
-        Some(r#"DROP TABLE "extra""#),
-        None,
+    // The exact statement at each position: ledger create, six operations, ledger insert.
+    let expected: [String; 8] = [
+        "CREATE TABLE IF NOT EXISTS _migratr_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL)".to_string(),
+        r#"CREATE TABLE "extra" ("id" INTEGER, PRIMARY KEY ("id"))"#.to_string(),
+        r#"ALTER TABLE "base" ADD COLUMN "note" TEXT"#.to_string(),
+        "UPDATE base SET v = v + 1".to_string(),
+        r#"CREATE INDEX "base_v" ON "base" ("v")"#.to_string(),
+        r#"ALTER TABLE "base" RENAME TO "renamed""#.to_string(),
+        r#"DROP TABLE "extra""#.to_string(),
+        format!(
+            "INSERT INTO _migratr_migrations (version, name, checksum, applied_at) VALUES (20260101000001, 'multi', '{}', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            migrations[0].checksum
+        ),
     ];
     assert_eq!(expected.len(), statement_count);
 
-    for fail_at in 0..statement_count {
+    for (fail_at, expected_statement) in expected.iter().enumerate() {
         let conn = Connection::open_in_memory().expect("open");
         conn.execute_batch(
             "CREATE TABLE base (id INTEGER PRIMARY KEY, v INTEGER);
@@ -367,15 +370,26 @@ fn failure_at_every_statement_position_leaves_the_database_untouched() {
 
         let err = up(&mut ex, &migrations, None).expect_err("injected failure");
 
-        assert!(
-            matches!(
-                err,
-                MigrateError::Apply {
-                    version: 20260101000001,
-                    ..
-                }
-            ),
-            "position {fail_at}: {err:?}"
+        let MigrateError::Apply {
+            version,
+            statement,
+            operation,
+            ..
+        } = err
+        else {
+            panic!("position {fail_at}: expected Apply, got {err:?}");
+        };
+        assert_eq!(version, 20260101000001, "position {fail_at}");
+        assert_eq!(
+            statement.as_deref(),
+            Some(expected_statement.as_str()),
+            "position {fail_at}"
+        );
+        let is_operation = (1..=6).contains(&fail_at);
+        assert_eq!(
+            operation,
+            is_operation.then(|| fail_at - 1),
+            "position {fail_at}"
         );
         assert_eq!(
             dump(ex.inner.connection()),
