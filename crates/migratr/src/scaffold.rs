@@ -107,20 +107,14 @@ fn operations(dir: &Path, name: &str, specs: &[String]) -> Result<Vec<Op>, Migra
         .strip_prefix("remove_")
         .and_then(|rest| rest.rsplit_once("_from_"))
         .filter(|(c, t)| !c.is_empty() && !t.is_empty());
-    if drop_table.is_none() && remove.is_none() {
-        if !specs.is_empty() {
-            return Err(spec_error(
-                &specs[0],
-                "column specs are only read by create_ and add_ names",
-            ));
-        }
-        return Ok(Vec::new());
-    }
     if let Some(spec) = specs.first() {
         return Err(spec_error(
             spec,
             "column specs are only read by create_ and add_ names",
         ));
+    }
+    if drop_table.is_none() && remove.is_none() {
+        return Ok(Vec::new());
     }
 
     let schema = schema_file::load(dir)?;
@@ -186,17 +180,11 @@ fn parse_specs(name: &str, specs: &[String]) -> Result<Vec<Column>, MigrateError
         .collect()
 }
 
-/// One `name[:type][:modifier...]` column spec. Without a type the column is TEXT. A `pk`
-/// column is marked with position 1; the caller numbers a composite key.
-fn parse_spec(spec: &str) -> Result<Column, String> {
-    let mut parts = spec.split(':');
-    let name = parts.next().unwrap_or_default();
-    if name.is_empty() {
-        return Err("column spec has no name".to_string());
-    }
-    let mut column = Column {
+/// A column with a name and type and no constraints.
+fn bare_column(name: &str, type_name: &str) -> Column {
+    Column {
         name: name.to_string(),
-        type_name: "TEXT".to_string(),
+        type_name: type_name.to_string(),
         not_null: false,
         primary_key: None,
         unique: false,
@@ -205,7 +193,18 @@ fn parse_spec(spec: &str) -> Result<Column, String> {
         check: None,
         references: None,
         generated: None,
-    };
+    }
+}
+
+/// One `name[:type][:modifier...]` column spec. Without a type the column is TEXT. A `pk`
+/// column is marked with position 1; the caller numbers a composite key.
+fn parse_spec(spec: &str) -> Result<Column, String> {
+    let mut parts = spec.split(':');
+    let name = parts.next().unwrap_or_default();
+    if name.is_empty() {
+        return Err("column spec has no name".to_string());
+    }
+    let mut column = bare_column(name, "TEXT");
     for (i, part) in parts.enumerate() {
         match part {
             "pk" => column.primary_key = Some(1),
@@ -353,18 +352,7 @@ const CONSTRAINT_WORDS: [&str; 11] = [
 fn parse_column(item: &str) -> Option<Column> {
     let toks = tokens(item);
     let name = toks.first().filter(|t| t.kind != TokenKind::Punct)?;
-    let mut column = Column {
-        name: name.text.clone(),
-        type_name: String::new(),
-        not_null: false,
-        primary_key: None,
-        unique: false,
-        default: None,
-        collation: None,
-        check: None,
-        references: None,
-        generated: None,
-    };
+    let mut column = bare_column(&name.text, "");
 
     let type_end = toks[1..]
         .iter()
