@@ -185,8 +185,26 @@ pub enum MigrateError {
     #[error("cannot rebuild table {table}: its CREATE TABLE statement could not be parsed")]
     UnparseableTable { table: String },
 
-    #[error("rebuilding table {table} would leave {rows} rows violating foreign keys")]
+    #[error("table {table}: found {rows} rows violating foreign keys")]
     ForeignKeyViolation { table: String, rows: u64 },
+
+    #[error("cannot drop column {column} from table {table}: {object} uses it")]
+    ColumnInUse {
+        table: String,
+        column: String,
+        object: String,
+    },
+
+    #[error(
+        "migration {version}: cannot rebuild table {table}: operation {operation} earlier in \
+         the same migration changed objects the rebuild recreates in a way migratr does not \
+         track; move the rebuild into its own migration"
+    )]
+    UntrackedChange {
+        version: u64,
+        table: String,
+        operation: usize,
+    },
 
     #[error(transparent)]
     Executor(Box<dyn std::error::Error + Send + Sync>),

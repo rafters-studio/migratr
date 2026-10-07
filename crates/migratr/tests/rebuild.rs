@@ -217,60 +217,220 @@ fn foreign_keys_is_restored_to_its_prior_value_on_success() {
 #[test]
 fn a_failure_at_any_rebuild_statement_changes_nothing_and_restores_foreign_keys() {
     let (_dir, migrations) = migration(&drop_column("authors", "code"));
-    let mut fail_at = 0;
-    loop {
-        let mut ex = FailAt {
-            inner: seeded(LIBRARY),
-            fail_at,
-            statement_count: 0,
-        };
-        let before = dump(ex.inner.connection());
+    for prior in [true, false] {
+        let mut fail_at = 0;
+        loop {
+            let inner = seeded(LIBRARY);
+            inner
+                .connection()
+                .pragma_update(None, "foreign_keys", prior)
+                .expect("set fk");
+            let mut ex = FailAt {
+                inner,
+                fail_at,
+                statement_count: 0,
+            };
+            let before = dump(ex.inner.connection());
 
-        let err = up(&mut ex, &migrations, None).expect_err("injected failure");
+            let err = up(&mut ex, &migrations, None).expect_err("injected failure");
+
+            assert!(
+                matches!(err, MigrateError::Apply { .. }),
+                "position {fail_at}: {err:?}"
+            );
+            assert_eq!(
+                dump(ex.inner.connection()),
+                before,
+                "position {fail_at} changed the database"
+            );
+            assert_eq!(
+                foreign_keys(ex.inner.connection()),
+                prior,
+                "position {fail_at}"
+            );
+            assert_eq!(
+                query_i64(
+                    ex.inner.connection(),
+                    "SELECT count(*) FROM sqlite_temp_master"
+                ),
+                0,
+                "position {fail_at} left temporary objects"
+            );
+
+            fail_at += 1;
+            if fail_at == ex.statement_count {
+                break;
+            }
+        }
+        // The ledger create, the foreign-key baseline, the view drop, create, copy, drop,
+        // rename, one index, one view, three triggers, the foreign-key check, and the ledger
+        // insert.
+        assert_eq!(fail_at, 14);
+    }
+}
+
+const PARENTS_AND_KIDS: &str = "
+    CREATE TABLE parents (id INTEGER PRIMARY KEY, code TEXT UNIQUE);
+    CREATE TABLE kids (parent_id INTEGER REFERENCES parents (id));
+    INSERT INTO parents VALUES (1, 'a');
+    INSERT INTO kids VALUES (1);
+";
+
+#[test]
+fn an_orphaning_insert_in_the_same_migration_is_refused_and_leaves_the_database_unchanged() {
+    for prior in [true, false] {
+        let mut ex = seeded(PARENTS_AND_KIDS);
+        ex.connection()
+            .pragma_update(None, "foreign_keys", prior)
+            .expect("set fk");
+        let before = dump(ex.connection());
+        let (_dir, migrations) = migration(&format!(
+            r#"{{"op": "raw_sql", "up": "INSERT INTO kids VALUES (7), (8)"}}, {}"#,
+            drop_column("parents", "code")
+        ));
+
+        let err = up(&mut ex, &migrations, None).expect_err("violations");
 
         assert!(
-            matches!(err, MigrateError::Apply { .. }),
-            "position {fail_at}: {err:?}"
+            matches!(
+                err,
+                MigrateError::ForeignKeyViolation { ref table, rows: 2 } if table == "kids"
+            ),
+            "{err:?}"
         );
-        assert_eq!(
-            dump(ex.inner.connection()),
-            before,
-            "position {fail_at} changed the database"
-        );
-        assert!(foreign_keys(ex.inner.connection()), "position {fail_at}");
-
-        fail_at += 1;
-        if fail_at == ex.statement_count {
-            break;
-        }
+        assert_eq!(dump(ex.connection()), before);
+        assert_eq!(foreign_keys(ex.connection()), prior);
     }
-    // The ledger create, the view drop, create, copy, drop, rename, one index, one view,
-    // three triggers, the foreign-key check, and the ledger insert.
-    assert_eq!(fail_at, 13);
 }
 
 #[test]
-fn a_rebuild_that_breaks_foreign_keys_is_refused_with_the_row_count() {
-    let mut ex = seeded(
-        "CREATE TABLE parents (id INTEGER PRIMARY KEY, code TEXT UNIQUE);
-         CREATE TABLE kids (parent_id INTEGER REFERENCES parents (id));
-         INSERT INTO parents VALUES (1, 'a');
-         INSERT INTO kids VALUES (1), (7), (8);",
-    );
-    let before = dump(ex.connection());
+fn violations_that_existed_before_the_migration_do_not_block_it() {
+    let mut ex = seeded(PARENTS_AND_KIDS);
+    ex.connection()
+        .execute_batch("PRAGMA foreign_keys = OFF; INSERT INTO kids VALUES (7), (8); PRAGMA foreign_keys = ON;")
+        .expect("orphans");
     let (_dir, migrations) = migration(&drop_column("parents", "code"));
 
-    let err = up(&mut ex, &migrations, None).expect_err("violations");
+    up(&mut ex, &migrations, None).expect("up");
 
-    assert!(
-        matches!(
-            err,
-            MigrateError::ForeignKeyViolation { ref table, rows: 2 } if table == "parents"
+    assert_eq!(query_i64(ex.connection(), "SELECT count(*) FROM kids"), 3);
+    assert_eq!(
+        query_i64(
+            ex.connection(),
+            "SELECT count(*) FROM pragma_table_info('parents')"
         ),
-        "{err:?}"
+        1
     );
+}
+
+/// `gone` is UNIQUE, so only the rebuild can drop it.
+const GRAPH: &str = "
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, gone TEXT UNIQUE);
+    CREATE TABLE other (x);
+    CREATE TABLE log (x);
+    CREATE VIEW v1 AS SELECT id, name FROM t;
+    CREATE VIEW v2 AS SELECT name FROM v1;
+    CREATE TRIGGER on_other AFTER INSERT ON other BEGIN UPDATE t SET name = 'x'; END;
+    CREATE TRIGGER via_view AFTER INSERT ON log BEGIN INSERT INTO other SELECT name FROM v2; END;
+    INSERT INTO t (name) VALUES ('a');
+";
+
+#[test]
+fn views_over_views_and_triggers_on_other_tables_survive_the_rebuild() {
+    let mut ex = seeded(GRAPH);
+    let (_dir, migrations) = migration(&drop_column("t", "gone"));
+
+    up(&mut ex, &migrations, None).expect("up");
+
+    let conn = ex.connection();
+    conn.execute("INSERT INTO log VALUES (1)", [])
+        .expect("chain of triggers and views runs");
+    assert_eq!(query_i64(conn, "SELECT count(*) FROM other"), 1);
+    assert_eq!(
+        query_i64(conn, "SELECT count(*) FROM v2 WHERE name = 'x'"),
+        1
+    );
+}
+
+#[test]
+fn a_recreated_object_naming_the_dropped_column_is_refused_and_nothing_changes() {
+    let dependents = [
+        (
+            "CREATE TRIGGER tr AFTER UPDATE ON t BEGIN SELECT NEW.gone; END",
+            "tr",
+        ),
+        (
+            "CREATE TRIGGER tr AFTER UPDATE ON t WHEN NEW.gone > 0 BEGIN SELECT 1; END",
+            "tr",
+        ),
+        ("CREATE VIEW v AS SELECT gone FROM t", "v"),
+        (
+            "CREATE VIEW v AS SELECT id FROM t;
+             CREATE TRIGGER vt INSTEAD OF INSERT ON v BEGIN INSERT INTO t (gone) VALUES (1); END",
+            "vt",
+        ),
+    ];
+    for (dependent, object) in dependents {
+        let mut ex = seeded(&format!(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, gone TEXT UNIQUE); {dependent}"
+        ));
+        let before = dump(ex.connection());
+        let (_dir, migrations) = migration(&drop_column("t", "gone"));
+
+        let err = up(&mut ex, &migrations, None).expect_err(dependent);
+
+        assert!(
+            matches!(
+                err,
+                MigrateError::ColumnInUse { ref table, ref column, object: ref o }
+                    if table == "t" && column == "gone" && o == object
+            ),
+            "{dependent}: {err:?}"
+        );
+        assert_eq!(dump(ex.connection()), before, "{dependent}");
+    }
+}
+
+#[test]
+fn a_column_sqlite_can_drop_in_place_is_dropped_in_place() {
+    let mut ex = FailAt {
+        inner: seeded(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, plain TEXT, b TEXT);
+             CREATE TABLE after (x);
+             CREATE VIEW v AS SELECT id, b FROM t;",
+        ),
+        fail_at: usize::MAX,
+        statement_count: 0,
+    };
+    let at = |ex: &FailAt| {
+        query_i64(
+            ex.inner.connection(),
+            "SELECT rowid FROM sqlite_master WHERE name = 't'",
+        )
+    };
+    let position = at(&ex);
+    let (_dir, migrations) = migration(&drop_column("t", "plain"));
+
+    up(&mut ex, &migrations, None).expect("up");
+
+    // The ledger create, the drop, and the ledger insert: no rebuild, no foreign-key check.
+    assert_eq!(ex.statement_count, 3);
+    assert_eq!(at(&ex), position);
+}
+
+#[test]
+fn an_in_place_drop_that_a_view_or_trigger_depends_on_is_refused_by_sqlite() {
+    let mut ex = seeded(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, plain TEXT);
+         CREATE VIEW v AS SELECT plain FROM t;",
+    );
+    let before = dump(ex.connection());
+    let (_dir, migrations) = migration(&drop_column("t", "plain"));
+
+    let err = up(&mut ex, &migrations, None).expect_err("refused");
+
+    assert!(matches!(err, MigrateError::Apply { .. }), "{err:?}");
     assert_eq!(dump(ex.connection()), before);
-    assert!(foreign_keys(ex.connection()));
 }
 
 /// A real executor whose schema reads show `table` with a CREATE statement that does not
@@ -334,27 +494,32 @@ fn an_unparseable_create_table_is_refused_by_name_and_nothing_changes() {
     assert_eq!(dump(ex.inner.connection()), before);
 }
 
+fn columns(conn: &Connection, table: &str) -> Vec<String> {
+    conn.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("columns")
+}
+
 #[test]
-fn a_table_changed_earlier_in_the_migration_drops_in_place_without_losing_the_change() {
-    let mut ex = seeded("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT)");
+fn a_column_added_earlier_in_the_migration_is_in_the_rebuild() {
+    let mut ex = seeded(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, u TEXT UNIQUE, b TEXT);
+         INSERT INTO t VALUES (1, 'u', 'b');",
+    );
     let (_dir, migrations) = migration(&format!(
         r#"{{"op": "add_column", "table": "t", "column": {{"name": "c", "type": "TEXT"}}}},
            {{"op": "create_index", "name": "t_c", "table": "t", "columns": ["c"]}},
            {}"#,
-        drop_column("t", "a")
+        drop_column("t", "u")
     ));
 
     up(&mut ex, &migrations, None).expect("up");
 
     let conn = ex.connection();
-    let columns: Vec<String> = conn
-        .prepare("SELECT name FROM pragma_table_info('t')")
-        .expect("prepare")
-        .query_map([], |r| r.get(0))
-        .expect("query")
-        .collect::<Result<_, _>>()
-        .expect("columns");
-    assert_eq!(columns, ["id", "b", "c"]);
+    assert_eq!(columns(conn, "t"), ["id", "b", "c"]);
     assert_eq!(
         query_i64(
             conn,
@@ -362,6 +527,106 @@ fn a_table_changed_earlier_in_the_migration_drops_in_place_without_losing_the_ch
         ),
         1
     );
+    assert_eq!(query_i64(conn, "SELECT count(*) FROM t WHERE b = 'b'"), 1);
+}
+
+#[test]
+fn a_child_table_dropped_earlier_in_the_migration_is_not_checked_after() {
+    let mut ex = seeded(PARENTS_AND_KIDS);
+    let (_dir, migrations) = migration(&format!(
+        r#"{{"op": "drop_table", "table": "kids", "definition": {{"name": "kids", "columns": [], "sql": ""}}}},
+           {}"#,
+        drop_column("parents", "code")
+    ));
+
+    up(&mut ex, &migrations, None).expect("up");
+
+    assert_eq!(columns(ex.connection(), "parents"), ["id"]);
+    assert_eq!(
+        query_i64(
+            ex.connection(),
+            "SELECT count(*) FROM sqlite_master WHERE name = 'kids'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn a_renamed_table_and_column_are_rebuilt_under_their_new_names() {
+    let mut ex = seeded(
+        "CREATE TABLE parents (id INTEGER PRIMARY KEY, name TEXT, code TEXT UNIQUE);
+         CREATE TABLE kids (parent_id INTEGER REFERENCES parents (id) ON DELETE CASCADE);
+         CREATE INDEX parents_name ON parents (name);
+         INSERT INTO parents VALUES (1, 'a', 'x');
+         INSERT INTO kids VALUES (1);",
+    );
+    let (_dir, migrations) = migration(&format!(
+        r#"{{"op": "rename_table", "from": "parents", "to": "people"}},
+           {{"op": "rename_column", "table": "people", "from": "name", "to": "label"}},
+           {}"#,
+        drop_column("people", "code")
+    ));
+
+    up(&mut ex, &migrations, None).expect("up");
+
+    let conn = ex.connection();
+    assert_eq!(columns(conn, "people"), ["id", "label"]);
+    let index: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'parents_name'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("index");
+    assert!(
+        index.contains("people") && index.contains("label"),
+        "{index}"
+    );
+    conn.execute("DELETE FROM people WHERE id = 1", [])
+        .expect("delete");
+    assert_eq!(query_i64(conn, "SELECT count(*) FROM kids"), 0);
+}
+
+#[test]
+fn raw_sql_naming_the_table_before_a_rebuild_is_refused_and_nothing_changes() {
+    let mut ex = seeded(LIBRARY);
+    let before = dump(ex.connection());
+    let (_dir, migrations) = migration(&format!(
+        r#"{{"op": "raw_sql", "up": "CREATE VIEW late AS SELECT id FROM authors"}}, {}"#,
+        drop_column("authors", "code")
+    ));
+
+    let err = up(&mut ex, &migrations, None).expect_err("refused");
+
+    assert!(
+        matches!(
+            err,
+            MigrateError::UntrackedChange { ref table, operation: 0, .. } if table == "authors"
+        ),
+        "{err:?}"
+    );
+    assert_eq!(dump(ex.connection()), before);
+}
+
+#[test]
+fn a_view_that_an_earlier_rename_rewrote_blocks_the_rebuild() {
+    let mut ex = seeded(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, gone TEXT UNIQUE);
+         CREATE VIEW v AS SELECT name FROM t;",
+    );
+    let before = dump(ex.connection());
+    let (_dir, migrations) = migration(&format!(
+        r#"{{"op": "rename_column", "table": "t", "from": "name", "to": "label"}}, {}"#,
+        drop_column("t", "gone")
+    ));
+
+    let err = up(&mut ex, &migrations, None).expect_err("refused");
+
+    assert!(
+        matches!(err, MigrateError::UntrackedChange { operation: 0, .. }),
+        "{err:?}"
+    );
+    assert_eq!(dump(ex.connection()), before);
 }
 
 #[test]

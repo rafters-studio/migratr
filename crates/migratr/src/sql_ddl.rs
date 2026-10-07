@@ -34,58 +34,25 @@ pub(crate) fn table_body(create_sql: &str) -> Option<TableBody> {
     let mut open: Option<usize> = None;
     let mut close: Option<usize> = None;
     let mut cuts: Vec<usize> = Vec::new();
-
-    let mut chars = create_sql.char_indices().peekable();
-    while let Some((at, c)) = chars.next() {
-        match c {
-            '\'' | '"' | '`' => {
-                while let Some((_, n)) = chars.next() {
-                    if n == c {
-                        if chars.peek().map(|(_, p)| *p) == Some(c) {
-                            chars.next();
-                            continue;
-                        }
-                        break;
-                    }
-                }
-            }
-            '[' => {
-                for (_, n) in chars.by_ref() {
-                    if n == ']' {
-                        break;
-                    }
-                }
-            }
-            '-' if chars.peek().map(|(_, p)| *p) == Some('-') => {
-                for (_, n) in chars.by_ref() {
-                    if n == '\n' {
-                        break;
-                    }
-                }
-            }
-            '/' if chars.peek().map(|(_, p)| *p) == Some('*') => {
-                chars.next();
-                let mut prev = '\0';
-                for (_, n) in chars.by_ref() {
-                    if prev == '*' && n == '/' {
-                        break;
-                    }
-                    prev = n;
-                }
-            }
-            '(' => {
+    for token in tokens(create_sql)
+        .into_iter()
+        .filter(|t| t.kind == TokenKind::Punct)
+    {
+        let at = token.span.start;
+        match token.text.as_str() {
+            "(" => {
                 depth += 1;
                 if depth == 1 && open.is_none() {
                     open = Some(at);
                 }
             }
-            ')' => {
+            ")" => {
                 depth = depth.checked_sub(1)?;
                 if depth == 0 && close.is_none() {
                     close = Some(at);
                 }
             }
-            ',' if depth == 1 && close.is_none() => cuts.push(at),
+            "," if depth == 1 && close.is_none() => cuts.push(at),
             _ => {}
         }
     }
@@ -103,55 +70,67 @@ pub(crate) fn table_body(create_sql: &str) -> Option<TableBody> {
     Some(TableBody { close, items })
 }
 
-/// The first identifier in `sql`: the column name of a column definition, or the leading
-/// keyword of a table constraint.
-pub(crate) fn leading_identifier(sql: &str) -> Option<String> {
-    let mut first = None;
-    any_sql_identifier(sql, |_quoted, token| {
-        first = Some(token.to_string());
-        true
-    });
-    first
+/// What a [`Token`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenKind {
+    /// A bare word: a keyword, an unquoted identifier, or a number.
+    Bare,
+    /// A `"x"`, `` `x` `` or `[x]` identifier; `text` holds it unquoted.
+    Quoted,
+    /// One of `(`, `)`, `,` or `.`.
+    Punct,
 }
 
-/// Whether `sql` names `ident` as a bare word or quoted identifier, compared as SQLite
-/// compares identifiers (ASCII case-insensitively).
-pub(crate) fn mentions_identifier(sql: &str, ident: &str) -> bool {
-    any_sql_identifier(sql, |_quoted, token| token.eq_ignore_ascii_case(ident))
+/// One token of SQL text, located by its byte span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Token {
+    pub kind: TokenKind,
+    pub text: String,
+    pub span: Range<usize>,
 }
 
-/// Whether `sql` contains `keyword` as a bare word. A quoted identifier spelled the same way
-/// does not count.
-pub(crate) fn has_keyword(sql: &str, keyword: &str) -> bool {
-    any_sql_identifier(sql, |quoted, token| {
-        !quoted && token.eq_ignore_ascii_case(keyword)
-    })
+impl Token {
+    /// Whether this is an identifier (bare or quoted) equal to `name` as SQLite compares
+    /// identifiers, ASCII case-insensitively.
+    pub(crate) fn names(&self, name: &str) -> bool {
+        self.kind != TokenKind::Punct && self.text.eq_ignore_ascii_case(name)
+    }
+
+    /// Whether this is the bare keyword `keyword`.
+    pub(crate) fn is_keyword(&self, keyword: &str) -> bool {
+        self.kind == TokenKind::Bare && self.text.eq_ignore_ascii_case(keyword)
+    }
 }
 
-/// Calls `f(quoted, token)` on each bare word and each quoted identifier (`"x"`, `` `x` ``,
-/// `[x]`) in `sql`, skipping string literals and comments. Stops at the first `true` from
-/// `f` and reports whether there was one.
-fn any_sql_identifier(sql: &str, mut f: impl FnMut(bool, &str) -> bool) -> bool {
-    let mut chars = sql.chars().peekable();
-    let mut bare = String::new();
-    let mut quoted = String::new();
-    while let Some(c) = chars.next() {
+/// The words, quoted identifiers and structural punctuation of `sql`, in order. String
+/// literals, comments and operators produce no tokens.
+pub(crate) fn tokens(sql: &str) -> Vec<Token> {
+    let mut out = Vec::new();
+    let mut chars = sql.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
         // SQLite admits any non-ASCII character in a bare identifier.
-        if c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii() {
-            bare.push(c);
-            continue;
-        }
-        if !bare.is_empty() {
-            if f(false, &bare) {
-                return true;
+        let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii();
+        if is_word(c) {
+            let mut end = at + c.len_utf8();
+            while let Some(&(i, n)) = chars.peek() {
+                if !is_word(n) {
+                    break;
+                }
+                end = i + n.len_utf8();
+                chars.next();
             }
-            bare.clear();
+            out.push(Token {
+                kind: TokenKind::Bare,
+                text: sql[at..end].to_string(),
+                span: at..end,
+            });
+            continue;
         }
         match c {
             '\'' => {
-                while let Some(n) = chars.next() {
+                while let Some((_, n)) = chars.next() {
                     if n == '\'' {
-                        if chars.peek() == Some(&'\'') {
+                        if chars.peek().map(|&(_, p)| p) == Some('\'') {
                             chars.next();
                             continue;
                         }
@@ -159,56 +138,145 @@ fn any_sql_identifier(sql: &str, mut f: impl FnMut(bool, &str) -> bool) -> bool 
                     }
                 }
             }
-            '"' | '`' => {
-                quoted.clear();
-                while let Some(n) = chars.next() {
-                    if n == c {
-                        if chars.peek() == Some(&c) {
+            '"' | '`' | '[' => {
+                let close = if c == '[' { ']' } else { c };
+                let mut text = String::new();
+                let mut end = sql.len();
+                while let Some((i, n)) = chars.next() {
+                    if n == close {
+                        if c != '[' && chars.peek().map(|&(_, p)| p) == Some(close) {
                             chars.next();
-                            quoted.push(c);
+                            text.push(close);
                             continue;
                         }
+                        end = i + 1;
                         break;
                     }
-                    quoted.push(n);
+                    text.push(n);
                 }
-                if f(true, &quoted) {
-                    return true;
-                }
+                out.push(Token {
+                    kind: TokenKind::Quoted,
+                    text,
+                    span: at..end,
+                });
             }
-            '[' => {
-                quoted.clear();
-                for n in chars.by_ref() {
-                    if n == ']' {
-                        break;
-                    }
-                    quoted.push(n);
-                }
-                if f(true, &quoted) {
-                    return true;
-                }
-            }
-            '-' if chars.peek() == Some(&'-') => {
-                for n in chars.by_ref() {
+            '-' if chars.peek().map(|&(_, p)| p) == Some('-') => {
+                for (_, n) in chars.by_ref() {
                     if n == '\n' {
                         break;
                     }
                 }
             }
-            '/' if chars.peek() == Some(&'*') => {
+            '/' if chars.peek().map(|&(_, p)| p) == Some('*') => {
                 chars.next();
                 let mut prev = '\0';
-                for n in chars.by_ref() {
+                for (_, n) in chars.by_ref() {
                     if prev == '*' && n == '/' {
                         break;
                     }
                     prev = n;
                 }
             }
+            '(' | ')' | ',' | '.' => out.push(Token {
+                kind: TokenKind::Punct,
+                text: c.to_string(),
+                span: at..at + 1,
+            }),
             _ => {}
         }
     }
-    !bare.is_empty() && f(false, &bare)
+    out
+}
+
+/// The first identifier in `sql`: the column name of a column definition, or the leading
+/// keyword of a table constraint.
+pub(crate) fn leading_identifier(sql: &str) -> Option<String> {
+    tokens(sql)
+        .into_iter()
+        .find(|t| t.kind != TokenKind::Punct)
+        .map(|t| t.text)
+}
+
+/// Whether `sql` names `ident` as a bare word or quoted identifier.
+pub(crate) fn mentions_identifier(sql: &str, ident: &str) -> bool {
+    tokens(sql).iter().any(|t| t.names(ident))
+}
+
+/// Whether `sql` contains `keyword` as a bare word. A quoted identifier spelled the same way
+/// does not count.
+pub(crate) fn has_keyword(sql: &str, keyword: &str) -> bool {
+    tokens(sql).iter().any(|t| t.is_keyword(keyword))
+}
+
+/// `sql` with each token in `spans` replaced by `new` as a quoted identifier.
+fn replace_spans(sql: &str, spans: &[Range<usize>], new: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut from = 0;
+    for span in spans {
+        out.push_str(&sql[from..span.start]);
+        out.push_str(&quote_ident(new));
+        from = span.end;
+    }
+    out.push_str(&sql[from..]);
+    out
+}
+
+/// `sql` with the identifier right after each bare `keyword` renamed from `old` to `new`:
+/// the table after `REFERENCES` in a CREATE TABLE, or after `ON` in a CREATE INDEX.
+pub(crate) fn rename_after_keyword(sql: &str, keyword: &str, old: &str, new: &str) -> String {
+    let tokens = tokens(sql);
+    let spans: Vec<Range<usize>> = tokens
+        .windows(2)
+        .filter(|w| w[0].is_keyword(keyword) && w[1].names(old))
+        .map(|w| w[1].span.clone())
+        .collect();
+    replace_spans(sql, &spans, new)
+}
+
+/// A CREATE TABLE statement with its column `old` renamed to `new` everywhere the table's
+/// own columns are named. The parenthesised column list after `REFERENCES parent` names the
+/// parent's columns and is left alone.
+pub(crate) fn rename_column_in_table(sql: &str, old: &str, new: &str) -> String {
+    let tokens = tokens(sql);
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i].is_keyword("REFERENCES") {
+            // The parent table, an optional `schema.` qualifier, then its column list.
+            i += 1;
+            while tokens
+                .get(i + 1)
+                .is_some_and(|t| t.kind == TokenKind::Punct && t.text == ".")
+            {
+                i += 2;
+            }
+            i += 1;
+            if tokens.get(i).is_some_and(|t| t.text == "(") {
+                while i < tokens.len() && tokens[i].text != ")" {
+                    i += 1;
+                }
+            }
+        } else if tokens[i].names(old) {
+            spans.push(tokens[i].span.clone());
+        }
+        i += 1;
+    }
+    replace_spans(sql, &spans, new)
+}
+
+/// A CREATE INDEX statement with its table's column `old` renamed to `new`: every
+/// identifier after the table name that follows `ON`.
+pub(crate) fn rename_column_in_index(sql: &str, old: &str, new: &str) -> String {
+    let tokens = tokens(sql);
+    let spans: Vec<Range<usize>> = match tokens.iter().position(|t| t.is_keyword("ON")) {
+        Some(on) => tokens[on + 2..]
+            .iter()
+            .filter(|t| t.names(old))
+            .map(|t| t.span.clone())
+            .collect(),
+        None => Vec::new(),
+    };
+    replace_spans(sql, &spans, new)
 }
 
 /// The byte range of the table name in a `CREATE [TEMP] TABLE [IF NOT EXISTS] [schema.]name`

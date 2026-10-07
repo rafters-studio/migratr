@@ -1,8 +1,9 @@
-use crate::executor::{Executor, SchemaSnapshot};
+use crate::executor::Executor;
 use crate::ledger;
 use crate::migration::{Column, MigrateError, Migration, Op};
-use crate::rebuild::{FK_VIOLATION_MESSAGE, TableChange, rebuild_statements};
-use crate::sql_ddl::{mentions_identifier, quote_ident as ident};
+use crate::rebuild::{FK_BASELINE, FK_VIOLATION_MESSAGE, fk_check};
+use crate::sql_ddl::quote_ident as ident;
+use crate::tracked::Tracked;
 
 /// What an `up` run applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,64 +42,64 @@ pub fn up(
 
 /// Runs one migration's statements and its ledger row atomically.
 fn apply(exec: &mut impl Executor, migration: &Migration) -> Result<(), MigrateError> {
-    let schema = if migration
+    let mut tracked = if migration
         .up
         .iter()
         .any(|op| matches!(op, Op::DropColumn { .. }))
     {
-        Some(
-            exec.read_schema()
-                .map_err(|e| MigrateError::Executor(Box::new(e)))?,
-        )
+        let schema = exec
+            .read_schema()
+            .map_err(|e| MigrateError::Executor(Box::new(e)))?;
+        Some(Tracked::new(schema))
     } else {
         None
     };
 
-    let mut statements = vec![ledger::CREATE_LEDGER.to_string()];
-    // The operation each statement came from; `None` for the ledger's own statements.
-    let mut origins: Vec<Option<usize>> = vec![None];
-    // The final statement of each rebuild, which is its foreign-key check, and its table.
-    let mut fk_checks: Vec<(usize, &str)> = Vec::new();
-
+    // Each operation's statements, with the operation they came from.
+    let mut body: Vec<(String, usize)> = Vec::new();
+    // The table of the first rebuild, which the foreign-key check names on failure.
+    let mut rebuilt: Option<&str> = None;
     for (i, op) in migration.up.iter().enumerate() {
-        let rebuilt = match (op, &schema) {
-            (Op::DropColumn { table, column }, Some(schema))
-                if describes_table(schema, &migration.up[..i], table, &column.name) =>
-            {
-                let change = TableChange::DropColumn {
-                    column: column.name.clone(),
-                };
-                Some((table, rebuild_statements(schema, table, &change)?))
-            }
-            _ => None,
+        let rebuild = match &mut tracked {
+            Some(tracked) => tracked.step(migration.version, i, op)?,
+            None => None,
         };
-        match rebuilt {
-            Some((table, rebuild)) => {
-                statements.extend(rebuild);
-                fk_checks.push((statements.len() - 1, table));
+        match (rebuild, op) {
+            (Some(rebuild), Op::DropColumn { table, .. }) => {
+                rebuilt.get_or_insert(table);
+                body.extend(rebuild.into_iter().map(|s| (s, i)));
             }
-            None => statements.push(render(op)),
+            _ => body.push((render(op), i)),
         }
-        origins.resize(statements.len(), Some(i));
+    }
+
+    // A migration with a rebuild runs with foreign keys suspended, so it is checked as a
+    // whole: violations that exist before the first statement are not its doing.
+    let mut statements = vec![ledger::CREATE_LEDGER.to_string()];
+    let mut origins: Vec<Option<usize>> = vec![None];
+    if rebuilt.is_some() {
+        statements.push(FK_BASELINE.to_string());
+        origins.push(None);
+    }
+    for (statement, operation) in body {
+        statements.push(statement);
+        origins.push(Some(operation));
+    }
+    let fk_check_at = rebuilt.map(|_| statements.len());
+    if rebuilt.is_some() {
+        statements.push(fk_check());
+        origins.push(None);
     }
     statements.push(ledger::insert_row(migration));
     origins.push(None);
 
-    exec.run_atomic(&statements, !fk_checks.is_empty())
+    exec.run_atomic(&statements, rebuilt.is_some())
         .map_err(|failure| {
-            let fk_violation = failure
+            let violation = failure
                 .index
-                .and_then(|i| fk_checks.iter().find(|(at, _)| *at == i))
-                .and_then(|(_, table)| {
-                    let message = failure.source.to_string();
-                    let rows = message.split(FK_VIOLATION_MESSAGE).nth(1)?;
-                    let digits: String = rows.chars().take_while(char::is_ascii_digit).collect();
-                    Some(MigrateError::ForeignKeyViolation {
-                        table: table.to_string(),
-                        rows: digits.parse().ok()?,
-                    })
-                });
-            fk_violation.unwrap_or_else(|| MigrateError::Apply {
+                .filter(|&i| Some(i) == fk_check_at)
+                .and_then(|_| foreign_key_violation(&failure.source.to_string()));
+            violation.unwrap_or_else(|| MigrateError::Apply {
                 version: migration.version,
                 statement: failure.index.and_then(|i| statements.get(i)).cloned(),
                 operation: failure
@@ -109,39 +110,18 @@ fn apply(exec: &mut impl Executor, migration: &Migration) -> Result<(), MigrateE
         })
 }
 
-/// Whether the schema read before the migration still describes `table` and its `column`
-/// when the operation after `earlier` runs: both exist, and no earlier operation of the
-/// migration could have changed the table or added a table referencing it. Otherwise the
-/// rebuild would work from stale DDL, so the drop runs in place and SQLite refuses whatever
-/// it cannot drop.
-fn describes_table(schema: &SchemaSnapshot, earlier: &[Op], table: &str, column: &str) -> bool {
-    let same = |name: &str| name.eq_ignore_ascii_case(table);
-    let references = |c: &Column| c.references.as_ref().is_some_and(|fk| same(&fk.table));
-    let exists = schema
-        .tables
-        .iter()
-        .find(|t| same(&t.name))
-        .is_some_and(|t| {
-            t.columns
-                .iter()
-                .any(|c| c.name.eq_ignore_ascii_case(column))
-        });
-    let changed = earlier.iter().any(|op| match op {
-        Op::CreateTable { table, columns, .. } => same(table) || columns.iter().any(references),
-        Op::AddColumn { table, column } => same(table) || references(column),
-        Op::DropTable { table, .. }
-        | Op::DropColumn { table, .. }
-        | Op::RenameColumn { table, .. }
-        | Op::CreateIndex { table, .. } => same(table),
-        Op::RenameTable { from, to } => same(from) || same(to),
-        Op::DropIndex { definition } => same(&definition.table),
-        Op::RawSql { up, .. } => mentions_identifier(up, table),
-    });
-    exists && !changed
+/// The `ForeignKeyViolation` that an executor's [`fk_check`] failure message reports.
+fn foreign_key_violation(message: &str) -> Option<MigrateError> {
+    let report = message.split(FK_VIOLATION_MESSAGE).nth(1)?;
+    let (rows, table) = report.split_once(" in ")?;
+    Some(MigrateError::ForeignKeyViolation {
+        table: table.trim().to_string(),
+        rows: rows.parse().ok()?,
+    })
 }
 
 /// The SQL statement for one operation.
-fn render(op: &Op) -> String {
+pub(crate) fn render(op: &Op) -> String {
     match op {
         Op::CreateTable {
             table,
@@ -207,7 +187,7 @@ fn create_table(table: &str, columns: &[Column], without_rowid: bool) -> String 
     )
 }
 
-fn column_def(column: &Column) -> String {
+pub(crate) fn column_def(column: &Column) -> String {
     let mut sql = ident(&column.name);
     if !column.type_name.is_empty() {
         sql.push(' ');

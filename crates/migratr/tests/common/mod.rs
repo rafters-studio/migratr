@@ -46,15 +46,15 @@ impl Executor for FailAt {
 /// Every sqlite_master row and every table's rows, as text.
 pub fn dump(conn: &Connection) -> Vec<String> {
     let mut out = Vec::new();
-    let rows: Vec<(String, String, Option<String>)> = conn
-        .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY name")
+    let rows: Vec<(String, String, String, Option<String>)> = conn
+        .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name")
         .expect("prepare")
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
         .expect("query")
         .collect::<Result<_, _>>()
         .expect("rows");
-    for (kind, name, sql) in rows {
-        out.push(format!("{kind}|{name}|{sql:?}"));
+    for (kind, name, tbl_name, sql) in rows {
+        out.push(format!("{kind}|{name}|{tbl_name}|{sql:?}"));
         if kind == "table" {
             let mut all = conn
                 .prepare(&format!("SELECT rowid, * FROM \"{name}\" ORDER BY 1"))

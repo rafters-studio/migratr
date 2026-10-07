@@ -6,6 +6,7 @@ mod ledger;
 mod migration;
 mod rebuild;
 mod sql_ddl;
+mod tracked;
 mod up;
 
 pub use error::Error;
