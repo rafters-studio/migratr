@@ -163,14 +163,15 @@ fn up_and_down_write_schema_json_and_a_failed_run_leaves_it_alone() {
     let after_down = p.schema().expect("schema.json after down");
     assert_ne!(after_up, after_down);
 
-    // A migration whose SQL fails rolls back and leaves schema.json as it was.
+    // A migration whose SQL fails is rolled back and leaves schema.json as it was.
     fs::write(
         p.dir().join("20990101000000_broken.json"),
-        r#"{"up":[{"raw_sql":{"up":"THIS IS NOT SQL"}}]}"#,
+        r#"{"up":[{"op":"raw_sql","up":"THIS IS NOT SQL"}]}"#,
     )
     .expect("write broken");
     let failed = p.run(&["--json", "up"]);
     assert_eq!(failed.code, 1, "{}", failed.stdout);
+    assert_eq!(failed.json()["code"], "apply_failed");
     assert_eq!(p.schema().as_deref(), Some(after_down.as_str()));
 }
 
@@ -228,6 +229,22 @@ fn plan_leaves_database_snapshots_and_schema_json_unchanged() {
     assert_eq!(fs::read(p.db()).expect("db"), db_before);
     assert_eq!(p.schema(), schema_before);
     assert_eq!(files_under(p.root.path()), files_before);
+}
+
+#[test]
+fn plan_to_stops_after_the_named_version_and_conflicts_with_a_direction() {
+    let p = Project::new();
+    p.new_migration(&["create_users", "id:integer:pk"]);
+    p.new_migration(&["create_posts", "id:integer:pk"]);
+    let first = version_of(&p, 0);
+
+    let plan = p.run(&["--json", "plan", "--to", &first]).json();
+    assert_eq!(plan["direction"], "up");
+    assert_eq!(plan["steps"].as_array().map(Vec::len), Some(1));
+
+    let both = p.run(&["--json", "plan", "--to", &first, "down"]);
+    assert_eq!(both.code, 2);
+    assert_eq!(both.json()["code"], "usage");
 }
 
 #[test]

@@ -57,7 +57,11 @@ enum Command {
     /// List every migration as applied or pending.
     Status,
     /// Show the SQL a run would execute, without running it.
+    #[command(args_conflicts_with_subcommands = true)]
     Plan {
+        /// Plan an up run that stops after this version.
+        #[arg(long)]
+        to: Option<u64>,
         #[command(subcommand)]
         direction: Option<PlanDirection>,
     },
@@ -100,12 +104,11 @@ impl Direction {
     }
 }
 
-impl From<Option<PlanDirection>> for Direction {
-    fn from(direction: Option<PlanDirection>) -> Self {
+impl From<PlanDirection> for Direction {
+    fn from(direction: PlanDirection) -> Self {
         match direction {
-            None => Direction::Up { to: None },
-            Some(PlanDirection::Up { to }) => Direction::Up { to },
-            Some(PlanDirection::Down { steps }) => Direction::Down { steps },
+            PlanDirection::Up { to } => Direction::Up { to },
+            PlanDirection::Down { steps } => Direction::Down { steps },
         }
     }
 }
@@ -149,7 +152,10 @@ fn main() -> ExitCode {
             } else {
                 eprintln!("error [{}]: {error}", error.code());
             }
-            ExitCode::FAILURE
+            match error {
+                CliError::Usage(_) => ExitCode::from(2),
+                _ => ExitCode::FAILURE,
+            }
         }
     }
 }
@@ -233,10 +239,13 @@ fn run(cli: &Cli) -> Result<Outcome, CliError> {
             let migrations = load_dir(&cli.dir)?;
             status::status(db, &migrations)
         }
-        Command::Plan { direction } => {
+        Command::Plan { to, direction } => {
             let db = db_path(cli)?;
             let migrations = load_dir(&cli.dir)?;
-            let direction = Direction::from(direction.clone());
+            let direction = match direction {
+                None => Direction::Up { to: *to },
+                Some(direction) => Direction::from(direction.clone()),
+            };
             let (conn, bytes) = match open_existing(db)? {
                 Some(conn) => (conn, std::fs::metadata(db).map_or(0, |m| m.len())),
                 None => (Connection::open_in_memory()?, 0),
