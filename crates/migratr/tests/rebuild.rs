@@ -661,6 +661,7 @@ fn a_rebuild_after_an_earlier_operation_changed_a_recreated_object_is_refused() 
         r#"{"op": "drop_index", "definition": {"name": "t_id", "table": "t", "columns": ["id"]}}"#,
         r#"{"op": "rename_table", "from": "log", "to": "history"}"#,
         r#"{"op": "raw_sql", "up": "DROP VIEW v"}"#,
+        r#"{"op": "raw_sql", "up": "ALTER TABLE log RENAME TO history"}"#,
     ] {
         assert_refused_after(schema, ops, 0);
     }

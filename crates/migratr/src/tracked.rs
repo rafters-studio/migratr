@@ -63,7 +63,8 @@ impl Tracked {
 
     /// The first earlier operation that involved an object a rebuild of `table` drops or
     /// recreates, the table included. A rename or drop also counts when it involved an
-    /// object that those objects' SQL names, since SQLite rewrites that SQL.
+    /// object that those objects' SQL names, since SQLite rewrites that SQL. Raw SQL cannot be
+    /// told apart, so it counts when it names any of them.
     fn changed_since_read(&self, table: &str) -> Option<usize> {
         let touched = touched_objects(&self.schema, table);
         let neighbours: Vec<&str> = self
@@ -83,7 +84,11 @@ impl Tracked {
         self.earlier
             .iter()
             .find(|(_, earlier)| match earlier {
-                Earlier::Sql(sql) => touched.iter().any(|t| mentions_identifier(sql, t)),
+                Earlier::Sql(sql) => touched
+                    .iter()
+                    .map(String::as_str)
+                    .chain(neighbours.iter().copied())
+                    .any(|name| mentions_identifier(sql, name)),
                 Earlier::Names { names, rewrites } => names.iter().any(|n| {
                     touched.iter().any(|t| same(t, n))
                         || (*rewrites && neighbours.iter().any(|t| same(t, n)))
