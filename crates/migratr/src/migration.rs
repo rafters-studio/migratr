@@ -211,6 +211,15 @@ pub enum MigrateError {
         operation: usize,
     },
 
+    #[error("snapshot {}: {source}", path.display())]
+    SnapshotFailed {
+        path: PathBuf,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[error("restore needs confirmation; it would discard {}", report.discards())]
+    RestoreNotConfirmed { report: Box<crate::RestoreReport> },
+
     #[error(transparent)]
     Executor(Box<dyn std::error::Error + Send + Sync>),
 }
