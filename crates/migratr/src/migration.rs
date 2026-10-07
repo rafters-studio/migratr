@@ -196,14 +196,17 @@ pub enum MigrateError {
     },
 
     #[error(
-        "migration {version}: cannot rebuild table {table}: operation {operation} earlier in \
-         the same migration changed objects the rebuild recreates in a way migratr does not \
-         track; move the rebuild into its own migration"
+        "migration {version}: cannot drop the column from table {table}: operation \
+         {operation} earlier in the same migration changed the table or an object a rebuild \
+         would recreate, so the schema migratr read is stale and SQLite refuses the drop in \
+         place ({cause}); move the drop into its own migration"
     )]
     UntrackedChange {
         version: u64,
         table: String,
         operation: usize,
+        /// SQLite's refusal of the in-place drop.
+        cause: String,
     },
 
     #[error(transparent)]

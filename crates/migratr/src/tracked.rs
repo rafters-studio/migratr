@@ -2,7 +2,7 @@
 //!
 //! A rebuild works from the schema read before the migration. When an earlier operation of
 //! the same migration changed the table or an object the rebuild recreates, that schema is
-//! stale and the rebuild is refused.
+//! stale and no rebuild is made.
 
 use crate::executor::SchemaSnapshot;
 use crate::migration::{Column, MigrateError, Op};
@@ -14,6 +14,18 @@ use crate::sql_ddl::mentions_identifier;
 enum Earlier {
     Names { names: Vec<String>, rewrites: bool },
     Sql(String),
+}
+
+/// How to run one operation.
+pub(crate) enum Plan {
+    /// The operation's own statement.
+    Plain,
+    /// A column drop that SQLite cannot make in place: the table rebuild's statements.
+    Rebuild(Vec<String>),
+    /// A column drop on a table or objects an earlier operation changed, so the schema read
+    /// before the migration cannot say whether it needs a rebuild. It runs in place, and
+    /// SQLite's refusal means the rebuild is refused, naming the earlier operation.
+    AfterChange { operation: usize },
 }
 
 pub(crate) struct Tracked {
@@ -30,35 +42,24 @@ impl Tracked {
         }
     }
 
-    /// Records operation number `at` of migration `version`. For a column drop that SQLite
-    /// cannot make in place, returns the rebuild's statements.
-    ///
-    /// Refused with `UntrackedChange` naming the earliest operation when an earlier operation
-    /// changed the table or an object the rebuild drops or recreates.
-    pub(crate) fn step(
-        &mut self,
-        version: u64,
-        at: usize,
-        op: &Op,
-    ) -> Result<Option<Vec<String>>, MigrateError> {
-        let mut rebuild = None;
-        if let Op::DropColumn { table, column } = op
-            && needs_rebuild(&self.schema, table, &column.name)?
-        {
-            if let Some(operation) = self.changed_since_read(table) {
-                return Err(MigrateError::UntrackedChange {
-                    version,
-                    table: table.clone(),
-                    operation,
-                });
-            }
-            let change = TableChange::DropColumn {
-                column: column.name.clone(),
+    /// Records operation number `at` and says how to run it.
+    pub(crate) fn step(&mut self, at: usize, op: &Op) -> Result<Plan, MigrateError> {
+        let mut plan = Plan::Plain;
+        if let Op::DropColumn { table, column } = op {
+            let rebuild = needs_rebuild(&self.schema, table, &column.name)?;
+            plan = match (self.changed_since_read(table), rebuild) {
+                (Some(operation), _) => Plan::AfterChange { operation },
+                (None, true) => {
+                    let change = TableChange::DropColumn {
+                        column: column.name.clone(),
+                    };
+                    Plan::Rebuild(rebuild_statements(&self.schema, table, &change)?)
+                }
+                (None, false) => Plan::Plain,
             };
-            rebuild = Some(rebuild_statements(&self.schema, table, &change)?);
         }
         self.earlier.push((at, earlier(op)));
-        Ok(rebuild)
+        Ok(plan)
     }
 
     /// The first earlier operation that involved an object a rebuild of `table` drops or

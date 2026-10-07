@@ -651,6 +651,40 @@ fn a_rebuild_after_an_earlier_operation_changed_the_table_is_refused() {
 }
 
 #[test]
+fn an_earlier_operation_that_leaves_the_drop_possible_in_place_does_not_block_it() {
+    let mut ex = seeded(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT);
+         CREATE INDEX t_a ON t (a);",
+    );
+    let (_dir, migrations) = migration(&format!(
+        r#"{{"op": "drop_index", "definition": {{"name": "t_a", "table": "t", "columns": ["a"]}}}},
+           {{"op": "add_column", "table": "t", "column": {{"name": "c", "type": "TEXT"}}}},
+           {}"#,
+        drop_column("t", "a")
+    ));
+
+    up(&mut ex, &migrations, None).expect("up");
+
+    assert_eq!(columns(ex.connection(), "t"), ["id", "b", "c"]);
+}
+
+#[test]
+fn a_unique_column_of_a_table_created_or_renamed_earlier_is_refused_naming_that_operation() {
+    for (ops, schema) in [
+        (
+            r#"{"op": "create_table", "table": "t", "columns": [{"name": "id", "type": "INTEGER", "primary_key": 1}, {"name": "gone", "type": "TEXT", "unique": true}]}"#,
+            "",
+        ),
+        (
+            r#"{"op": "rename_table", "from": "old", "to": "t"}"#,
+            "CREATE TABLE old (id INTEGER PRIMARY KEY, gone TEXT UNIQUE)",
+        ),
+    ] {
+        assert_refused_after(schema, ops, 0);
+    }
+}
+
+#[test]
 fn a_rebuild_after_an_earlier_operation_changed_a_recreated_object_is_refused() {
     let schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, gone TEXT UNIQUE);
          CREATE TABLE log (x);

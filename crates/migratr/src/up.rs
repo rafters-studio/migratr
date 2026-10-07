@@ -3,7 +3,7 @@ use crate::ledger;
 use crate::migration::{Column, MigrateError, Migration, Op};
 use crate::rebuild::{FK_VIOLATION_MESSAGE, fk_check};
 use crate::sql_ddl::quote_ident as ident;
-use crate::tracked::Tracked;
+use crate::tracked::{Plan, Tracked};
 
 /// What an `up` run applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,17 +58,23 @@ fn apply(exec: &mut impl Executor, migration: &Migration) -> Result<(), MigrateE
     // Each operation's statements, with the operation they came from.
     let mut body: Vec<(String, usize)> = Vec::new();
     let mut has_rebuild = false;
+    // The earlier operation behind each column drop that SQLite alone must accept.
+    let mut after_change: Vec<(usize, usize)> = Vec::new();
     for (i, op) in migration.up.iter().enumerate() {
-        let rebuild = match &mut tracked {
-            Some(tracked) => tracked.step(migration.version, i, op)?,
-            None => None,
+        let plan = match &mut tracked {
+            Some(tracked) => tracked.step(i, op)?,
+            None => Plan::Plain,
         };
-        match (rebuild, op) {
-            (Some(rebuild), _) => {
+        match plan {
+            Plan::Rebuild(rebuild) => {
                 has_rebuild = true;
                 body.extend(rebuild.into_iter().map(|s| (s, i)));
             }
-            (None, _) => body.push((render(op), i)),
+            Plan::AfterChange { operation } => {
+                after_change.push((i, operation));
+                body.push((render(op), i));
+            }
+            Plan::Plain => body.push((render(op), i)),
         }
     }
 
@@ -94,14 +100,31 @@ fn apply(exec: &mut impl Executor, migration: &Migration) -> Result<(), MigrateE
                 .index
                 .filter(|&i| Some(i) == fk_check_at)
                 .and_then(|_| foreign_key_violation(&failure.source.to_string()));
-            violation.unwrap_or_else(|| MigrateError::Apply {
-                version: migration.version,
-                statement: failure.index.and_then(|i| statements.get(i)).cloned(),
-                operation: failure
-                    .index
-                    .and_then(|i| origins.get(i).copied().flatten()),
-                source: Box::new(failure.source),
-            })
+            let operation = failure
+                .index
+                .and_then(|i| origins.get(i).copied().flatten());
+            let untracked = after_change
+                .iter()
+                .find(|(at, _)| Some(*at) == operation)
+                .and_then(|&(at, earlier)| match &migration.up[at] {
+                    Op::DropColumn { table, .. } => Some(MigrateError::UntrackedChange {
+                        version: migration.version,
+                        table: table.clone(),
+                        operation: earlier,
+                        cause: failure.source.to_string(),
+                    }),
+                    _ => None,
+                });
+            violation
+                .or(untracked)
+                .unwrap_or_else(|| MigrateError::Apply {
+                    version: migration.version,
+                    statement: failure.index.and_then(|i| statements.get(i)).cloned(),
+                    operation: failure
+                        .index
+                        .and_then(|i| origins.get(i).copied().flatten()),
+                    source: Box::new(failure.source),
+                })
         })
 }
 
