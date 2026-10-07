@@ -224,6 +224,13 @@ dependencies = [
 [[package]]
 name = "migratr-oracle"
 version = "0.1.0"
+dependencies = [
+ "migratr",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "once_cell"
