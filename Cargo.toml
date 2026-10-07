@@ -4,16 +4,16 @@ members = ["crates/migratr", "crates/migratr-format", "crates/migratr-macros", "
 exclude = ["tests/fixtures/sqlx-coexist"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/rafters-studio/migratr"
 authors = ["Rafters Studio"]
 
 [workspace.dependencies]
-migratr = { path = "crates/migratr", version = "0.1.0" }
-migratr-format = { path = "crates/migratr-format", version = "0.1.0" }
-migratr-macros = { path = "crates/migratr-macros", version = "0.1.0" }
+migratr = { path = "crates/migratr", version = "0.1.1" }
+migratr-format = { path = "crates/migratr-format", version = "0.1.1" }
+migratr-macros = { path = "crates/migratr-macros", version = "0.1.1" }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
