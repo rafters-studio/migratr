@@ -2,6 +2,11 @@
 name = "migratr-cli"
 version.workspace = true
 edition.workspace = true
+description = "The migratr command line: new, up, down, status, plan and restore for SQLite schema migrations."
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
 
 [[bin]]
 name = "migratr"

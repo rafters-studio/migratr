@@ -45,3 +45,12 @@ jobs:
         with:
           workspaces: tests/fixtures/sqlx-coexist
       - run: cargo build --manifest-path tests/fixtures/sqlx-coexist/Cargo.toml
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Verifies each published crate builds from its own package, as crates.io will build it.
+      - run: cargo package --workspace --exclude migratr-oracle

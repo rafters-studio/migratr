@@ -5,11 +5,8 @@ use std::path::{Path, PathBuf};
 
 use proc_macro::{Delimiter, TokenStream, TokenTree};
 
-// The macro validates a directory with the same parser the library runs. The library depends
-// on this crate, so the parser's source file is shared rather than depended on.
-#[allow(dead_code)]
-#[path = "../../migratr/src/format.rs"]
-mod format;
+// The macro validates a directory with the same parser the library runs.
+use migratr_format as format;
 
 /// Embeds the migrations directory named by the string literal, relative to the calling
 /// crate's manifest directory, and expands to a `migratr::Migrator`. A file that does not
