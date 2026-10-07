@@ -86,6 +86,8 @@ enum Fault {
     Schema(String, String),
     /// Run statements on the seeded database.
     After(&'static str),
+    /// Replace text in the schema before seeding, then run statements on the seeded database.
+    SchemaThenAfter(String, String, &'static str),
 }
 
 struct Break {
@@ -193,7 +195,7 @@ fn probe_after(fault: &Break) -> Result<(), migratr_oracle::ProbeError> {
     conn.pragma_update(None, "foreign_keys", true)
         .expect("foreign keys on");
     match &fault.fault {
-        Fault::Schema(from, to) => {
+        Fault::Schema(from, to) | Fault::SchemaThenAfter(from, to, _) => {
             assert!(
                 case.schema.contains(from.as_str()),
                 "{}: the schema has no `{from}` to remove",
@@ -202,6 +204,9 @@ fn probe_after(fault: &Break) -> Result<(), migratr_oracle::ProbeError> {
             conn.execute_batch(&case.schema.replacen(from.as_str(), to, 1))
                 .expect("broken schema");
             (case.seed)(&conn);
+            if let Fault::SchemaThenAfter(_, _, sql) = &fault.fault {
+                conn.execute_batch(sql).expect("fault");
+            }
         }
         Fault::After(sql) => {
             conn.execute_batch(case.schema).expect("schema");
@@ -227,6 +232,35 @@ fn removing_a_construct_makes_its_probe_fail() {
             all.iter().any(|fault| fault.case == case.name),
             "{} has no mutation",
             case.name
+        );
+    }
+}
+
+/// A rebuild that copies a generated column's computed value into an ordinary column reads
+/// correctly until the base moves, so only the second read catches it.
+#[test]
+fn a_generated_value_frozen_in_an_ordinary_column_fails_after_its_base_moves() {
+    let frozen = [
+        (
+            "virtual generated columns",
+            "GENERATED ALWAYS AS (base * 2) VIRTUAL",
+            "UPDATE generated_virtual SET doubled = base * 2;",
+        ),
+        (
+            "stored generated columns",
+            "GENERATED ALWAYS AS (base * 3) STORED",
+            "UPDATE generated_stored SET tripled = base * 3;",
+        ),
+    ];
+    for (case, clause, freeze) in frozen {
+        let fault = Break {
+            case,
+            fault: Fault::SchemaThenAfter(clause.to_string(), String::new(), freeze),
+        };
+        let error = probe_after(&fault).expect_err(case);
+        assert!(
+            error.differed.contains("after its base moved"),
+            "{case}: failed at the wrong check: {error}"
         );
     }
 }
