@@ -2,7 +2,8 @@ use crate::executor::Executor;
 use crate::ledger;
 use crate::migration::{Column, MigrateError, Migration, Op};
 use crate::rebuild::{
-    FK_VIOLATION_MESSAGE, TableChange, fk_check, needs_rebuild, rebuild_statements,
+    FK_VIOLATION_MESSAGE, TableChange, add_needs_rebuild, fk_check, needs_rebuild,
+    rebuild_statements,
 };
 use crate::sql_ddl::quote_ident as ident;
 
@@ -56,7 +57,11 @@ pub(crate) fn apply(
     prelude: &[String],
     record: String,
 ) -> Result<(), MigrateError> {
-    let schema = if ops.iter().any(|op| matches!(op, Op::DropColumn { .. })) {
+    let schema = if ops.iter().any(|op| match op {
+        Op::DropColumn { .. } => true,
+        Op::AddColumn { column, .. } => add_needs_rebuild(column),
+        _ => false,
+    }) {
         Some(
             exec.read_schema()
                 .map_err(|e| MigrateError::Executor(Box::new(e)))?,
@@ -69,9 +74,36 @@ pub(crate) fn apply(
     let mut body: Vec<(String, usize)> = Vec::new();
     let mut has_rebuild = false;
     for (i, op) in ops.iter().enumerate() {
-        if let (Some(schema), Op::DropColumn { table, column }) = (&schema, op)
-            && needs_rebuild(schema, table, &column.name)?
-        {
+        let rebuild = match (&schema, op) {
+            (Some(schema), Op::DropColumn { table, column }) => {
+                // An earlier DropIndex has removed its index by the time the column goes.
+                let dropped_indexes: Vec<&str> = ops[..i]
+                    .iter()
+                    .filter_map(|o| match o {
+                        Op::DropIndex { definition } => Some(definition.name.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                needs_rebuild(schema, table, &column.name, &dropped_indexes)?.then(|| {
+                    (
+                        table,
+                        column,
+                        TableChange::DropColumn {
+                            column: column.name.clone(),
+                        },
+                    )
+                })
+            }
+            (Some(_), Op::AddColumn { table, column }) if add_needs_rebuild(column) => Some((
+                table,
+                column,
+                TableChange::AddColumn {
+                    definition: rebuilt_column_def(column),
+                },
+            )),
+            _ => None,
+        };
+        if let (Some(schema), Some((table, column, change))) = (&schema, rebuild) {
             // The rebuild works from the schema read before the migration, which is
             // current only for the first operation.
             if i > 0 {
@@ -83,9 +115,6 @@ pub(crate) fn apply(
                 });
             }
             has_rebuild = true;
-            let change = TableChange::DropColumn {
-                column: column.name.clone(),
-            };
             body.extend(
                 rebuild_statements(schema, table, &change)?
                     .into_iter()
@@ -204,6 +233,16 @@ fn create_table(table: &str, columns: &[Column], without_rowid: bool) -> String 
         parts.join(", "),
         if without_rowid { " WITHOUT ROWID" } else { "" }
     )
+}
+
+/// The column's definition as a rebuilt table's column item, where a PRIMARY KEY column can
+/// say so inline.
+fn rebuilt_column_def(column: &Column) -> String {
+    let mut sql = column_def(column);
+    if column.primary_key.is_some() {
+        sql.push_str(" PRIMARY KEY");
+    }
+    sql
 }
 
 fn column_def(column: &Column) -> String {

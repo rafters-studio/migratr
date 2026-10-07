@@ -651,14 +651,19 @@ fn a_rebuild_after_an_earlier_operation_changed_the_table_is_refused() {
 }
 
 #[test]
-fn a_drop_the_pre_migration_schema_routes_to_a_rebuild_is_refused_after_any_earlier_operation() {
-    // The index is gone by the time the drop runs, but the schema read before the migration
-    // still shows it, so the drop is refused rather than guessed.
-    assert_refused_after(
+fn dropping_a_column_after_dropping_its_index_runs_in_place() {
+    // The drop would need a rebuild only for the index, which the earlier operation removes.
+    let mut ex = seeded(
         "CREATE TABLE t (id INTEGER PRIMARY KEY, gone TEXT, b TEXT); CREATE INDEX t_gone ON t (gone);",
-        r#"{"op": "drop_index", "definition": {"name": "t_gone", "table": "t", "columns": ["gone"]}}"#,
-        1,
     );
+    let (_dir, migrations) = migration(&format!(
+        r#"{{"op": "drop_index", "definition": {{"name": "t_gone", "table": "t", "columns": ["gone"]}}}}, {}"#,
+        drop_column("t", "gone")
+    ));
+
+    up(&mut ex, &migrations, None).expect("up");
+
+    assert_eq!(columns(ex.connection(), "t"), ["id", "b"]);
 }
 
 #[test]

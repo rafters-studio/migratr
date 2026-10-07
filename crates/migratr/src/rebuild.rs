@@ -8,7 +8,7 @@
 //! suspended by the executor; the caller ends the migration with [`fk_check`].
 
 use crate::executor::{SchemaObject, SchemaSnapshot, TableInfo};
-use crate::migration::MigrateError;
+use crate::migration::{Column, MigrateError};
 use crate::sql_ddl::{
     TableBody, TokenKind, create_table_name_span, has_keyword, index_names_column,
     leading_identifier, mentions_identifier, names_own_column, quote_ident, quote_literal,
@@ -18,7 +18,22 @@ use crate::sql_ddl::{
 /// A change to one table that the rebuild makes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TableChange {
-    DropColumn { column: String },
+    DropColumn {
+        column: String,
+    },
+    /// Adds a column, as the last column item of the stored CREATE statement. `definition` is
+    /// the column's SQL; existing rows get its default, or NULL.
+    AddColumn {
+        definition: String,
+    },
+}
+
+/// Whether SQLite's in-place ADD COLUMN refuses `column`: it cannot add a UNIQUE or PRIMARY
+/// KEY column or a STORED generated one.
+pub(crate) fn add_needs_rebuild(column: &Column) -> bool {
+    column.unique
+        || column.primary_key.is_some()
+        || column.generated.as_ref().is_some_and(|g| g.stored)
 }
 
 /// A table's stored CREATE statement, split and checked against its columns.
@@ -48,6 +63,13 @@ impl ParsedTable<'_> {
             .filter(|&i| i != index)
             .find(|&i| names_own_column(self.item(i), column))
             .map(|i| self.item(i))
+    }
+
+    /// The CREATE statement with `definition` as a new column after the last column item,
+    /// ahead of any table constraints.
+    fn with_column(&self, definition: &str) -> String {
+        let end = self.body.items[self.info.columns.len() - 1].end;
+        format!("{}, {}{}", &self.sql[..end], definition, &self.sql[end..])
     }
 
     /// The CREATE statement without column `index`. The item goes with the comma after it,
@@ -102,11 +124,13 @@ fn parse<'a>(schema: &'a SchemaSnapshot, table: &str) -> Result<ParsedTable<'a>,
 /// Whether dropping `column` from `table` needs the rebuild. SQLite's in-place DROP COLUMN
 /// refuses a column that is part of the primary key, UNIQUE, a foreign key, indexed, or
 /// named by another column (a generated expression or CHECK) or a table constraint. False
-/// when the table or column is absent, so the in-place statement reports it.
+/// when the table or column is absent, so the in-place statement reports it. Indexes named in
+/// `dropped_indexes` no longer exist when the column is dropped, so they do not count.
 pub(crate) fn needs_rebuild(
     schema: &SchemaSnapshot,
     table: &str,
     column: &str,
+    dropped_indexes: &[&str],
 ) -> Result<bool, MigrateError> {
     let present = schema
         .tables
@@ -133,6 +157,11 @@ pub(crate) fn needs_rebuild(
     let indexed = Dependents::of(schema, table)
         .indexes
         .iter()
+        .filter(|o| {
+            !dropped_indexes
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(&o.name))
+        })
         .any(|o| index_names(o, column));
     Ok(constrained || named_elsewhere || indexed)
 }
@@ -266,50 +295,55 @@ pub(crate) fn rebuild_statements(
     change: &TableChange,
 ) -> Result<Vec<String>, MigrateError> {
     let parsed = parse(schema, table)?;
-    let TableChange::DropColumn { column } = change;
-    let dropped = parsed
-        .column_index(column)
-        .ok_or_else(|| MigrateError::UnparseableTable {
-            table: table.to_string(),
-        })?;
     let table_name = &parsed.object.name;
-
-    let column_in_use = |object: String| MigrateError::ColumnInUse {
-        table: table_name.clone(),
-        column: column.clone(),
-        object,
-    };
-    if let Some(item) = parsed.item_naming(dropped, column) {
-        return Err(column_in_use(
-            item.split_whitespace().collect::<Vec<_>>().join(" "),
-        ));
-    }
-    // A foreign key in any table, this one included, whose parent key is the column: named
-    // outright, or implied when the column is the parent's primary key.
-    let in_primary_key = parsed.info.columns[dropped].pk > 0;
-    let referencing = schema.tables.iter().find(|t| {
-        t.foreign_keys.iter().any(|fk| {
-            fk.table.eq_ignore_ascii_case(table_name)
-                && fk
-                    .to
-                    .as_deref()
-                    .map_or(in_primary_key, |to| to.eq_ignore_ascii_case(column))
-                && !(t.name.eq_ignore_ascii_case(table_name)
-                    && fk.from.eq_ignore_ascii_case(column))
-        })
-    });
-    if let Some(child) = referencing {
-        return Err(column_in_use(child.name.clone()));
-    }
-
     let dependents = Dependents::of(schema, table_name);
-    let uses_column = |o: &&&SchemaObject| match o.kind.as_str() {
-        "index" => index_names(o, column),
-        _ => mentions(o, column) || uses_columns_by_position(o, table_name),
+
+    let (edited, dropped) = match change {
+        TableChange::DropColumn { column } => {
+            let dropped =
+                parsed
+                    .column_index(column)
+                    .ok_or_else(|| MigrateError::UnparseableTable {
+                        table: table.to_string(),
+                    })?;
+            let column_in_use = |object: String| MigrateError::ColumnInUse {
+                table: table_name.clone(),
+                column: column.clone(),
+                object,
+            };
+            if let Some(item) = parsed.item_naming(dropped, column) {
+                return Err(column_in_use(
+                    item.split_whitespace().collect::<Vec<_>>().join(" "),
+                ));
+            }
+            // A foreign key in any table, this one included, whose parent key is the column:
+            // named outright, or implied when the column is the parent's primary key.
+            let in_primary_key = parsed.info.columns[dropped].pk > 0;
+            let referencing = schema.tables.iter().find(|t| {
+                t.foreign_keys.iter().any(|fk| {
+                    fk.table.eq_ignore_ascii_case(table_name)
+                        && fk
+                            .to
+                            .as_deref()
+                            .map_or(in_primary_key, |to| to.eq_ignore_ascii_case(column))
+                        && !(t.name.eq_ignore_ascii_case(table_name)
+                            && fk.from.eq_ignore_ascii_case(column))
+                })
+            });
+            if let Some(child) = referencing {
+                return Err(column_in_use(child.name.clone()));
+            }
+            let uses_column = |o: &&&SchemaObject| match o.kind.as_str() {
+                "index" => index_names(o, column),
+                _ => mentions(o, column) || uses_columns_by_position(o, table_name),
+            };
+            if let Some(user) = dependents.all().find(uses_column) {
+                return Err(column_in_use(user.name.clone()));
+            }
+            (parsed.without_column(dropped), Some(dropped))
+        }
+        TableChange::AddColumn { definition } => (parsed.with_column(definition), None),
     };
-    if let Some(user) = dependents.all().find(uses_column) {
-        return Err(column_in_use(user.name.clone()));
-    }
 
     let name_span =
         create_table_name_span(parsed.sql).ok_or_else(|| MigrateError::UnparseableTable {
@@ -317,12 +351,11 @@ pub(crate) fn rebuild_statements(
         })?;
     let taken: Vec<&str> = schema.objects.iter().map(|o| o.name.as_str()).collect();
     let new_name = free_name(&taken, "_migratr_rebuild");
-    let without = parsed.without_column(dropped);
     let new_create = format!(
         "{}{}{}",
-        &without[..name_span.start],
+        &edited[..name_span.start],
         quote_ident(&new_name),
-        &without[name_span.end..],
+        &edited[name_span.end..],
     );
 
     // Generated columns compute their own values and cannot be inserted into.
@@ -331,7 +364,7 @@ pub(crate) fn rebuild_statements(
         .columns
         .iter()
         .enumerate()
-        .filter(|(i, c)| *i != dropped && c.hidden == 0)
+        .filter(|(i, c)| Some(*i) != dropped && c.hidden == 0)
         .map(|(_, c)| quote_ident(&c.name))
         .collect();
     let without_rowid = has_keyword(&parsed.sql[parsed.body.close + 1..], "ROWID");
@@ -492,6 +525,26 @@ mod tests {
         let mut ex = executor("CREATE TABLE t (a, b UNIQUE)");
         rebuild(&mut ex, "t", "b");
         assert_eq!(table_sql(&mut ex, "t"), "CREATE TABLE \"t\" (a)");
+    }
+
+    #[test]
+    fn an_added_column_goes_after_the_last_column_item_and_ahead_of_constraints() {
+        let mut ex = executor(
+            "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT, UNIQUE (b)); \
+             INSERT INTO t VALUES (1, 'x');",
+        );
+        let schema = ex.read_schema().expect("schema");
+        let change = TableChange::AddColumn {
+            definition: "\"c\" TEXT UNIQUE".to_string(),
+        };
+        let statements = rebuild_statements(&schema, "t", &change).expect("statements");
+        ex.run_atomic(&statements, true).expect("rebuild");
+
+        assert_eq!(
+            table_sql(&mut ex, "t"),
+            "CREATE TABLE \"t\" (a INTEGER PRIMARY KEY, b TEXT, \"c\" TEXT UNIQUE, UNIQUE (b))"
+        );
+        assert_eq!(query_i64(&ex, "SELECT count(*) FROM t WHERE c IS NULL"), 1);
     }
 
     #[test]
@@ -661,7 +714,7 @@ mod tests {
         let schema = ex.read_schema().expect("schema");
         for (column, expected) in [("t", false), ("idx", false), ("a", true), ("b", true)] {
             assert_eq!(
-                needs_rebuild(&schema, "t", column).expect(column),
+                needs_rebuild(&schema, "t", column, &[]).expect(column),
                 expected,
                 "{column}"
             );
@@ -710,12 +763,12 @@ mod tests {
             ("absent", false),
         ] {
             assert_eq!(
-                needs_rebuild(&schema, "t", column).expect(column),
+                needs_rebuild(&schema, "t", column, &[]).expect(column),
                 expected,
                 "{column}"
             );
         }
-        assert!(!needs_rebuild(&schema, "absent", "x").expect("absent table"));
+        assert!(!needs_rebuild(&schema, "absent", "x", &[]).expect("absent table"));
     }
 
     #[test]

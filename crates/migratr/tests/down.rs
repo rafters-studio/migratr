@@ -233,3 +233,165 @@ fn an_edited_file_refuses_down() {
 
     assert!(matches!(err, MigrateError::ChecksumMismatch { .. }));
 }
+
+#[test]
+fn a_dropped_unique_column_comes_back_last_with_its_definition() {
+    let dir = TempDir::new().expect("tempdir");
+    write(
+        dir.path(),
+        "20260101000001_users.json",
+        r#"{"op": "create_table", "table": "users", "columns": [
+            {"name": "id", "type": "INTEGER", "primary_key": 1},
+            {"name": "tag", "type": "TEXT", "unique": true},
+            {"name": "email", "type": "TEXT"}]}"#,
+    );
+    write(
+        dir.path(),
+        "20260101000002_drop_tag.json",
+        r#"{"op": "drop_column", "table": "users",
+            "column": {"name": "tag", "type": "TEXT", "unique": true}}"#,
+    );
+    let migrations = load(&dir);
+    let mut ex = executor();
+    up(&mut ex, &migrations[..1], None).expect("up one");
+    ex.connection()
+        .execute(
+            "INSERT INTO users (id, tag, email) VALUES (1, 't', 'e')",
+            [],
+        )
+        .expect("seed");
+    up(&mut ex, &migrations, None).expect("up two");
+
+    down(&mut ex, &migrations, 1).expect("down");
+
+    let columns: Vec<String> = ex
+        .connection()
+        .prepare("SELECT name FROM pragma_table_info('users')")
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(columns, ["id", "email", "tag"]);
+    let tag: Option<String> = ex
+        .connection()
+        .query_row("SELECT tag FROM users", [], |r| r.get(0))
+        .expect("row survives");
+    assert_eq!(tag, None);
+    ex.connection()
+        .execute("INSERT INTO users (id, tag) VALUES (2, 'a'), (3, 'b')", [])
+        .expect("distinct tags");
+    assert!(
+        ex.connection()
+            .execute("INSERT INTO users (id, tag) VALUES (4, 'a')", [])
+            .is_err(),
+        "the restored column is still UNIQUE"
+    );
+}
+
+#[test]
+fn a_dropped_column_comes_back_with_type_default_and_collation() {
+    let dir = TempDir::new().expect("tempdir");
+    write(
+        dir.path(),
+        "20260101000001_users.json",
+        r#"{"op": "create_table", "table": "users", "columns": [
+            {"name": "id", "type": "INTEGER", "primary_key": 1},
+            {"name": "name", "type": "TEXT", "collation": "NOCASE", "default": "'anon'"},
+            {"name": "email", "type": "TEXT"}]}"#,
+    );
+    write(
+        dir.path(),
+        "20260101000002_drop_name.json",
+        r#"{"op": "drop_column", "table": "users",
+            "column": {"name": "name", "type": "TEXT", "collation": "NOCASE", "default": "'anon'"}}"#,
+    );
+    let migrations = load(&dir);
+    let mut ex = executor();
+    up(&mut ex, &migrations, None).expect("up");
+
+    down(&mut ex, &migrations, 1).expect("down");
+
+    let schema = ex.read_schema().expect("schema");
+    let users = schema
+        .tables
+        .iter()
+        .find(|t| t.name == "users")
+        .expect("users");
+    let last = users.columns.last().expect("columns");
+    assert_eq!(last.name, "name");
+    assert_eq!(last.decl_type, "TEXT");
+    assert_eq!(last.default_value.as_deref(), Some("'anon'"));
+    let sql = schema
+        .objects
+        .iter()
+        .find(|o| o.name == "users")
+        .and_then(|o| o.sql.clone())
+        .expect("sql");
+    assert!(sql.contains("COLLATE NOCASE"), "{sql}");
+}
+
+#[test]
+fn an_added_column_with_its_index_reverses() {
+    let dir = TempDir::new().expect("tempdir");
+    write(dir.path(), "20260101000001_users.json", CREATE_USERS);
+    write(
+        dir.path(),
+        "20260101000002_nick.json",
+        r#"{"op": "add_column", "table": "users", "column": {"name": "nick", "type": "TEXT"}},
+           {"op": "create_index", "name": "users_nick", "table": "users", "columns": ["nick"]}"#,
+    );
+    let migrations = load(&dir);
+    let mut ex = executor();
+    up(&mut ex, &migrations[..1], None).expect("up one");
+    let after_one = state(ex.connection());
+    up(&mut ex, &migrations, None).expect("up two");
+
+    down(&mut ex, &migrations, 1).expect("down");
+
+    assert_eq!(state(ex.connection()), after_one);
+}
+
+#[test]
+fn rename_table_round_trips() {
+    let dir = TempDir::new().expect("tempdir");
+    write(dir.path(), "20260101000001_users.json", CREATE_USERS);
+    write(
+        dir.path(),
+        "20260101000002_rename.json",
+        r#"{"op": "rename_table", "from": "users", "to": "people"}"#,
+    );
+    let migrations = load(&dir);
+    let mut ex = executor();
+    up(&mut ex, &migrations[..1], None).expect("up one");
+    let after_one = state(ex.connection());
+    up(&mut ex, &migrations, None).expect("up two");
+
+    down(&mut ex, &migrations, 1).expect("down");
+
+    assert_eq!(state(ex.connection()), after_one);
+}
+
+#[test]
+fn a_failed_reversal_names_the_operation_in_file_order() {
+    let dir = TempDir::new().expect("tempdir");
+    write(
+        dir.path(),
+        "20260101000001_two_ops.json",
+        r#"{"op": "create_table", "table": "a", "columns": [{"name": "id", "type": "INTEGER"}]},
+           {"op": "raw_sql", "up": "CREATE TABLE b (x)", "down": "NOT SQL"}"#,
+    );
+    let migrations = load(&dir);
+    let mut ex = executor();
+    up(&mut ex, &migrations, None).expect("up");
+
+    let err = down(&mut ex, &migrations, 1).expect_err("fails");
+
+    assert!(matches!(
+        err,
+        MigrateError::Apply {
+            operation: Some(1),
+            ..
+        }
+    ));
+}

@@ -54,9 +54,40 @@ pub fn down(
         .collect::<Result<Vec<_>, MigrateError>>()?;
 
     for (version, ops) in &plan {
-        apply(exec, *version, ops, &[], ledger::delete_row(*version))?;
+        apply(exec, *version, ops, &[], ledger::delete_row(*version))
+            .map_err(|e| in_file_order(e, ops.len()))?;
     }
     Ok(DownReport { reverted: versions })
+}
+
+/// Renumbers the operation an error names from its position in the reversed list to its
+/// position in the migration file, whose `count` operations were reversed.
+fn in_file_order(error: MigrateError, count: usize) -> MigrateError {
+    match error {
+        MigrateError::Apply {
+            version,
+            statement,
+            operation,
+            source,
+        } => MigrateError::Apply {
+            version,
+            statement,
+            operation: operation.map(|i| count - 1 - i),
+            source,
+        },
+        MigrateError::RebuildNotFirst {
+            version,
+            table,
+            column,
+            operation,
+        } => MigrateError::RebuildNotFirst {
+            version,
+            table,
+            column,
+            operation: count - 1 - operation,
+        },
+        other => other,
+    }
 }
 
 /// The operations that undo `migration`, in the order to run them: the inverse of each
