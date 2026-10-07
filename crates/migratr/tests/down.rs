@@ -395,3 +395,38 @@ fn a_failed_reversal_names_the_operation_in_file_order() {
         }
     ));
 }
+
+#[test]
+fn a_reversal_that_would_rebuild_after_another_operation_refuses_before_anything_runs() {
+    let dir = TempDir::new().expect("tempdir");
+    write(dir.path(), "20260101000001_users.json", CREATE_USERS);
+    write(
+        dir.path(),
+        "20260101000002_code.json",
+        &format!(
+            r#"{{"op": "add_column", "table": "users",
+                "column": {{"name": "code", "type": "TEXT", "unique": true}}}}, {ADD_NAME}"#
+        ),
+    );
+    write(
+        dir.path(),
+        "20260101000003_index.json",
+        r#"{"op": "create_index", "name": "users_name", "table": "users", "columns": ["name"]}"#,
+    );
+    let migrations = load(&dir);
+    let mut ex = executor();
+    up(&mut ex, &migrations, None).expect("up");
+    let before = dump(ex.connection());
+
+    let err = down(&mut ex, &migrations, 2).expect_err("refused");
+
+    assert!(
+        matches!(
+            err,
+            MigrateError::RebuildNotFirst { version: 20260101000002, ref column, operation: 0, .. }
+                if column == "code"
+        ),
+        "{err:?}"
+    );
+    assert_eq!(dump(ex.connection()), before);
+}

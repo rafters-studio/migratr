@@ -3,6 +3,7 @@ use std::fmt;
 use crate::executor::Executor;
 use crate::ledger;
 use crate::migration::{IndexDef, MigrateError, Migration, Op};
+use crate::rebuild::add_needs_rebuild;
 use crate::sql_ddl::quote_ident as ident;
 use crate::up::{apply, ident_list};
 
@@ -52,6 +53,27 @@ pub fn down(
         .iter()
         .map(|m| Ok((m.version, inverse_ops(m)?)))
         .collect::<Result<Vec<_>, MigrateError>>()?;
+    // A reversal that would need a rebuild after another operation is refused before any
+    // migration in the range runs, so a multi-step down never stops part way for this.
+    for (version, ops) in &plan {
+        if let Some((i, table, column)) =
+            ops.iter().enumerate().skip(1).find_map(|(i, op)| match op {
+                Op::AddColumn { table, column } | Op::DropColumn { table, column }
+                    if add_needs_rebuild(column) || column.references.is_some() =>
+                {
+                    Some((i, table, column))
+                }
+                _ => None,
+            })
+        {
+            return Err(MigrateError::RebuildNotFirst {
+                version: *version,
+                table: table.clone(),
+                column: column.name.clone(),
+                operation: ops.len() - 1 - i,
+            });
+        }
+    }
 
     for (version, ops) in &plan {
         apply(exec, *version, ops, &[], ledger::delete_row(*version))
