@@ -182,6 +182,9 @@ pub enum MigrateError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[error("migration {version} cannot be reversed: operation {op_index} is raw SQL with no down")]
+    Irreversible { version: u64, op_index: usize },
+
     #[error("cannot rebuild table {table}: its CREATE TABLE statement could not be parsed")]
     UnparseableTable { table: String },
 
@@ -196,9 +199,10 @@ pub enum MigrateError {
     },
 
     #[error(
-        "migration {version}: dropping column {column} from table {table} needs a table \
-         rebuild, which must be the first operation of its migration, but it is operation \
-         {operation}; move the earlier operations into their own migration"
+        "migration {version}: operation {operation} changes column {column} of table {table} \
+         in a way that needs a table rebuild, and a rebuild must run before any other \
+         operation of its migration in that direction; put operation {operation} in its own \
+         migration"
     )]
     RebuildNotFirst {
         version: u64,
