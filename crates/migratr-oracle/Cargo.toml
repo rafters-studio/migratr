@@ -3,3 +3,12 @@ name = "migratr-oracle"
 version.workspace = true
 edition.workspace = true
 publish = false
+
+[dependencies]
+rusqlite.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+migratr.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
