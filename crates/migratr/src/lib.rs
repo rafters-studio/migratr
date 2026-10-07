@@ -4,6 +4,7 @@ mod down;
 mod embed;
 mod error;
 mod executor;
+mod format;
 mod ledger;
 mod migration;
 mod rebuild;

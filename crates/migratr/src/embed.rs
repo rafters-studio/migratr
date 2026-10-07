@@ -38,11 +38,6 @@ impl Migrator {
         }
     }
 
-    /// The embedded migrations, in version order.
-    pub fn migrations(&self) -> &[Migration] {
-        &self.migrations
-    }
-
     /// Applies every pending migration.
     pub fn up(&self, exec: &mut impl Executor) -> Result<UpReport, MigrateError> {
         up(exec, &self.migrations, None)

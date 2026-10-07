@@ -1,14 +1,15 @@
 //! The `embed!` macro behind `migratr::embed!`.
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use proc_macro::{Delimiter, TokenStream, TokenTree};
 
 // The macro validates a directory with the same parser the library runs. The library depends
 // on this crate, so the parser's source file is shared rather than depended on.
 #[allow(dead_code)]
-#[path = "../../migratr/src/migration.rs"]
-mod migration;
+#[path = "../../migratr/src/format.rs"]
+mod format;
 
 /// Embeds the migrations directory named by the string literal, relative to the calling
 /// crate's manifest directory, and expands to a `migratr::Migrator`. A file that does not
@@ -30,12 +31,33 @@ fn expand(input: TokenStream) -> Result<TokenStream, String> {
         .ok_or_else(|| "embed!: CARGO_MANIFEST_DIR is not set".to_string())?;
     let dir = PathBuf::from(manifest).join(&relative);
 
-    let migrations = migration::load_dir(&dir).map_err(|e| format!("embed!: {e}"))?;
+    // The migration files: every `.json` file but `schema.json`, as the library reads them.
+    let io = |path: &Path, e: std::io::Error| format!("embed!: {}: {e}", path.display());
+    let mut files: Vec<(String, String)> = Vec::new();
+    for entry in fs::read_dir(&dir).map_err(|e| io(&dir, e))? {
+        let path = entry.map_err(|e| io(&dir, e))?.path();
+        let file = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .ok_or_else(|| format!("embed!: {} is not valid UTF-8", path.display()))?
+            .to_string();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") || file == "schema.json" {
+            continue;
+        }
+        let contents = fs::read_to_string(&path).map_err(|e| io(&path, e))?;
+        files.push((file, contents));
+    }
+    files.sort();
+
+    let sources: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(file, contents)| (file.as_str(), contents.as_str()))
+        .collect();
+    format::parse_all(&sources).map_err(|e| format!("embed!: {e}"))?;
 
     let mut entries = String::new();
-    for m in &migrations {
-        let file = format!("{}_{}.json", m.version, m.name);
-        let path = dir.join(&file);
+    for (file, _) in &files {
+        let path = dir.join(file);
         let path = path
             .to_str()
             .ok_or_else(|| format!("embed!: {} is not valid UTF-8", path.display()))?;
