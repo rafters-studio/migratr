@@ -5,8 +5,7 @@
 //! so everything else the author declared (types or their absence, collations, CHECK and
 //! foreign-key clauses, generated columns, AUTOINCREMENT, `WITHOUT ROWID`) carries over
 //! unchanged. The statements run inside the migration's transaction with foreign_keys
-//! suspended by the executor; the caller brackets the migration with [`FK_BASELINE`] and
-//! [`fk_check`].
+//! suspended by the executor; the caller ends the migration with [`fk_check`].
 
 use crate::executor::{SchemaObject, SchemaSnapshot, TableInfo};
 use crate::migration::MigrateError;
@@ -233,7 +232,8 @@ pub(crate) fn touched_objects(schema: &SchemaSnapshot, table: &str) -> Vec<Strin
 /// Refused before any statement with `UnparseableTable` when the table's stored CREATE
 /// statement cannot be split into column definitions that match the table's columns, or
 /// when the table or the changed column is absent from `schema`; and with `ColumnInUse`
-/// when a recreated index, view or trigger names the dropped column, since SQLite does not
+/// when another column's definition, a table constraint or a recreated index, view or
+/// trigger names the dropped column, since SQLite does not
 /// check a view or trigger body when it is created and the object would break on first use.
 pub(crate) fn rebuild_statements(
     schema: &SchemaSnapshot,
@@ -248,6 +248,20 @@ pub(crate) fn rebuild_statements(
             table: table.to_string(),
         })?;
     let table_name = &parsed.object.name;
+
+    let other_items = (0..parsed.body.items.len())
+        .filter(|&i| i != dropped)
+        .map(|i| parsed.item(i));
+    if let Some(item) = other_items
+        .clone()
+        .find(|item| mentions_identifier(item, column))
+    {
+        return Err(MigrateError::ColumnInUse {
+            table: table_name.clone(),
+            column: column.clone(),
+            object: item.split_whitespace().collect::<Vec<_>>().join(" "),
+        });
+    }
 
     let dependents = Dependents::of(schema, table_name);
     if let Some(user) = dependents.all().find(|o| mentions(o, column)) {
@@ -348,31 +362,21 @@ fn free_name(taken: &[&str], base: &str) -> String {
         .unwrap_or_else(|| base.to_string())
 }
 
-/// Records the foreign-key violations that exist before a migration's first statement, so
-/// [`fk_check`] blames the migration only for violations it adds.
-pub(crate) const FK_BASELINE: &str =
-    "CREATE TEMP TABLE _migratr_fk_before AS SELECT * FROM pragma_foreign_key_check";
-
-/// The message prefix of [`fk_check`]'s failure; the count of new violations follows it,
+/// The message prefix of [`fk_check`]'s failure; the number of violating rows follows it,
 /// then ` in ` and the first table that has one.
 pub(crate) const FK_VIOLATION_MESSAGE: &str = "migratr: foreign key violations: ";
 
-/// One statement that aborts with [`FK_VIOLATION_MESSAGE`] when the database has
-/// foreign-key violations that [`FK_BASELINE`] did not record. RAISE works only in a trigger,
-/// so the count goes into a temporary table whose trigger raises. Every temporary object is
-/// dropped again before the statement ends.
+/// One statement that aborts with [`FK_VIOLATION_MESSAGE`] when the database has any
+/// foreign-key violation. RAISE works only in a trigger, so the count goes into a temporary
+/// table whose trigger raises; both are dropped again before the statement ends.
 pub(crate) fn fk_check() -> String {
     let message = quote_literal(FK_VIOLATION_MESSAGE);
     format!(
-        "CREATE TEMP TABLE _migratr_fk_new AS \
-           SELECT * FROM pragma_foreign_key_check EXCEPT SELECT * FROM _migratr_fk_before; \
-         CREATE TEMP TABLE _migratr_fk_raise (n INTEGER, tbl TEXT); \
+        "CREATE TEMP TABLE _migratr_fk_raise (n INTEGER, tbl TEXT); \
          CREATE TEMP TRIGGER _migratr_fk_raise_trigger BEFORE INSERT ON _migratr_fk_raise \
            WHEN NEW.n > 0 BEGIN SELECT RAISE(ABORT, {message} || NEW.n || ' in ' || NEW.tbl); END; \
-         INSERT INTO _migratr_fk_raise SELECT count(*), min(\"table\") FROM _migratr_fk_new; \
-         DROP TABLE _migratr_fk_raise; \
-         DROP TABLE _migratr_fk_new; \
-         DROP TABLE _migratr_fk_before"
+         INSERT INTO _migratr_fk_raise SELECT count(*), min(\"table\") FROM pragma_foreign_key_check; \
+         DROP TABLE _migratr_fk_raise"
     )
 }
 
@@ -544,29 +548,31 @@ mod tests {
     }
 
     #[test]
-    fn the_foreign_key_check_blames_only_new_violations() {
+    fn the_foreign_key_check_counts_every_violating_row() {
         let mut ex = executor(
-            "PRAGMA foreign_keys = OFF;
-             CREATE TABLE p (id INTEGER PRIMARY KEY);
+            "CREATE TABLE p (id INTEGER PRIMARY KEY);
              CREATE TABLE c (pid INTEGER REFERENCES p (id));
-             INSERT INTO c VALUES (8);",
+             CREATE TABLE w (k TEXT PRIMARY KEY, pid INTEGER REFERENCES p (id)) WITHOUT ROWID;
+             PRAGMA foreign_keys = OFF;
+             INSERT INTO p VALUES (1);
+             INSERT INTO c VALUES (1);",
         );
-        let check = |extra: &str| vec![FK_BASELINE.to_string(), extra.to_string(), fk_check()];
+        ex.run_atomic(&[fk_check()], true).expect("no violations");
 
-        ex.run_atomic(&check("INSERT INTO p VALUES (1)"), true)
-            .expect("the existing orphan is not blamed");
-
-        let statements = check("INSERT INTO c VALUES (9), (10)");
+        let statements = [
+            "INSERT INTO w VALUES ('a', 8), ('b', 8), ('c', 9)".to_string(),
+            fk_check(),
+        ];
         let err = ex
             .run_atomic(&statements, true)
-            .expect_err("new orphans abort");
-        assert_eq!(err.index, Some(2));
+            .expect_err("violations abort");
+        assert_eq!(err.index, Some(1));
         let message = err.source.to_string();
         assert!(
-            message.contains(&format!("{FK_VIOLATION_MESSAGE}2 in c")),
+            message.contains(&format!("{FK_VIOLATION_MESSAGE}3 in w")),
             "{message}"
         );
-        assert_eq!(query_i64(&ex, "SELECT count(*) FROM c"), 1);
+        assert_eq!(query_i64(&ex, "SELECT count(*) FROM w"), 0);
         assert_eq!(query_i64(&ex, "SELECT count(*) FROM sqlite_temp_master"), 0);
     }
 

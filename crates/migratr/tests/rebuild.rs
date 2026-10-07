@@ -262,10 +262,10 @@ fn a_failure_at_any_rebuild_statement_changes_nothing_and_restores_foreign_keys(
                 break;
             }
         }
-        // The ledger create, the foreign-key baseline, the view drop, create, copy, drop,
+        // The ledger create, the view drop, create, copy, drop,
         // rename, one index, one view, three triggers, the foreign-key check, and the ledger
         // insert.
-        assert_eq!(fail_at, 14);
+        assert_eq!(fail_at, 13);
     }
 }
 
@@ -304,23 +304,77 @@ fn an_orphaning_insert_in_the_same_migration_is_refused_and_leaves_the_database_
 }
 
 #[test]
-fn violations_that_existed_before_the_migration_do_not_block_it() {
+fn violations_that_existed_before_the_migration_refuse_it_with_the_exact_count() {
     let mut ex = seeded(PARENTS_AND_KIDS);
     ex.connection()
         .execute_batch("PRAGMA foreign_keys = OFF; INSERT INTO kids VALUES (7), (8); PRAGMA foreign_keys = ON;")
         .expect("orphans");
+    let before = dump(ex.connection());
     let (_dir, migrations) = migration(&drop_column("parents", "code"));
 
-    up(&mut ex, &migrations, None).expect("up");
+    let err = up(&mut ex, &migrations, None).expect_err("violations");
 
-    assert_eq!(query_i64(ex.connection(), "SELECT count(*) FROM kids"), 3);
-    assert_eq!(
-        query_i64(
-            ex.connection(),
-            "SELECT count(*) FROM pragma_table_info('parents')"
+    assert!(
+        matches!(
+            err,
+            MigrateError::ForeignKeyViolation { ref table, rows: 2 } if table == "kids"
         ),
-        1
+        "{err:?}"
     );
+    assert_eq!(dump(ex.connection()), before);
+    assert!(foreign_keys(ex.connection()));
+}
+
+#[test]
+fn several_new_orphans_in_a_without_rowid_child_are_all_counted() {
+    let mut ex = seeded(
+        "CREATE TABLE parents (id INTEGER PRIMARY KEY, code TEXT UNIQUE);
+         CREATE TABLE kids (k TEXT PRIMARY KEY, parent_id INTEGER REFERENCES parents (id)) WITHOUT ROWID;
+         INSERT INTO parents VALUES (1, 'a');",
+    );
+    let (_dir, migrations) = migration(&format!(
+        r#"{{"op": "raw_sql", "up": "INSERT INTO kids VALUES ('a', 7), ('b', 7), ('c', 8)"}}, {}"#,
+        drop_column("parents", "code")
+    ));
+
+    let err = up(&mut ex, &migrations, None).expect_err("violations");
+
+    assert!(
+        matches!(
+            err,
+            MigrateError::ForeignKeyViolation { ref table, rows: 3 } if table == "kids"
+        ),
+        "{err:?}"
+    );
+    assert_eq!(query_i64(ex.connection(), "SELECT count(*) FROM kids"), 0);
+}
+
+#[test]
+fn a_column_named_by_a_constraint_or_another_column_is_refused_and_nothing_changes() {
+    let tables = [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, gone TEXT, UNIQUE (gone))",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, gone INTEGER, FOREIGN KEY (gone) REFERENCES t (id))",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, gone INTEGER, CHECK (gone > 0))",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, gone INTEGER, other INTEGER CHECK (other > gone))",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, gone INTEGER, twice INTEGER GENERATED ALWAYS AS (gone * 2))",
+    ];
+    for table in tables {
+        let mut ex = seeded(table);
+        let before = dump(ex.connection());
+        let (_dir, migrations) = migration(&drop_column("t", "gone"));
+
+        let err = up(&mut ex, &migrations, None).expect_err(table);
+
+        assert!(
+            matches!(
+                err,
+                MigrateError::ColumnInUse { ref table, ref column, ref object }
+                    if table == "t" && column == "gone" && object.contains("gone")
+            ),
+            "{table}: {err:?}"
+        );
+        assert_eq!(dump(ex.connection()), before, "{table}");
+    }
 }
 
 /// `gone` is UNIQUE, so only the rebuild can drop it.

@@ -1,7 +1,7 @@
 use crate::executor::Executor;
 use crate::ledger;
 use crate::migration::{Column, MigrateError, Migration, Op};
-use crate::rebuild::{FK_BASELINE, FK_VIOLATION_MESSAGE, fk_check};
+use crate::rebuild::{FK_VIOLATION_MESSAGE, fk_check};
 use crate::sql_ddl::quote_ident as ident;
 use crate::tracked::Tracked;
 
@@ -57,43 +57,38 @@ fn apply(exec: &mut impl Executor, migration: &Migration) -> Result<(), MigrateE
 
     // Each operation's statements, with the operation they came from.
     let mut body: Vec<(String, usize)> = Vec::new();
-    // The table of the first rebuild, which the foreign-key check names on failure.
-    let mut rebuilt: Option<&str> = None;
+    let mut has_rebuild = false;
     for (i, op) in migration.up.iter().enumerate() {
         let rebuild = match &mut tracked {
             Some(tracked) => tracked.step(migration.version, i, op)?,
             None => None,
         };
         match (rebuild, op) {
-            (Some(rebuild), Op::DropColumn { table, .. }) => {
-                rebuilt.get_or_insert(table);
+            (Some(rebuild), _) => {
+                has_rebuild = true;
                 body.extend(rebuild.into_iter().map(|s| (s, i)));
             }
-            _ => body.push((render(op), i)),
+            (None, _) => body.push((render(op), i)),
         }
     }
 
-    // A migration with a rebuild runs with foreign keys suspended, so it is checked as a
-    // whole: violations that exist before the first statement are not its doing.
+    // A migration with a rebuild runs with foreign keys suspended, so the whole database is
+    // checked before the ledger row, as SQLite's own procedure does.
     let mut statements = vec![ledger::CREATE_LEDGER.to_string()];
     let mut origins: Vec<Option<usize>> = vec![None];
-    if rebuilt.is_some() {
-        statements.push(FK_BASELINE.to_string());
-        origins.push(None);
-    }
     for (statement, operation) in body {
         statements.push(statement);
         origins.push(Some(operation));
     }
-    let fk_check_at = rebuilt.map(|_| statements.len());
-    if rebuilt.is_some() {
+    let fk_check_at = has_rebuild.then_some(statements.len());
+    if has_rebuild {
         statements.push(fk_check());
         origins.push(None);
     }
     statements.push(ledger::insert_row(migration));
     origins.push(None);
 
-    exec.run_atomic(&statements, rebuilt.is_some())
+    exec.run_atomic(&statements, has_rebuild)
         .map_err(|failure| {
             let violation = failure
                 .index
