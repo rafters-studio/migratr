@@ -27,7 +27,7 @@ pub enum MigrateError {
     },
 
     #[error(
-        "migration {version}_{name} was edited after it was applied: its checksum no longer matches the ledger"
+        "migration {version}_{name} was edited after it was applied. Applied migrations are not edited: restore the file to what was applied, then write a new migration for the change"
     )]
     ChecksumMismatch { version: u64, name: String },
 

@@ -292,6 +292,34 @@ fn status_reports_applied_pending_mismatch_and_missing() {
 }
 
 #[test]
+fn an_edited_applied_migration_under_json_says_to_restore_and_write_a_new_one() {
+    let p = Project::new();
+    let first = p.new_migration(&["create_users", "id:integer:pk"]);
+    assert_eq!(p.run(&["up"]).code, 0);
+    let text = fs::read_to_string(&first).expect("read");
+    fs::write(&first, text.replace("\"id\"", "\"ident\"")).expect("edit");
+
+    let run = p.run(&["--json", "up"]);
+
+    assert_ne!(run.code, 0);
+    let doc = run.json();
+    assert_eq!(doc["status"], "error");
+    assert_eq!(doc["code"], "checksum_mismatch");
+    let message = doc["message"].as_str().expect("message");
+    assert!(message.contains("create_users"), "{message}");
+    assert!(
+        message.contains("Applied migrations are not edited"),
+        "{message}"
+    );
+    assert!(
+        message.contains(
+            "restore the file to what was applied, then write a new migration for the change"
+        ),
+        "{message}"
+    );
+}
+
+#[test]
 fn down_says_data_is_not_restored_and_points_at_the_snapshot() {
     let p = Project::new();
     p.new_migration(&["create_users", "id:integer:pk"]);
