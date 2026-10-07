@@ -161,6 +161,38 @@ pub enum MigrateError {
         path: PathBuf,
         source: std::io::Error,
     },
+
+    #[error(
+        "migration {version}_{name} was edited after it was applied: its checksum no longer matches the ledger"
+    )]
+    ChecksumMismatch { version: u64, name: String },
+
+    #[error("migration {version}_{name} is in the ledger but its file is missing")]
+    MissingFile { version: u64, name: String },
+
+    #[error("migration {version} failed and was rolled back{}: {source}", failure_site(.operation, .statement))]
+    Apply {
+        version: u64,
+        /// The statement that failed. `None` when the failure was not in a statement.
+        statement: Option<String>,
+        /// Position within the migration's operations of the operation that produced
+        /// `statement`. `None` for the ledger's own statements and for failures outside a
+        /// statement.
+        operation: Option<usize>,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[error(transparent)]
+    Executor(Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// Names the failing operation and statement in an `Apply` message.
+fn failure_site(operation: &Option<usize>, statement: &Option<String>) -> String {
+    match (operation, statement) {
+        (Some(operation), Some(statement)) => format!(" at operation {operation} ({statement})"),
+        (None, Some(statement)) => format!(" at ({statement})"),
+        _ => String::new(),
+    }
 }
 
 /// The JSON body of a migration file.
