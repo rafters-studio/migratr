@@ -278,6 +278,20 @@ pub fn load_dir(path: &Path) -> Result<Vec<Migration>, MigrateError> {
         found.push((file, migration));
     }
 
+    sorted(found)
+}
+
+/// Parses migration files given as (file name, contents) pairs, sorted by version.
+pub(crate) fn load_sources(sources: &[(&str, &str)]) -> Result<Vec<Migration>, MigrateError> {
+    let found = sources
+        .iter()
+        .map(|(file, contents)| Ok((file.to_string(), parse(file, contents)?)))
+        .collect::<Result<_, MigrateError>>()?;
+    sorted(found)
+}
+
+/// Orders (file name, migration) pairs by version and refuses a repeated version.
+fn sorted(mut found: Vec<(String, Migration)>) -> Result<Vec<Migration>, MigrateError> {
     found.sort_by(|a, b| (a.1.version, &a.0).cmp(&(b.1.version, &b.0)));
 
     if let Some(first) = found
