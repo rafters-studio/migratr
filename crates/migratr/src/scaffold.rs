@@ -333,7 +333,7 @@ fn table_columns(sql: &str) -> Option<Vec<Column>> {
     Some(columns)
 }
 
-const CONSTRAINT_WORDS: [&str; 11] = [
+const CONSTRAINT_WORDS: [&str; 15] = [
     "CONSTRAINT",
     "PRIMARY",
     "NOT",
@@ -345,6 +345,10 @@ const CONSTRAINT_WORDS: [&str; 11] = [
     "REFERENCES",
     "GENERATED",
     "AS",
+    "ON",
+    "MATCH",
+    "DEFERRABLE",
+    "INITIALLY",
 ];
 
 /// One column definition: its name, its declared type verbatim, then its constraints. `None`
@@ -431,8 +435,26 @@ fn parse_column(item: &str) -> Option<Column> {
                 stored: toks.get(next).is_some_and(|t| t.is_keyword("STORED")),
             });
             i = next;
-        } else {
+        } else if word(0, "CONSTRAINT") {
+            i += 2;
+        } else if [
+            "KEY",
+            "NULL",
+            "ASC",
+            "DESC",
+            "AUTOINCREMENT",
+            "GENERATED",
+            "ALWAYS",
+            "STORED",
+            "VIRTUAL",
+        ]
+        .iter()
+        .any(|w| word(0, w))
+        {
             i += 1;
+        } else {
+            // A clause the column model cannot hold, such as ON CONFLICT or DEFERRABLE.
+            return None;
         }
     }
     Some(column)
@@ -499,10 +521,15 @@ fn default_value(item: &str, toks: &[Token], at: usize) -> Option<(String, usize
             j += 1;
         }
         let words = j;
-        while bytes
-            .get(j)
-            .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$'))
-        {
+        while bytes.get(j).is_some_and(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'_' | b'.' | b'$')
+                // The sign of a decimal exponent, as in 1.5e-3.
+                || (matches!(b, b'+' | b'-')
+                    && j > words
+                    && matches!(bytes[j - 1], b'e' | b'E')
+                    && bytes[words].is_ascii_digit())
+        }) {
             j += 1;
         }
         if j == words {
@@ -514,6 +541,10 @@ fn default_value(item: &str, toks: &[Token], at: usize) -> Option<(String, usize
         }
         j
     };
+    // A literal followed by anything but whitespace or the item's end was not read whole.
+    if bytes.get(end).is_some_and(|b| !b.is_ascii_whitespace()) {
+        return None;
+    }
     let next = toks
         .iter()
         .position(|t| t.span.start >= end)
@@ -708,6 +739,7 @@ mod tests {
         score REAL DEFAULT (1 + 1), \
         slug TEXT GENERATED ALWAYS AS (lower(email)) STORED, \
         delta INTEGER DEFAULT -1, \
+        expo REAL DEFAULT 1.5e-3, \
         raw BLOB DEFAULT X'00ff')";
 
     #[test]
@@ -759,6 +791,7 @@ mod tests {
         );
         assert_eq!(column_of("score").default.as_deref(), Some("1 + 1"));
         assert_eq!(column_of("delta").default.as_deref(), Some("-1"));
+        assert_eq!(column_of("expo").default.as_deref(), Some("1.5e-3"));
         assert_eq!(column_of("raw").default.as_deref(), Some("X'00ff'"));
         assert_eq!(
             column_of("slug").generated,
@@ -768,6 +801,21 @@ mod tests {
             })
         );
         assert_eq!(column_of("id").primary_key, Some(1));
+    }
+
+    #[test]
+    fn a_column_with_a_clause_the_model_cannot_hold_is_refused() {
+        for body in [
+            "x TEXT DEFERRABLE INITIALLY DEFERRED",
+            "x TEXT NOT NULL ON CONFLICT REPLACE",
+            "x TEXT UNIQUE ON CONFLICT IGNORE",
+            "x TEXT NOT DEFERRABLE",
+        ] {
+            let sql = format!("CREATE TABLE t (id INTEGER, {body})");
+            let dir = schema_dir(&[("table", "t", &sql)]);
+            let err = scaffold(dir.path(), "remove_x_from_t", &[]).expect_err(body);
+            assert!(err.to_string().contains("table t"), "{body}: {err}");
+        }
     }
 
     #[test]

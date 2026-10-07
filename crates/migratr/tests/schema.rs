@@ -69,7 +69,7 @@ fn schema_json_follows_up_and_down() {
 }
 
 #[test]
-fn a_failed_up_leaves_schema_json_unchanged() {
+fn a_failed_up_leaves_the_database_and_an_existing_schema_json_alone() {
     let dir = migrations_dir();
     let mut ex = executor();
     let migrations = load_dir(dir.path()).expect("load");
