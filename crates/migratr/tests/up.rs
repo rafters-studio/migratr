@@ -230,6 +230,18 @@ fn editing_an_applied_file_refuses_the_run_naming_it() {
         err,
         MigrateError::ChecksumMismatch { version: 20260101000001, ref name } if name == "one"
     ));
+    let message = err.to_string();
+    assert!(message.contains("20260101000001_one"), "{message}");
+    assert!(
+        message.contains("Applied migrations are not edited"),
+        "{message}"
+    );
+    assert!(
+        message.contains(
+            "restore the file to what was applied, then write a new migration for the change"
+        ),
+        "{message}"
+    );
     assert_eq!(ledger_versions(&mut ex), vec![20260101000001]);
 }
 
