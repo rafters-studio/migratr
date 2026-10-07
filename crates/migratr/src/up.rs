@@ -116,7 +116,7 @@ fn foreign_key_violation(message: &str) -> Option<MigrateError> {
 }
 
 /// The SQL statement for one operation.
-pub(crate) fn render(op: &Op) -> String {
+fn render(op: &Op) -> String {
     match op {
         Op::CreateTable {
             table,
@@ -182,7 +182,7 @@ fn create_table(table: &str, columns: &[Column], without_rowid: bool) -> String 
     )
 }
 
-pub(crate) fn column_def(column: &Column) -> String {
+fn column_def(column: &Column) -> String {
     let mut sql = ident(&column.name);
     if !column.type_name.is_empty() {
         sql.push(' ');

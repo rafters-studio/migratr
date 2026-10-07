@@ -603,31 +603,67 @@ fn columns(conn: &Connection, table: &str) -> Vec<String> {
         .expect("columns")
 }
 
-#[test]
-fn a_column_added_earlier_in_the_migration_is_in_the_rebuild() {
-    let mut ex = seeded(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, u TEXT UNIQUE, b TEXT);
-         INSERT INTO t VALUES (1, 'u', 'b');",
-    );
-    let (_dir, migrations) = migration(&format!(
-        r#"{{"op": "add_column", "table": "t", "column": {{"name": "c", "type": "TEXT"}}}},
-           {{"op": "create_index", "name": "t_c", "table": "t", "columns": ["c"]}},
-           {}"#,
-        drop_column("t", "u")
-    ));
+/// Runs `ops` then a rebuild-only drop of `t.gone` against `schema` and expects the refusal
+/// naming operation `operation`, with the database unchanged.
+fn assert_refused_after(schema: &str, ops: &str, operation: usize) {
+    let mut ex = seeded(schema);
+    let before = dump(ex.connection());
+    let (_dir, migrations) = migration(&format!("{ops}, {}", drop_column("t", "gone")));
 
-    up(&mut ex, &migrations, None).expect("up");
+    let err = up(&mut ex, &migrations, None).expect_err(ops);
 
-    let conn = ex.connection();
-    assert_eq!(columns(conn, "t"), ["id", "b", "c"]);
-    assert_eq!(
-        query_i64(
-            conn,
-            "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 't_c'"
+    assert!(
+        matches!(
+            err,
+            MigrateError::UntrackedChange { ref table, operation: n, .. }
+                if table == "t" && n == operation
         ),
-        1
+        "{ops}: {err:?}"
     );
-    assert_eq!(query_i64(conn, "SELECT count(*) FROM t WHERE b = 'b'"), 1);
+    assert!(err.to_string().contains("own migration"), "{err}");
+    assert_eq!(dump(ex.connection()), before, "{ops}");
+}
+
+#[test]
+fn a_rebuild_after_an_earlier_operation_changed_the_table_is_refused() {
+    let schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, gone TEXT UNIQUE)";
+    for (ops, operation) in [
+        (
+            r#"{"op": "add_column", "table": "t", "column": {"name": "c", "type": "TEXT"}}"#,
+            0,
+        ),
+        (
+            r#"{"op": "create_index", "name": "t_name", "table": "t", "columns": ["name"]}"#,
+            0,
+        ),
+        (
+            r#"{"op": "rename_column", "table": "t", "from": "name", "to": "label"}"#,
+            0,
+        ),
+        (r#"{"op": "rename_table", "from": "t", "to": "u"}"#, 0),
+        (
+            r#"{"op": "drop_column", "table": "t", "column": {"name": "name", "type": "TEXT"}}"#,
+            0,
+        ),
+    ] {
+        assert_refused_after(schema, ops, operation);
+    }
+}
+
+#[test]
+fn a_rebuild_after_an_earlier_operation_changed_a_recreated_object_is_refused() {
+    let schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, gone TEXT UNIQUE);
+         CREATE TABLE log (x);
+         CREATE INDEX t_id ON t (id);
+         CREATE VIEW v AS SELECT id FROM t;
+         CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES (1); END";
+    for ops in [
+        r#"{"op": "drop_index", "definition": {"name": "t_id", "table": "t", "columns": ["id"]}}"#,
+        r#"{"op": "rename_table", "from": "log", "to": "history"}"#,
+        r#"{"op": "raw_sql", "up": "DROP VIEW v"}"#,
+    ] {
+        assert_refused_after(schema, ops, 0);
+    }
 }
 
 #[test]
@@ -652,42 +688,6 @@ fn a_child_table_dropped_earlier_in_the_migration_is_not_checked_after() {
 }
 
 #[test]
-fn a_renamed_table_and_column_are_rebuilt_under_their_new_names() {
-    let mut ex = seeded(
-        "CREATE TABLE parents (id INTEGER PRIMARY KEY, name TEXT, code TEXT UNIQUE);
-         CREATE TABLE kids (parent_id INTEGER REFERENCES parents (id) ON DELETE CASCADE);
-         CREATE INDEX parents_name ON parents (name);
-         INSERT INTO parents VALUES (1, 'a', 'x');
-         INSERT INTO kids VALUES (1);",
-    );
-    let (_dir, migrations) = migration(&format!(
-        r#"{{"op": "rename_table", "from": "parents", "to": "people"}},
-           {{"op": "rename_column", "table": "people", "from": "name", "to": "label"}},
-           {}"#,
-        drop_column("people", "code")
-    ));
-
-    up(&mut ex, &migrations, None).expect("up");
-
-    let conn = ex.connection();
-    assert_eq!(columns(conn, "people"), ["id", "label"]);
-    let index: String = conn
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE name = 'parents_name'",
-            [],
-            |r| r.get(0),
-        )
-        .expect("index");
-    assert!(
-        index.contains("people") && index.contains("label"),
-        "{index}"
-    );
-    conn.execute("DELETE FROM people WHERE id = 1", [])
-        .expect("delete");
-    assert_eq!(query_i64(conn, "SELECT count(*) FROM kids"), 0);
-}
-
-#[test]
 fn raw_sql_naming_the_table_before_a_rebuild_is_refused_and_nothing_changes() {
     let mut ex = seeded(LIBRARY);
     let before = dump(ex.connection());
@@ -703,27 +703,6 @@ fn raw_sql_naming_the_table_before_a_rebuild_is_refused_and_nothing_changes() {
             err,
             MigrateError::UntrackedChange { ref table, operation: 0, .. } if table == "authors"
         ),
-        "{err:?}"
-    );
-    assert_eq!(dump(ex.connection()), before);
-}
-
-#[test]
-fn a_view_that_an_earlier_rename_rewrote_blocks_the_rebuild() {
-    let mut ex = seeded(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, gone TEXT UNIQUE);
-         CREATE VIEW v AS SELECT name FROM t;",
-    );
-    let before = dump(ex.connection());
-    let (_dir, migrations) = migration(&format!(
-        r#"{{"op": "rename_column", "table": "t", "from": "name", "to": "label"}}, {}"#,
-        drop_column("t", "gone")
-    ));
-
-    let err = up(&mut ex, &migrations, None).expect_err("refused");
-
-    assert!(
-        matches!(err, MigrateError::UntrackedChange { operation: 0, .. }),
         "{err:?}"
     );
     assert_eq!(dump(ex.connection()), before);

@@ -136,34 +136,6 @@ pub(crate) fn needs_rebuild(
     Ok(constrained || named_elsewhere || indexed)
 }
 
-/// `table`'s CREATE statement without `column`, or `None` when it does not parse or has no
-/// such column.
-pub(crate) fn sql_without_column(
-    schema: &SchemaSnapshot,
-    table: &str,
-    column: &str,
-) -> Option<String> {
-    let parsed = parse(schema, table).ok()?;
-    Some(parsed.without_column(parsed.column_index(column)?))
-}
-
-/// `table`'s CREATE statement with `definition` added after its last column, or `None` when
-/// it does not parse.
-pub(crate) fn sql_with_column(
-    schema: &SchemaSnapshot,
-    table: &str,
-    definition: &str,
-) -> Option<String> {
-    let parsed = parse(schema, table).ok()?;
-    let last = parsed.info.columns.len().checked_sub(1)?;
-    let at = parsed.body.items[last].end;
-    Some(format!(
-        "{}, {definition}{}",
-        &parsed.sql[..at],
-        &parsed.sql[at..]
-    ))
-}
-
 fn mentions(object: &SchemaObject, name: &str) -> bool {
     object
         .sql
@@ -763,20 +735,5 @@ mod tests {
                 "via_view"
             ]
         );
-    }
-
-    #[test]
-    fn the_snapshot_text_edits_add_and_remove_columns() {
-        let mut ex = executor("CREATE TABLE t (a INTEGER, b TEXT, PRIMARY KEY (a))");
-        let schema = ex.read_schema().expect("schema");
-        assert_eq!(
-            sql_with_column(&schema, "t", "\"c\" TEXT").as_deref(),
-            Some("CREATE TABLE t (a INTEGER, b TEXT, \"c\" TEXT, PRIMARY KEY (a))")
-        );
-        assert_eq!(
-            sql_without_column(&schema, "t", "b").as_deref(),
-            Some("CREATE TABLE t (a INTEGER, PRIMARY KEY (a))")
-        );
-        assert_eq!(sql_without_column(&schema, "t", "nope"), None);
     }
 }
