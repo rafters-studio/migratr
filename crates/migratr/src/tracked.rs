@@ -7,7 +7,10 @@
 
 use crate::executor::{ColumnInfo, SchemaObject, SchemaSnapshot, TableInfo};
 use crate::migration::{Column, MigrateError, Op};
-use crate::rebuild::{TableChange, needs_rebuild, rebuild_statements, touched_objects};
+use crate::rebuild::{
+    TableChange, needs_rebuild, rebuild_statements, sql_with_column, sql_without_column,
+    touched_objects,
+};
 use crate::sql_ddl::{
     create_table_name_span, mentions_identifier, quote_ident, rename_after_keyword,
     rename_column_in_index, rename_column_in_table,
@@ -66,9 +69,7 @@ impl Tracked {
             }
             Op::RenameTable { from, to } => self.rename_table(at, from, to),
             Op::AddColumn { table, column } => {
-                if let Some(sql) =
-                    crate::rebuild::sql_with_column(&self.schema, table, &column_def(column))
-                {
+                if let Some(sql) = sql_with_column(&self.schema, table, &column_def(column)) {
                     let position = self
                         .schema
                         .tables
@@ -102,9 +103,7 @@ impl Tracked {
                     rebuild = Some(rebuild_statements(&self.schema, table, &change)?);
                     self.move_rebuilt_to_end(table);
                 }
-                if let Some(sql) =
-                    crate::rebuild::sql_without_column(&self.schema, table, &column.name)
-                {
+                if let Some(sql) = sql_without_column(&self.schema, table, &column.name) {
                     self.set_table_sql(table, sql);
                     self.table_info(table, |t| {
                         t.columns.retain(|c| !same(&c.name, &column.name));
