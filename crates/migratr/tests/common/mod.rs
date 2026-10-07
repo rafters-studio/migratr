@@ -1,6 +1,6 @@
 //! Helpers shared by the integration tests.
 
-use std::path::Path;
+use std::path::PathBuf;
 
 use migratr::{AtomicError, Executor, LedgerRow, RusqliteExecutor, SchemaSnapshot};
 use rusqlite::Connection;
@@ -38,8 +38,8 @@ impl Executor for FailAt {
         self.inner.run_atomic(&broken, suspend_foreign_keys)
     }
 
-    fn snapshot(&mut self, path: &Path) -> Result<bool, Self::Error> {
-        self.inner.snapshot(path)
+    fn snapshot(&mut self, file_name: &str) -> Result<Option<PathBuf>, Self::Error> {
+        self.inner.snapshot(file_name)
     }
 }
 

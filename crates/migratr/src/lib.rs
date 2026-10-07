@@ -8,6 +8,7 @@ mod migration;
 mod rebuild;
 mod scaffold;
 mod schema_file;
+mod snapshot;
 mod sql_ddl;
 mod up;
 
@@ -22,7 +23,10 @@ pub use migration::{
 };
 pub use scaffold::scaffold;
 pub use schema_file::write_schema;
+pub use snapshot::RestoreReport;
 pub use up::{UpReport, up};
 
 #[cfg(feature = "rusqlite")]
 pub use executor::RusqliteExecutor;
+#[cfg(feature = "rusqlite")]
+pub use snapshot::restore;

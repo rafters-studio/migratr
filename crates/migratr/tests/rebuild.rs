@@ -1,5 +1,4 @@
 use std::fs;
-use std::path::Path;
 
 use migratr::{
     AtomicError, Executor, LedgerRow, MigrateError, Migration, RusqliteExecutor, SchemaSnapshot,
@@ -578,8 +577,8 @@ impl Executor for Mangled {
         self.inner.run_atomic(statements, suspend_foreign_keys)
     }
 
-    fn snapshot(&mut self, path: &Path) -> Result<bool, Self::Error> {
-        self.inner.snapshot(path)
+    fn snapshot(&mut self, file_name: &str) -> Result<Option<std::path::PathBuf>, Self::Error> {
+        self.inner.snapshot(file_name)
     }
 }
 

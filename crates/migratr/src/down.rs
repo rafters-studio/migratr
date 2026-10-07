@@ -4,6 +4,7 @@ use crate::executor::Executor;
 use crate::ledger;
 use crate::migration::{IndexDef, MigrateError, Migration, Op};
 use crate::rebuild::add_needs_rebuild;
+use crate::snapshot::Direction;
 use crate::sql_ddl::quote_ident as ident;
 use crate::up::{apply, ident_list};
 
@@ -76,8 +77,15 @@ pub fn down(
     }
 
     for (version, ops) in &plan {
-        apply(exec, *version, ops, &[], ledger::delete_row(*version))
-            .map_err(|e| in_file_order(e, ops.len()))?;
+        apply(
+            exec,
+            *version,
+            Direction::Down,
+            ops,
+            &[],
+            ledger::delete_row(*version),
+        )
+        .map_err(|e| in_file_order(e, ops.len()))?;
     }
     Ok(DownReport { reverted: versions })
 }
