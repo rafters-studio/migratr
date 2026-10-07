@@ -469,6 +469,18 @@ fn a_recreated_object_naming_the_dropped_column_is_refused_and_nothing_changes()
              CREATE TRIGGER vt INSTEAD OF INSERT ON v BEGIN INSERT INTO t (gone) VALUES (1); END",
             "vt",
         ),
+        // These use the column by position, without naming it.
+        (
+            "CREATE TABLE src (x);
+             CREATE TRIGGER pos AFTER INSERT ON src BEGIN INSERT INTO t VALUES (NEW.x, 'a'); END",
+            "pos",
+        ),
+        (
+            "CREATE TABLE src (x);
+             CREATE TRIGGER pos AFTER INSERT ON src BEGIN INSERT INTO t SELECT NEW.x, 'a'; END",
+            "pos",
+        ),
+        ("CREATE VIEW tv (a, b) AS SELECT * FROM t", "tv"),
     ];
     for (dependent, object) in dependents {
         let mut ex = seeded(&format!(

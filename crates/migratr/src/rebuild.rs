@@ -10,8 +10,9 @@
 use crate::executor::{SchemaObject, SchemaSnapshot, TableInfo};
 use crate::migration::MigrateError;
 use crate::sql_ddl::{
-    TableBody, create_table_name_span, has_keyword, index_names_column, leading_identifier,
-    mentions_identifier, names_own_column, quote_ident, quote_literal, table_body,
+    TableBody, TokenKind, create_table_name_span, has_keyword, index_names_column,
+    leading_identifier, mentions_identifier, names_own_column, quote_ident, quote_literal,
+    table_body, tokens,
 };
 
 /// A change to one table that the rebuild makes.
@@ -150,6 +151,50 @@ fn mentions(object: &SchemaObject, name: &str) -> bool {
         .is_some_and(|sql| mentions_identifier(sql, name))
 }
 
+/// Whether `object` relies on the columns of `table` by position, so dropping any column
+/// breaks it without naming that column: an `INSERT INTO table` with no column list, or a
+/// view that declares its own column list over a `*`.
+fn uses_columns_by_position(object: &SchemaObject, table: &str) -> bool {
+    let Some(sql) = object.sql.as_deref() else {
+        return false;
+    };
+    let toks = tokens(sql);
+    let punct = |i: usize, p: &str| {
+        toks.get(i)
+            .is_some_and(|t| t.kind == TokenKind::Punct && t.text == p)
+    };
+    let word = |i: usize, w: &str| {
+        toks.get(i)
+            .is_some_and(|t| t.kind == TokenKind::Bare && t.text.eq_ignore_ascii_case(w))
+    };
+    // Skips a possibly schema-qualified name starting at `i`, returning the index after it
+    // and the unqualified name.
+    let name_at = |i: usize| -> Option<(usize, &str)> {
+        let first = toks.get(i)?;
+        if punct(i + 1, ".") {
+            let second = toks.get(i + 2)?;
+            Some((i + 3, second.text.as_str()))
+        } else {
+            Some((i + 1, first.text.as_str()))
+        }
+    };
+    let positional_insert = (0..toks.len()).any(|i| {
+        word(i, "INTO")
+            && name_at(i + 1)
+                .is_some_and(|(next, name)| name.eq_ignore_ascii_case(table) && !punct(next, "("))
+    });
+    let view_over_star = object.kind == "view"
+        && sql.contains('*')
+        && (0..toks.len()).find(|&i| word(i, "VIEW")).is_some_and(|i| {
+            let mut at = i + 1;
+            if word(at, "IF") && word(at + 1, "NOT") && word(at + 2, "EXISTS") {
+                at += 3;
+            }
+            name_at(at).is_some_and(|(next, _)| punct(next, "("))
+        });
+    positional_insert || view_over_star
+}
+
 /// The objects a rebuild of a table drops and recreates.
 struct Dependents<'a> {
     /// Explicit indexes on the table.
@@ -260,7 +305,7 @@ pub(crate) fn rebuild_statements(
     let dependents = Dependents::of(schema, table_name);
     let uses_column = |o: &&&SchemaObject| match o.kind.as_str() {
         "index" => index_names(o, column),
-        _ => mentions(o, column),
+        _ => mentions(o, column) || uses_columns_by_position(o, table_name),
     };
     if let Some(user) = dependents.all().find(uses_column) {
         return Err(column_in_use(user.name.clone()));
