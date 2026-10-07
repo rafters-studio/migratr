@@ -1,0 +1,29 @@
+# release.toml: read by scripts/release.sh and scripts/sync-version.sh
+# (schema per legion's release.toml, #741). Procedure: RELEASING.md.
+
+[version]
+file = "Cargo.toml"
+field = "workspace.package.version"
+
+[changelog]
+path = "CHANGELOG.md"
+
+[git]
+branch = "main"
+tag_format = "v{version}"
+tag_message = "migratr {version}"
+co_authored_by = "Claude Opus 5.5 <noreply@anthropic.com>"
+repo = "migratr"
+
+[docs]
+repo = "shingle"
+branch = "docs/migratr-current"
+base = "main"
+
+[preflight]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo test --workspace",
+  "bash scripts/test-release.sh",
+]
