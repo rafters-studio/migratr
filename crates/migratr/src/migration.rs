@@ -211,6 +211,9 @@ pub enum MigrateError {
         operation: usize,
     },
 
+    #[error("{kind} {name} is not in schema.json")]
+    UnknownObject { kind: String, name: String },
+
     #[error(transparent)]
     Executor(Box<dyn std::error::Error + Send + Sync>),
 }
@@ -240,7 +243,7 @@ struct Canonical<'a> {
 }
 
 /// Reads every `<YYYYMMDDHHMMSS>_<snake_name>.json` file in `path`, sorted by version.
-/// Files without a `.json` extension are ignored.
+/// Files without a `.json` extension, and `schema.json`, are ignored.
 pub fn load_dir(path: &Path) -> Result<Vec<Migration>, MigrateError> {
     let io_err = |source| MigrateError::Io {
         path: path.to_path_buf(),
@@ -255,6 +258,9 @@ pub fn load_dir(path: &Path) -> Result<Vec<Migration>, MigrateError> {
             continue;
         }
         let file = entry.file_name().to_string_lossy().into_owned();
+        if file == "schema.json" {
+            continue;
+        }
         let contents = fs::read_to_string(&file_path).map_err(|source| MigrateError::Io {
             path: file_path.clone(),
             source,
@@ -282,7 +288,7 @@ pub fn load_dir(path: &Path) -> Result<Vec<Migration>, MigrateError> {
 }
 
 /// Splits `<YYYYMMDDHHMMSS>_<snake_name>.json` into version and name.
-fn split_file_name(file: &str) -> Option<(u64, String)> {
+pub(crate) fn split_file_name(file: &str) -> Option<(u64, String)> {
     let stem = file.strip_suffix(".json")?;
     let (timestamp, name) = stem.split_once('_')?;
     let is_snake = name.starts_with(|c: char| c.is_ascii_lowercase())
@@ -563,6 +569,18 @@ mod tests {
             .map(|m| m.name)
             .collect();
         assert_eq!(names, ["first", "second", "third"]);
+    }
+
+    #[test]
+    fn load_dir_ignores_schema_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "schema.json",
+            r#"{"version": null, "objects": []}"#,
+        );
+        write(dir.path(), "20260101000000_first.json", r#"{"up": []}"#);
+        assert_eq!(load_dir(dir.path()).expect("load").len(), 1);
     }
 
     #[test]
