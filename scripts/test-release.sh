@@ -1288,19 +1288,30 @@ fixture_git "$OBS_CO" commit --quiet --no-verify -m "chore(release): 0.25.0"
 fixture_git "$OBS_CO" remote add origin "${OBS_TMP}/origin.git"
 gitp "$OBS_CO" push --quiet -u origin main
 
+# These cases read the version through `legion sym etc extract`; a runner
+# without legion (CI) skips them instead of failing.
+with_legion() {
+  command -v legion >/dev/null 2>&1 && return 0
+  printf 'SKIP %s (no legion on PATH)\n' "$1"
+  return 1
+}
+
 if require_dir "observers: fixture repo" "$OBS_CO"; then
   # THE PRECONDITION FOR EVERYTHING BELOW, and the assertion that would have
   # caught the broken fixture: if the version-of-record cannot be READ, every
   # observer answers "" and the negative assertions all pass vacuously.
+  with_legion "landed: the fixture's version-of-record is actually readable" &&
   eq "landed: the fixture's version-of-record is actually readable" "0.25.0" \
     "$( (in_dir "$OBS_CO" ref_version HEAD Cargo.toml package.version) 2>/dev/null )"
 
   # THE POSITIVE ARM. Nothing anywhere in this suite covered release_landed = 1,
   # which is why mutating it to print 0 unconditionally changed no result.
+  with_legion "landed: a reachable remote that carries the version is 1" &&
   eq "landed: a reachable remote that carries the version is 1" "1" \
     "$( (in_dir "$OBS_CO" release_landed main Cargo.toml package.version 0.25.0) 2>/dev/null )"
 
   # A reachable remote that does not carry the version is a definite NO.
+  with_legion "landed: reachable remote without the version is 0" &&
   eq "landed: reachable remote without the version is 0" "0" \
     "$( (in_dir "$OBS_CO" release_landed main Cargo.toml package.version 9.9.9) 2>/dev/null )"
 
@@ -1334,6 +1345,7 @@ if require_dir "observers: fixture repo" "$OBS_CO"; then
   # `extract` returning nothing is exactly the state that used to read as 0.
   eq "ref_version: a field the file does not carry is rc 2" "2" \
     "$( (in_dir "$OBS_CO" ref_version HEAD Cargo.toml package.nosuchfield) >/dev/null 2>&1; printf '%s' $? )"
+  with_legion "ref_version: a successful read is rc 0" &&
   eq "ref_version: a successful read is rc 0" "0" \
     "$( (in_dir "$OBS_CO" ref_version HEAD Cargo.toml package.version) >/dev/null 2>&1; printf '%s' $? )"
   eq "landed: a successful fetch with an unreadable version is unknown, not 0" "unknown" \
