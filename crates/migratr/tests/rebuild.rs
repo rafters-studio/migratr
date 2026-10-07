@@ -377,6 +377,52 @@ fn a_column_named_by_a_constraint_or_another_column_is_refused_and_nothing_chang
     }
 }
 
+#[test]
+fn a_column_that_a_child_table_references_is_refused_naming_the_child() {
+    for parent in [
+        "CREATE TABLE parents (id INTEGER PRIMARY KEY, code TEXT UNIQUE)",
+        "CREATE TABLE parents (code TEXT PRIMARY KEY, id INTEGER)",
+    ] {
+        let mut ex = seeded(&format!(
+            "{parent}; CREATE TABLE kids (c TEXT REFERENCES parents (code))"
+        ));
+        let before = dump(ex.connection());
+        let (_dir, migrations) = migration(&drop_column("parents", "code"));
+
+        let err = up(&mut ex, &migrations, None).expect_err(parent);
+
+        assert!(
+            matches!(
+                err,
+                MigrateError::ColumnInUse { ref table, ref object, .. }
+                    if table == "parents" && object == "kids"
+            ),
+            "{parent}: {err:?}"
+        );
+        assert_eq!(dump(ex.connection()), before, "{parent}");
+    }
+}
+
+#[test]
+fn a_column_named_like_a_keyword_or_a_type_is_dropped_when_nothing_uses_it() {
+    let mut ex = seeded(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, key TEXT UNIQUE);
+         CREATE TABLE t (
+           id INTEGER PRIMARY KEY,
+           key TEXT UNIQUE,
+           text TEXT,
+           owner TEXT REFERENCES users (key),
+           UNIQUE (owner)
+         );
+         INSERT INTO t (key, text) VALUES ('k', 'x');",
+    );
+    let (_dir, migrations) = migration(&drop_column("t", "key"));
+
+    up(&mut ex, &migrations, None).expect("up");
+
+    assert_eq!(columns(ex.connection(), "t"), ["id", "text", "owner"]);
+}
+
 /// `gone` is UNIQUE, so only the rebuild can drop it.
 const GRAPH: &str = "
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, gone TEXT UNIQUE);

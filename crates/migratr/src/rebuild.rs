@@ -11,7 +11,7 @@ use crate::executor::{SchemaObject, SchemaSnapshot, TableInfo};
 use crate::migration::MigrateError;
 use crate::sql_ddl::{
     TableBody, create_table_name_span, has_keyword, leading_identifier, mentions_identifier,
-    quote_ident, quote_literal, table_body,
+    names_own_column, quote_ident, quote_literal, table_body,
 };
 
 /// A change to one table that the rebuild makes.
@@ -38,6 +38,15 @@ impl ParsedTable<'_> {
             .columns
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(column))
+    }
+
+    /// The first item other than column `index`'s own that names `column` as a column of this
+    /// table: another column's expressions or a table constraint.
+    fn item_naming(&self, index: usize, column: &str) -> Option<&str> {
+        (0..self.body.items.len())
+            .filter(|&i| i != index)
+            .find(|&i| names_own_column(self.item(i), column))
+            .map(|i| self.item(i))
     }
 
     /// The CREATE statement without column `index`. The item goes with the comma after it,
@@ -119,9 +128,7 @@ pub(crate) fn needs_rebuild(
         || ["PRIMARY", "UNIQUE", "REFERENCES"]
             .iter()
             .any(|k| has_keyword(own, k));
-    let named_elsewhere = (0..parsed.body.items.len())
-        .filter(|&i| i != index)
-        .any(|i| mentions_identifier(parsed.item(i), column));
+    let named_elsewhere = parsed.item_naming(index, column).is_some();
     let indexed = Dependents::of(schema, table)
         .indexes
         .iter()
@@ -249,27 +256,37 @@ pub(crate) fn rebuild_statements(
         })?;
     let table_name = &parsed.object.name;
 
-    let other_items = (0..parsed.body.items.len())
-        .filter(|&i| i != dropped)
-        .map(|i| parsed.item(i));
-    if let Some(item) = other_items
-        .clone()
-        .find(|item| mentions_identifier(item, column))
-    {
-        return Err(MigrateError::ColumnInUse {
-            table: table_name.clone(),
-            column: column.clone(),
-            object: item.split_whitespace().collect::<Vec<_>>().join(" "),
-        });
+    let column_in_use = |object: String| MigrateError::ColumnInUse {
+        table: table_name.clone(),
+        column: column.clone(),
+        object,
+    };
+    if let Some(item) = parsed.item_naming(dropped, column) {
+        return Err(column_in_use(
+            item.split_whitespace().collect::<Vec<_>>().join(" "),
+        ));
+    }
+    // A foreign key in any table, this one included, whose parent key is the column: named
+    // outright, or implied when the column is the parent's primary key.
+    let in_primary_key = parsed.info.columns[dropped].pk > 0;
+    let referencing = schema.tables.iter().find(|t| {
+        t.foreign_keys.iter().any(|fk| {
+            fk.table.eq_ignore_ascii_case(table_name)
+                && fk
+                    .to
+                    .as_deref()
+                    .map_or(in_primary_key, |to| to.eq_ignore_ascii_case(column))
+                && !(t.name.eq_ignore_ascii_case(table_name)
+                    && fk.from.eq_ignore_ascii_case(column))
+        })
+    });
+    if let Some(child) = referencing {
+        return Err(column_in_use(child.name.clone()));
     }
 
     let dependents = Dependents::of(schema, table_name);
     if let Some(user) = dependents.all().find(|o| mentions(o, column)) {
-        return Err(MigrateError::ColumnInUse {
-            table: table_name.clone(),
-            column: column.clone(),
-            object: user.name.clone(),
-        });
+        return Err(column_in_use(user.name.clone()));
     }
 
     let name_span =
@@ -362,8 +379,8 @@ fn free_name(taken: &[&str], base: &str) -> String {
         .unwrap_or_else(|| base.to_string())
 }
 
-/// The message prefix of [`fk_check`]'s failure; the number of violating rows follows it,
-/// then ` in ` and the first table that has one.
+/// The message prefix of [`fk_check`]'s failure; the number of violating rows in a table
+/// follows it, then ` in ` and the table: the first one, by name, that has any.
 pub(crate) const FK_VIOLATION_MESSAGE: &str = "migratr: foreign key violations: ";
 
 /// One statement that aborts with [`FK_VIOLATION_MESSAGE`] when the database has any
@@ -375,7 +392,8 @@ pub(crate) fn fk_check() -> String {
         "CREATE TEMP TABLE _migratr_fk_raise (n INTEGER, tbl TEXT); \
          CREATE TEMP TRIGGER _migratr_fk_raise_trigger BEFORE INSERT ON _migratr_fk_raise \
            WHEN NEW.n > 0 BEGIN SELECT RAISE(ABORT, {message} || NEW.n || ' in ' || NEW.tbl); END; \
-         INSERT INTO _migratr_fk_raise SELECT count(*), min(\"table\") FROM pragma_foreign_key_check; \
+         INSERT INTO _migratr_fk_raise SELECT count(*), \"table\" FROM pragma_foreign_key_check \
+           WHERE \"table\" = (SELECT min(\"table\") FROM pragma_foreign_key_check); \
          DROP TABLE _migratr_fk_raise"
     )
 }
@@ -573,7 +591,36 @@ mod tests {
             "{message}"
         );
         assert_eq!(query_i64(&ex, "SELECT count(*) FROM w"), 0);
+
+        // With violations in two tables, the count is the first table's own.
+        let statements = [
+            "INSERT INTO w VALUES ('a', 8), ('b', 8), ('c', 9)".to_string(),
+            "INSERT INTO c VALUES (5)".to_string(),
+            fk_check(),
+        ];
+        let message = ex
+            .run_atomic(&statements, true)
+            .expect_err("violations abort")
+            .source
+            .to_string();
+        assert!(
+            message.contains(&format!("{FK_VIOLATION_MESSAGE}1 in c")),
+            "{message}"
+        );
         assert_eq!(query_i64(&ex, "SELECT count(*) FROM sqlite_temp_master"), 0);
+    }
+
+    #[test]
+    fn only_expressions_and_constraints_name_a_column() {
+        let name = |item: &str| names_own_column(item, "key");
+        assert!(!name("body text NOT NULL"));
+        assert!(!name("owner INTEGER REFERENCES users (key)"));
+        assert!(!name("id INTEGER PRIMARY KEY"));
+        assert!(name("n INTEGER CHECK (n > key)"));
+        assert!(name("twice INTEGER AS (key * 2)"));
+        assert!(name("UNIQUE (key)"));
+        assert!(name("FOREIGN KEY (key) REFERENCES p (id)"));
+        assert!(!name("FOREIGN KEY (a) REFERENCES p (key)"));
     }
 
     #[test]

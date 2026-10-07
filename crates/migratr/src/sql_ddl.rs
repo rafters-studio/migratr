@@ -202,6 +202,51 @@ pub(crate) fn mentions_identifier(sql: &str, ident: &str) -> bool {
     tokens(sql).iter().any(|t| t.names(ident))
 }
 
+/// Whether `item`, one comma-separated item of a CREATE TABLE body, names `ident` where it
+/// refers to a column of its own table: inside parentheses, as in a CHECK, generated or
+/// DEFAULT expression or a constraint's column list. A type name or constraint keyword
+/// outside parentheses cannot be a column reference. The parent column list after
+/// `REFERENCES` belongs to another table and is skipped.
+pub(crate) fn names_own_column(item: &str, ident: &str) -> bool {
+    let tokens = tokens(item);
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = &tokens[i];
+        if token.kind == TokenKind::Punct {
+            match token.text.as_str() {
+                "(" => depth += 1,
+                ")" => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        } else if token.is_keyword("REFERENCES") {
+            // The parent table, an optional `schema.` qualifier, then its column list.
+            i += 1;
+            while tokens
+                .get(i + 1)
+                .is_some_and(|t| t.kind == TokenKind::Punct && t.text == ".")
+            {
+                i += 2;
+            }
+            i += 1;
+            if tokens
+                .get(i)
+                .is_some_and(|t| t.kind == TokenKind::Punct && t.text == "(")
+            {
+                while i < tokens.len()
+                    && !(tokens[i].kind == TokenKind::Punct && tokens[i].text == ")")
+                {
+                    i += 1;
+                }
+            }
+        } else if token.names(ident) && depth > 0 {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Whether `sql` contains `keyword` as a bare word. A quoted identifier spelled the same way
 /// does not count.
 pub(crate) fn has_keyword(sql: &str, keyword: &str) -> bool {
