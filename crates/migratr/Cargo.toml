@@ -2,18 +2,22 @@
 name = "migratr"
 version.workspace = true
 edition.workspace = true
+description = "Schema migrations for SQLite: JSON migration files, safe table rebuilds, reversible downs and snapshots."
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
 
 [features]
 default = ["rusqlite"]
 rusqlite = ["dep:rusqlite"]
 
 [dependencies]
+migratr-format.workspace = true
 migratr-macros.workspace = true
 rusqlite = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
-serde_path_to_error.workspace = true
-sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

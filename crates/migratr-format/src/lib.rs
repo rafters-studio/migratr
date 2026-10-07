@@ -1,7 +1,5 @@
-// Both the migratr crate and the migratr-macros crate compile this file (the macros crate by
-// `#[path]`, because migratr depends on it), so it must not reference the rest of the library.
-
-//! The migration file format: its types, parser, checksum and ordering.
+//! The migration file format: its types, parser, checksum and ordering. Shared by the
+//! migratr library and the `embed!` macro, which validates migrations at compile time.
 
 use serde::{Deserialize, Serialize};
 use serde_path_to_error::Segment;

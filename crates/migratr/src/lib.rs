@@ -1,10 +1,11 @@
 //! Schema migrations for SQLite.
 
+use migratr_format as format;
+
 mod down;
 mod embed;
 mod error;
 mod executor;
-mod format;
 mod ledger;
 mod migration;
 mod rebuild;

@@ -313,12 +313,11 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 name = "migratr"
 version = "0.1.0"
 dependencies = [
+ "migratr-format",
  "migratr-macros",
  "rusqlite",
  "serde",
  "serde_json",
- "serde_path_to_error",
- "sha2",
  "tempfile",
  "thiserror",
 ]
@@ -336,7 +335,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "migratr-macros"
+name = "migratr-format"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -344,6 +343,13 @@ dependencies = [
  "serde_path_to_error",
  "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "migratr-macros"
+version = "0.1.0"
+dependencies = [
+ "migratr-format",
 ]
 
 [[package]]
