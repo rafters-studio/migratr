@@ -384,7 +384,9 @@ fn free_name(taken: &[&str], base: &str) -> String {
 pub(crate) const FK_VIOLATION_MESSAGE: &str = "migratr: foreign key violations: ";
 
 /// One statement that aborts with [`FK_VIOLATION_MESSAGE`] when the database has any
-/// foreign-key violation. RAISE works only in a trigger, so the count goes into a temporary
+/// foreign-key violation. SQLite reports one pragma row per violated key, so a row that
+/// breaks two keys is counted once by its rowid; a WITHOUT ROWID table has no rowid to
+/// tell its rows apart and counts one per violated key. RAISE works only in a trigger, so the count goes into a temporary
 /// table whose trigger raises; both are dropped again before the statement ends.
 pub(crate) fn fk_check() -> String {
     let message = quote_literal(FK_VIOLATION_MESSAGE);
@@ -392,7 +394,8 @@ pub(crate) fn fk_check() -> String {
         "CREATE TEMP TABLE _migratr_fk_raise (n INTEGER, tbl TEXT); \
          CREATE TEMP TRIGGER _migratr_fk_raise_trigger BEFORE INSERT ON _migratr_fk_raise \
            WHEN NEW.n > 0 BEGIN SELECT RAISE(ABORT, {message} || NEW.n || ' in ' || NEW.tbl); END; \
-         INSERT INTO _migratr_fk_raise SELECT count(*), \"table\" FROM pragma_foreign_key_check \
+         INSERT INTO _migratr_fk_raise SELECT count(DISTINCT \"rowid\") + count(*) FILTER (WHERE \"rowid\" IS NULL), \"table\" \
+           FROM pragma_foreign_key_check \
            WHERE \"table\" = (SELECT min(\"table\") FROM pragma_foreign_key_check); \
          DROP TABLE _migratr_fk_raise"
     )
@@ -591,6 +594,23 @@ mod tests {
             "{message}"
         );
         assert_eq!(query_i64(&ex, "SELECT count(*) FROM w"), 0);
+
+        // A row that breaks two keys is one row.
+        let statements = [
+            "CREATE TABLE two (a INTEGER REFERENCES p (id), b INTEGER REFERENCES p (id))"
+                .to_string(),
+            "INSERT INTO two VALUES (5, 6)".to_string(),
+            fk_check(),
+        ];
+        let message = ex
+            .run_atomic(&statements, true)
+            .expect_err("violations abort")
+            .source
+            .to_string();
+        assert!(
+            message.contains(&format!("{FK_VIOLATION_MESSAGE}1 in two")),
+            "{message}"
+        );
 
         // With violations in two tables, the count is the first table's own.
         let statements = [
