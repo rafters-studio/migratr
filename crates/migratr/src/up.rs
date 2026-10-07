@@ -1,6 +1,8 @@
-use crate::executor::Executor;
+use crate::executor::{Executor, SchemaSnapshot};
 use crate::ledger;
 use crate::migration::{Column, MigrateError, Migration, Op};
+use crate::rebuild::{FK_VIOLATION_MESSAGE, TableChange, rebuild_statements};
+use crate::sql_ddl::{mentions_identifier, quote_ident as ident};
 
 /// What an `up` run applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,25 +33,111 @@ pub fn up(
 
     let mut applied = Vec::with_capacity(pending.len());
     for migration in pending {
-        let mut statements = vec![ledger::CREATE_LEDGER.to_string()];
-        statements.extend(migration.up.iter().map(render));
-        let operation_count = migration.up.len();
-        statements.push(ledger::insert_row(migration));
-
-        exec.run_atomic(&statements, false)
-            .map_err(|failure| MigrateError::Apply {
-                version: migration.version,
-                statement: failure.index.and_then(|i| statements.get(i)).cloned(),
-                // Statement 0 is the ledger create and the last is the ledger insert.
-                operation: failure
-                    .index
-                    .filter(|i| (1..=operation_count).contains(i))
-                    .map(|i| i - 1),
-                source: Box::new(failure.source),
-            })?;
+        apply(exec, migration)?;
         applied.push(migration.version);
     }
     Ok(UpReport { applied })
+}
+
+/// Runs one migration's statements and its ledger row atomically.
+fn apply(exec: &mut impl Executor, migration: &Migration) -> Result<(), MigrateError> {
+    let schema = if migration
+        .up
+        .iter()
+        .any(|op| matches!(op, Op::DropColumn { .. }))
+    {
+        Some(
+            exec.read_schema()
+                .map_err(|e| MigrateError::Executor(Box::new(e)))?,
+        )
+    } else {
+        None
+    };
+
+    let mut statements = vec![ledger::CREATE_LEDGER.to_string()];
+    // The operation each statement came from; `None` for the ledger's own statements.
+    let mut origins: Vec<Option<usize>> = vec![None];
+    // The final statement of each rebuild, which is its foreign-key check, and its table.
+    let mut fk_checks: Vec<(usize, &str)> = Vec::new();
+
+    for (i, op) in migration.up.iter().enumerate() {
+        let rebuilt = match (op, &schema) {
+            (Op::DropColumn { table, column }, Some(schema))
+                if describes_table(schema, &migration.up[..i], table, &column.name) =>
+            {
+                let change = TableChange::DropColumn {
+                    column: column.name.clone(),
+                };
+                Some((table, rebuild_statements(schema, table, &change)?))
+            }
+            _ => None,
+        };
+        match rebuilt {
+            Some((table, rebuild)) => {
+                statements.extend(rebuild);
+                fk_checks.push((statements.len() - 1, table));
+            }
+            None => statements.push(render(op)),
+        }
+        origins.resize(statements.len(), Some(i));
+    }
+    statements.push(ledger::insert_row(migration));
+    origins.push(None);
+
+    exec.run_atomic(&statements, !fk_checks.is_empty())
+        .map_err(|failure| {
+            let fk_violation = failure
+                .index
+                .and_then(|i| fk_checks.iter().find(|(at, _)| *at == i))
+                .and_then(|(_, table)| {
+                    let message = failure.source.to_string();
+                    let rows = message.split(FK_VIOLATION_MESSAGE).nth(1)?;
+                    let digits: String = rows.chars().take_while(char::is_ascii_digit).collect();
+                    Some(MigrateError::ForeignKeyViolation {
+                        table: table.to_string(),
+                        rows: digits.parse().ok()?,
+                    })
+                });
+            fk_violation.unwrap_or_else(|| MigrateError::Apply {
+                version: migration.version,
+                statement: failure.index.and_then(|i| statements.get(i)).cloned(),
+                operation: failure
+                    .index
+                    .and_then(|i| origins.get(i).copied().flatten()),
+                source: Box::new(failure.source),
+            })
+        })
+}
+
+/// Whether the schema read before the migration still describes `table` and its `column`
+/// when the operation after `earlier` runs: both exist, and no earlier operation of the
+/// migration could have changed the table or added a table referencing it. Otherwise the
+/// rebuild would work from stale DDL, so the drop runs in place and SQLite refuses whatever
+/// it cannot drop.
+fn describes_table(schema: &SchemaSnapshot, earlier: &[Op], table: &str, column: &str) -> bool {
+    let same = |name: &str| name.eq_ignore_ascii_case(table);
+    let references = |c: &Column| c.references.as_ref().is_some_and(|fk| same(&fk.table));
+    let exists = schema
+        .tables
+        .iter()
+        .find(|t| same(&t.name))
+        .is_some_and(|t| {
+            t.columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(column))
+        });
+    let changed = earlier.iter().any(|op| match op {
+        Op::CreateTable { table, columns, .. } => same(table) || columns.iter().any(references),
+        Op::AddColumn { table, column } => same(table) || references(column),
+        Op::DropTable { table, .. }
+        | Op::DropColumn { table, .. }
+        | Op::RenameColumn { table, .. }
+        | Op::CreateIndex { table, .. } => same(table),
+        Op::RenameTable { from, to } => same(from) || same(to),
+        Op::DropIndex { definition } => same(&definition.table),
+        Op::RawSql { up, .. } => mentions_identifier(up, table),
+    });
+    exists && !changed
 }
 
 /// The SQL statement for one operation.
@@ -167,10 +255,6 @@ fn column_def(column: &Column) -> String {
     sql
 }
 
-fn ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
 fn ident_list<'a>(names: impl Iterator<Item = &'a str>) -> String {
     names.map(ident).collect::<Vec<_>>().join(", ")
 }
@@ -228,10 +312,5 @@ mod tests {
             "\"owner\" INTEGER UNIQUE DEFAULT (0) CHECK (owner >= 0) \
              REFERENCES \"users\" (\"id\") ON DELETE CASCADE"
         );
-    }
-
-    #[test]
-    fn identifiers_escape_quotes() {
-        assert_eq!(ident("we\"ird"), "\"we\"\"ird\"");
     }
 }

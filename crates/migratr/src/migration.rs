@@ -182,6 +182,12 @@ pub enum MigrateError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[error("cannot rebuild table {table}: its CREATE TABLE statement could not be parsed")]
+    UnparseableTable { table: String },
+
+    #[error("rebuilding table {table} would leave {rows} rows violating foreign keys")]
+    ForeignKeyViolation { table: String, rows: u64 },
+
     #[error(transparent)]
     Executor(Box<dyn std::error::Error + Send + Sync>),
 }
