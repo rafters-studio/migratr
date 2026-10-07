@@ -1,6 +1,10 @@
 use crate::executor::Executor;
 use crate::ledger;
 use crate::migration::{Column, MigrateError, Migration, Op};
+use crate::rebuild::{
+    FK_VIOLATION_MESSAGE, TableChange, fk_check, needs_rebuild, rebuild_statements,
+};
+use crate::sql_ddl::quote_ident as ident;
 
 /// What an `up` run applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,25 +35,99 @@ pub fn up(
 
     let mut applied = Vec::with_capacity(pending.len());
     for migration in pending {
-        let mut statements = vec![ledger::CREATE_LEDGER.to_string()];
-        statements.extend(migration.up.iter().map(render));
-        let operation_count = migration.up.len();
-        statements.push(ledger::insert_row(migration));
-
-        exec.run_atomic(&statements, false)
-            .map_err(|failure| MigrateError::Apply {
-                version: migration.version,
-                statement: failure.index.and_then(|i| statements.get(i)).cloned(),
-                // Statement 0 is the ledger create and the last is the ledger insert.
-                operation: failure
-                    .index
-                    .filter(|i| (1..=operation_count).contains(i))
-                    .map(|i| i - 1),
-                source: Box::new(failure.source),
-            })?;
+        apply(exec, migration)?;
         applied.push(migration.version);
     }
     Ok(UpReport { applied })
+}
+
+/// Runs one migration's statements and its ledger row atomically.
+fn apply(exec: &mut impl Executor, migration: &Migration) -> Result<(), MigrateError> {
+    let schema = if migration
+        .up
+        .iter()
+        .any(|op| matches!(op, Op::DropColumn { .. }))
+    {
+        Some(
+            exec.read_schema()
+                .map_err(|e| MigrateError::Executor(Box::new(e)))?,
+        )
+    } else {
+        None
+    };
+
+    // Each operation's statements, with the operation they came from.
+    let mut body: Vec<(String, usize)> = Vec::new();
+    let mut has_rebuild = false;
+    for (i, op) in migration.up.iter().enumerate() {
+        if let (Some(schema), Op::DropColumn { table, column }) = (&schema, op)
+            && needs_rebuild(schema, table, &column.name)?
+        {
+            // The rebuild works from the schema read before the migration, which is
+            // current only for the first operation.
+            if i > 0 {
+                return Err(MigrateError::RebuildNotFirst {
+                    version: migration.version,
+                    table: table.clone(),
+                    column: column.name.clone(),
+                    operation: i,
+                });
+            }
+            has_rebuild = true;
+            let change = TableChange::DropColumn {
+                column: column.name.clone(),
+            };
+            body.extend(
+                rebuild_statements(schema, table, &change)?
+                    .into_iter()
+                    .map(|s| (s, i)),
+            );
+            continue;
+        }
+        body.push((render(op), i));
+    }
+
+    // A migration with a rebuild runs with foreign keys suspended, so the whole database is
+    // checked before the ledger row, as SQLite's own procedure does.
+    let mut statements = vec![ledger::CREATE_LEDGER.to_string()];
+    let mut origins: Vec<Option<usize>> = vec![None];
+    for (statement, operation) in body {
+        statements.push(statement);
+        origins.push(Some(operation));
+    }
+    let fk_check_at = has_rebuild.then_some(statements.len());
+    if has_rebuild {
+        statements.push(fk_check());
+        origins.push(None);
+    }
+    statements.push(ledger::insert_row(migration));
+    origins.push(None);
+
+    exec.run_atomic(&statements, has_rebuild)
+        .map_err(|failure| {
+            let violation = failure
+                .index
+                .filter(|&i| Some(i) == fk_check_at)
+                .and_then(|_| foreign_key_violation(&failure.source.to_string()));
+            violation.unwrap_or_else(|| MigrateError::Apply {
+                version: migration.version,
+                statement: failure.index.and_then(|i| statements.get(i)).cloned(),
+                operation: failure
+                    .index
+                    .and_then(|i| origins.get(i).copied().flatten()),
+                source: Box::new(failure.source),
+            })
+        })
+}
+
+/// The `ForeignKeyViolation` that an executor's [`fk_check`] failure message reports.
+fn foreign_key_violation(message: &str) -> Option<MigrateError> {
+    let report = message.split(FK_VIOLATION_MESSAGE).nth(1)?;
+    let (rows, table) = report.split_once(" in ")?;
+    Some(MigrateError::ForeignKeyViolation {
+        table: table.trim().to_string(),
+        rows: rows.parse().ok()?,
+    })
 }
 
 /// The SQL statement for one operation.
@@ -167,10 +245,6 @@ fn column_def(column: &Column) -> String {
     sql
 }
 
-fn ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
 fn ident_list<'a>(names: impl Iterator<Item = &'a str>) -> String {
     names.map(ident).collect::<Vec<_>>().join(", ")
 }
@@ -228,10 +302,5 @@ mod tests {
             "\"owner\" INTEGER UNIQUE DEFAULT (0) CHECK (owner >= 0) \
              REFERENCES \"users\" (\"id\") ON DELETE CASCADE"
         );
-    }
-
-    #[test]
-    fn identifiers_escape_quotes() {
-        assert_eq!(ident("we\"ird"), "\"we\"\"ird\"");
     }
 }

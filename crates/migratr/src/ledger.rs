@@ -1,5 +1,6 @@
 use crate::executor::LedgerRow;
 use crate::migration::{MigrateError, Migration};
+use crate::sql_ddl::quote_literal;
 
 /// Creates the ledger when it is absent. Every migration's atomic run starts with it, so the
 /// table appears together with the first applied migration and rolls back with it.
@@ -38,10 +39,6 @@ pub(crate) fn verify(ledger: &[LedgerRow], migrations: &[Migration]) -> Result<(
         }
     }
     Ok(())
-}
-
-fn quote_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
 }
 
 #[cfg(test)]
