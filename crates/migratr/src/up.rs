@@ -31,16 +31,15 @@ pub fn up(
 
     let mut applied = Vec::with_capacity(pending.len());
     for migration in pending {
-        let op_statements: Vec<String> = migration.up.iter().map(render).collect();
-        let mut statements = Vec::with_capacity(op_statements.len() + 2);
-        statements.push(ledger::CREATE_LEDGER.to_string());
-        statements.extend(op_statements.iter().cloned());
+        let mut statements = vec![ledger::CREATE_LEDGER.to_string()];
+        statements.extend(migration.up.iter().map(render));
+        let operations = statements[1..].join("; ");
         statements.push(ledger::insert_row(migration));
 
         exec.run_atomic(&statements, false)
             .map_err(|source| MigrateError::Apply {
                 version: migration.version,
-                statement: op_statements.join("; "),
+                statement: operations,
                 source: Box::new(source),
             })?;
         applied.push(migration.version);
