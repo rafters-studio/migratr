@@ -22,6 +22,11 @@ pub(crate) fn insert_row(migration: &Migration) -> String {
     )
 }
 
+/// The statement that removes the ledger row of the reverted migration `version`.
+pub(crate) fn delete_row(version: u64) -> String {
+    format!("DELETE FROM _migratr_migrations WHERE version = {version}")
+}
+
 /// Checks every ledger row against the migration file of the same version.
 pub(crate) fn verify(ledger: &[LedgerRow], migrations: &[Migration]) -> Result<(), MigrateError> {
     for row in ledger {

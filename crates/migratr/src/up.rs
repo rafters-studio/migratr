@@ -35,19 +35,28 @@ pub fn up(
 
     let mut applied = Vec::with_capacity(pending.len());
     for migration in pending {
-        apply(exec, migration)?;
+        apply(
+            exec,
+            migration.version,
+            &migration.up,
+            &[ledger::CREATE_LEDGER.to_string()],
+            ledger::insert_row(migration),
+        )?;
         applied.push(migration.version);
     }
     Ok(UpReport { applied })
 }
 
-/// Runs one migration's statements and its ledger row atomically.
-fn apply(exec: &mut impl Executor, migration: &Migration) -> Result<(), MigrateError> {
-    let schema = if migration
-        .up
-        .iter()
-        .any(|op| matches!(op, Op::DropColumn { .. }))
-    {
+/// Runs `ops` for migration `version` in one atomic run: the `prelude` statements, the
+/// operations, then `record`, the ledger statement that marks the migration applied or reverted.
+pub(crate) fn apply(
+    exec: &mut impl Executor,
+    version: u64,
+    ops: &[Op],
+    prelude: &[String],
+    record: String,
+) -> Result<(), MigrateError> {
+    let schema = if ops.iter().any(|op| matches!(op, Op::DropColumn { .. })) {
         Some(
             exec.read_schema()
                 .map_err(|e| MigrateError::Executor(Box::new(e)))?,
@@ -59,7 +68,7 @@ fn apply(exec: &mut impl Executor, migration: &Migration) -> Result<(), MigrateE
     // Each operation's statements, with the operation they came from.
     let mut body: Vec<(String, usize)> = Vec::new();
     let mut has_rebuild = false;
-    for (i, op) in migration.up.iter().enumerate() {
+    for (i, op) in ops.iter().enumerate() {
         if let (Some(schema), Op::DropColumn { table, column }) = (&schema, op)
             && needs_rebuild(schema, table, &column.name)?
         {
@@ -67,7 +76,7 @@ fn apply(exec: &mut impl Executor, migration: &Migration) -> Result<(), MigrateE
             // current only for the first operation.
             if i > 0 {
                 return Err(MigrateError::RebuildNotFirst {
-                    version: migration.version,
+                    version,
                     table: table.clone(),
                     column: column.name.clone(),
                     operation: i,
@@ -89,8 +98,8 @@ fn apply(exec: &mut impl Executor, migration: &Migration) -> Result<(), MigrateE
 
     // A migration with a rebuild runs with foreign keys suspended, so the whole database is
     // checked before the ledger row, as SQLite's own procedure does.
-    let mut statements = vec![ledger::CREATE_LEDGER.to_string()];
-    let mut origins: Vec<Option<usize>> = vec![None];
+    let mut statements = prelude.to_vec();
+    let mut origins: Vec<Option<usize>> = vec![None; prelude.len()];
     for (statement, operation) in body {
         statements.push(statement);
         origins.push(Some(operation));
@@ -100,7 +109,7 @@ fn apply(exec: &mut impl Executor, migration: &Migration) -> Result<(), MigrateE
         statements.push(fk_check());
         origins.push(None);
     }
-    statements.push(ledger::insert_row(migration));
+    statements.push(record);
     origins.push(None);
 
     exec.run_atomic(&statements, has_rebuild)
@@ -110,7 +119,7 @@ fn apply(exec: &mut impl Executor, migration: &Migration) -> Result<(), MigrateE
                 .filter(|&i| Some(i) == fk_check_at)
                 .and_then(|_| foreign_key_violation(&failure.source.to_string()));
             violation.unwrap_or_else(|| MigrateError::Apply {
-                version: migration.version,
+                version,
                 statement: failure.index.and_then(|i| statements.get(i)).cloned(),
                 operation: failure
                     .index
@@ -245,7 +254,7 @@ fn column_def(column: &Column) -> String {
     sql
 }
 
-fn ident_list<'a>(names: impl Iterator<Item = &'a str>) -> String {
+pub(crate) fn ident_list<'a>(names: impl Iterator<Item = &'a str>) -> String {
     names.map(ident).collect::<Vec<_>>().join(", ")
 }
 

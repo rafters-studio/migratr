@@ -1,5 +1,6 @@
 //! Schema migrations for SQLite.
 
+mod down;
 mod error;
 mod executor;
 mod ledger;
@@ -8,6 +9,7 @@ mod rebuild;
 mod sql_ddl;
 mod up;
 
+pub use down::{DownReport, down};
 pub use error::Error;
 pub use executor::{
     AtomicError, ColumnInfo, Executor, ForeignKeyInfo, LedgerRow, SchemaObject, SchemaSnapshot,

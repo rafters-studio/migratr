@@ -182,6 +182,9 @@ pub enum MigrateError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[error("migration {version} cannot be reversed: operation {op_index} is raw SQL with no down")]
+    Irreversible { version: u64, op_index: usize },
+
     #[error("cannot rebuild table {table}: its CREATE TABLE statement could not be parsed")]
     UnparseableTable { table: String },
 
