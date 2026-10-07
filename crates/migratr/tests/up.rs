@@ -2,11 +2,13 @@ use std::fs;
 use std::path::Path;
 
 use migratr::{
-    AtomicError, Executor, LedgerRow, MigrateError, RusqliteExecutor, SchemaSnapshot, UpReport,
-    load_dir, up,
+    Executor, LedgerRow, MigrateError, RusqliteExecutor, SchemaSnapshot, UpReport, load_dir, up,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
+
+mod common;
+use common::{FailAt, dump};
 
 fn write(dir: &Path, file: &str, ops: &str) {
     fs::write(dir.join(file), format!(r#"{{"up": [{ops}]}}"#)).expect("write migration");
@@ -248,76 +250,6 @@ fn a_missing_file_refuses_the_run_naming_it() {
     ));
 }
 
-/// Runs the statements through a real executor with statement `fail_at` replaced by invalid
-/// SQL, so the real transaction fails at that position and rolls back.
-struct FailAt {
-    inner: RusqliteExecutor,
-    fail_at: usize,
-}
-
-impl Executor for FailAt {
-    type Error = rusqlite::Error;
-
-    fn read_schema(&mut self) -> Result<SchemaSnapshot, Self::Error> {
-        self.inner.read_schema()
-    }
-
-    fn read_ledger(&mut self) -> Result<Vec<LedgerRow>, Self::Error> {
-        self.inner.read_ledger()
-    }
-
-    fn run_atomic(
-        &mut self,
-        statements: &[String],
-        suspend_foreign_keys: bool,
-    ) -> Result<(), AtomicError<Self::Error>> {
-        let mut broken = statements.to_vec();
-        broken[self.fail_at] = "FAULT INJECTED HERE".to_string();
-        self.inner.run_atomic(&broken, suspend_foreign_keys)
-    }
-
-    fn snapshot(&mut self, path: &Path) -> Result<bool, Self::Error> {
-        self.inner.snapshot(path)
-    }
-}
-
-/// Every sqlite_master row and every table's rows, as text.
-fn dump(conn: &Connection) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut master = conn
-        .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name")
-        .expect("prepare");
-    let rows: Vec<(String, String, String, Option<String>)> = master
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-        .expect("query")
-        .collect::<Result<_, _>>()
-        .expect("rows");
-    for (kind, name, tbl, sql) in rows {
-        out.push(format!("{kind}|{name}|{tbl}|{sql:?}"));
-        if kind == "table" {
-            let mut all = conn
-                .prepare(&format!("SELECT * FROM \"{name}\" ORDER BY 1"))
-                .expect("select");
-            let width = all.column_count();
-            let cells: Vec<String> = all
-                .query_map([], |r| {
-                    (0..width)
-                        .map(|i| {
-                            r.get::<_, rusqlite::types::Value>(i)
-                                .map(|v| format!("{v:?}"))
-                        })
-                        .collect::<Result<Vec<_>, _>>()
-                        .map(|c| c.join(","))
-                })
-                .expect("cells")
-                .collect::<Result<_, _>>()
-                .expect("cells");
-            out.extend(cells);
-        }
-    }
-    out
-}
-
 #[test]
 fn failure_at_every_statement_position_leaves_the_database_untouched() {
     let dir = TempDir::new().expect("tempdir");
@@ -365,6 +297,7 @@ fn failure_at_every_statement_position_leaves_the_database_untouched() {
         let mut ex = FailAt {
             inner: RusqliteExecutor::new(conn),
             fail_at,
+            statement_count: 0,
         };
         let before = dump(ex.inner.connection());
 

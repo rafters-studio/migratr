@@ -8,6 +8,9 @@ use migratr::{
 use rusqlite::Connection;
 use tempfile::TempDir;
 
+mod common;
+use common::{FailAt, dump};
+
 /// Loads one migration with `ops` as its operations.
 fn migration(ops: &str) -> (TempDir, Vec<Migration>) {
     let dir = TempDir::new().expect("tempdir");
@@ -44,43 +47,6 @@ fn query_i64(conn: &Connection, sql: &str) -> i64 {
 fn foreign_keys(conn: &Connection) -> bool {
     conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))
         .expect("pragma")
-}
-
-/// Every sqlite_master row and every table's rows, as text.
-fn dump(conn: &Connection) -> Vec<String> {
-    let mut out = Vec::new();
-    let rows: Vec<(String, String, Option<String>)> = conn
-        .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY name")
-        .expect("prepare")
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-        .expect("query")
-        .collect::<Result<_, _>>()
-        .expect("rows");
-    for (kind, name, sql) in rows {
-        out.push(format!("{kind}|{name}|{sql:?}"));
-        if kind == "table" {
-            let mut all = conn
-                .prepare(&format!("SELECT rowid, * FROM \"{name}\" ORDER BY 1"))
-                .or_else(|_| conn.prepare(&format!("SELECT * FROM \"{name}\" ORDER BY 1")))
-                .expect("select");
-            let width = all.column_count();
-            let cells: Vec<String> = all
-                .query_map([], |r| {
-                    (0..width)
-                        .map(|i| {
-                            r.get::<_, rusqlite::types::Value>(i)
-                                .map(|v| format!("{v:?}"))
-                        })
-                        .collect::<Result<Vec<_>, _>>()
-                        .map(|c| c.join(","))
-                })
-                .expect("cells")
-                .collect::<Result<_, _>>()
-                .expect("cells");
-            out.extend(cells);
-        }
-    }
-    out
 }
 
 /// `code` is UNIQUE, so SQLite's own ALTER TABLE DROP COLUMN refuses it and only the rebuild
@@ -245,43 +211,6 @@ fn foreign_keys_is_restored_to_its_prior_value_on_success() {
 
         assert_eq!(foreign_keys(ex.connection()), prior);
         assert_eq!(query_i64(ex.connection(), "SELECT count(*) FROM books"), 3);
-    }
-}
-
-/// Runs the statements through a real executor with statement `fail_at` replaced by invalid
-/// SQL, so the real transaction fails at that position and rolls back.
-struct FailAt {
-    inner: RusqliteExecutor,
-    fail_at: usize,
-    statement_count: usize,
-}
-
-impl Executor for FailAt {
-    type Error = rusqlite::Error;
-
-    fn read_schema(&mut self) -> Result<SchemaSnapshot, Self::Error> {
-        self.inner.read_schema()
-    }
-
-    fn read_ledger(&mut self) -> Result<Vec<LedgerRow>, Self::Error> {
-        self.inner.read_ledger()
-    }
-
-    fn run_atomic(
-        &mut self,
-        statements: &[String],
-        suspend_foreign_keys: bool,
-    ) -> Result<(), AtomicError<Self::Error>> {
-        self.statement_count = statements.len();
-        let mut broken = statements.to_vec();
-        if let Some(statement) = broken.get_mut(self.fail_at) {
-            *statement = "FAULT INJECTED HERE".to_string();
-        }
-        self.inner.run_atomic(&broken, suspend_foreign_keys)
-    }
-
-    fn snapshot(&mut self, path: &Path) -> Result<bool, Self::Error> {
-        self.inner.snapshot(path)
     }
 }
 
