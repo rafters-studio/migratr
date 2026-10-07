@@ -33,14 +33,19 @@ pub fn up(
     for migration in pending {
         let mut statements = vec![ledger::CREATE_LEDGER.to_string()];
         statements.extend(migration.up.iter().map(render));
-        let operations = statements[1..].join("; ");
+        let operation_count = migration.up.len();
         statements.push(ledger::insert_row(migration));
 
         exec.run_atomic(&statements, false)
-            .map_err(|source| MigrateError::Apply {
+            .map_err(|failure| MigrateError::Apply {
                 version: migration.version,
-                statement: operations,
-                source: Box::new(source),
+                statement: failure.index.and_then(|i| statements.get(i)).cloned(),
+                // Statement 0 is the ledger create and the last is the ledger insert.
+                operation: failure
+                    .index
+                    .filter(|i| (1..=operation_count).contains(i))
+                    .map(|i| i - 1),
+                source: Box::new(failure.source),
             })?;
         applied.push(migration.version);
     }

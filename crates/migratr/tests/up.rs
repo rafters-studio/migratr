@@ -2,7 +2,8 @@ use std::fs;
 use std::path::Path;
 
 use migratr::{
-    Executor, LedgerRow, MigrateError, RusqliteExecutor, SchemaSnapshot, UpReport, load_dir, up,
+    AtomicError, Executor, LedgerRow, MigrateError, RusqliteExecutor, SchemaSnapshot, UpReport,
+    load_dir, up,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -152,8 +153,12 @@ fn failure_in_the_second_keeps_the_first_and_never_tries_the_third() {
 
     assert!(matches!(
         err,
-        MigrateError::Apply { version: 20260101000002, ref statement, .. }
-            if statement.contains("NOT VALID SQL")
+        MigrateError::Apply {
+            version: 20260101000002,
+            statement: Some(ref statement),
+            operation: Some(1),
+            ..
+        } if statement == "NOT VALID SQL"
     ));
     assert_eq!(ledger_versions(&mut ex), vec![20260101000001]);
     let mut tables = table_names(&mut ex);
@@ -265,7 +270,7 @@ impl Executor for FailAt {
         &mut self,
         statements: &[String],
         suspend_foreign_keys: bool,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), AtomicError<Self::Error>> {
         let mut broken = statements.to_vec();
         broken[self.fail_at] = "FAULT INJECTED HERE".to_string();
         self.inner.run_atomic(&broken, suspend_foreign_keys)
@@ -333,6 +338,19 @@ fn failure_at_every_statement_position_leaves_the_database_untouched() {
     let migrations = load_dir(dir.path()).expect("load");
     // The ledger create, six operations, and the ledger insert.
     let statement_count = migrations[0].up.len() + 2;
+
+    // The statement each position holds. `None` marks the two ledger statements.
+    let expected: [Option<&str>; 8] = [
+        None,
+        Some(r#"CREATE TABLE "extra" ("id" INTEGER, PRIMARY KEY ("id"))"#),
+        Some(r#"ALTER TABLE "base" ADD COLUMN "note" TEXT"#),
+        Some("UPDATE base SET v = v + 1"),
+        Some(r#"CREATE INDEX "base_v" ON "base" ("v")"#),
+        Some(r#"ALTER TABLE "base" RENAME TO "renamed""#),
+        Some(r#"DROP TABLE "extra""#),
+        None,
+    ];
+    assert_eq!(expected.len(), statement_count);
 
     for fail_at in 0..statement_count {
         let conn = Connection::open_in_memory().expect("open");
