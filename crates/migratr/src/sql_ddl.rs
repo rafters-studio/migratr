@@ -247,6 +247,24 @@ pub(crate) fn names_own_column(item: &str, ident: &str) -> bool {
     false
 }
 
+/// Whether a CREATE INDEX statement names `ident` as an indexed column or in its partial
+/// WHERE expression. The index's own name and its table, before the column list, do not count.
+pub(crate) fn index_names_column(sql: &str, ident: &str) -> bool {
+    let tokens = tokens(sql);
+    let Some(on) = tokens.iter().position(|t| t.is_keyword("ON")) else {
+        return false;
+    };
+    // The table, with an optional `schema.` qualifier, then the column list.
+    let mut after = on + 2;
+    while tokens
+        .get(after)
+        .is_some_and(|t| t.kind == TokenKind::Punct && t.text == ".")
+    {
+        after += 2;
+    }
+    tokens.iter().skip(after).any(|t| t.names(ident))
+}
+
 /// Whether `sql` contains `keyword` as a bare word. A quoted identifier spelled the same way
 /// does not count.
 pub(crate) fn has_keyword(sql: &str, keyword: &str) -> bool {

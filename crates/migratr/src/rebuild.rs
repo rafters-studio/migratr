@@ -10,8 +10,8 @@
 use crate::executor::{SchemaObject, SchemaSnapshot, TableInfo};
 use crate::migration::MigrateError;
 use crate::sql_ddl::{
-    TableBody, create_table_name_span, has_keyword, leading_identifier, mentions_identifier,
-    names_own_column, quote_ident, quote_literal, table_body,
+    TableBody, create_table_name_span, has_keyword, index_names_column, leading_identifier,
+    mentions_identifier, names_own_column, quote_ident, quote_literal, table_body,
 };
 
 /// A change to one table that the rebuild makes.
@@ -132,8 +132,15 @@ pub(crate) fn needs_rebuild(
     let indexed = Dependents::of(schema, table)
         .indexes
         .iter()
-        .any(|o| mentions(o, column));
+        .any(|o| index_names(o, column));
     Ok(constrained || named_elsewhere || indexed)
+}
+
+fn index_names(object: &SchemaObject, column: &str) -> bool {
+    object
+        .sql
+        .as_deref()
+        .is_some_and(|sql| index_names_column(sql, column))
 }
 
 fn mentions(object: &SchemaObject, name: &str) -> bool {
@@ -211,9 +218,10 @@ pub(crate) fn touched_objects(schema: &SchemaSnapshot, table: &str) -> Vec<Strin
 /// Refused before any statement with `UnparseableTable` when the table's stored CREATE
 /// statement cannot be split into column definitions that match the table's columns, or
 /// when the table or the changed column is absent from `schema`; and with `ColumnInUse`
-/// when another column's definition, a table constraint or a recreated index, view or
-/// trigger names the dropped column, since SQLite does not
-/// check a view or trigger body when it is created and the object would break on first use.
+/// when another column's definition, a table constraint, a foreign key of any table that
+/// names the column as its parent key, or a recreated index, view or trigger names the
+/// dropped column. SQLite does not check a view or trigger body when it is created, so the
+/// object would break on first use.
 pub(crate) fn rebuild_statements(
     schema: &SchemaSnapshot,
     table: &str,
@@ -257,7 +265,11 @@ pub(crate) fn rebuild_statements(
     }
 
     let dependents = Dependents::of(schema, table_name);
-    if let Some(user) = dependents.all().find(|o| mentions(o, column)) {
+    let uses_column = |o: &&&SchemaObject| match o.kind.as_str() {
+        "index" => index_names(o, column),
+        _ => mentions(o, column),
+    };
+    if let Some(user) = dependents.all().find(uses_column) {
         return Err(column_in_use(user.name.clone()));
     }
 
@@ -600,6 +612,22 @@ mod tests {
             "{message}"
         );
         assert_eq!(query_i64(&ex, "SELECT count(*) FROM sqlite_temp_master"), 0);
+    }
+
+    #[test]
+    fn an_index_names_only_its_columns_and_where_clause() {
+        let mut ex = executor(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, t TEXT, idx TEXT, a TEXT, b TEXT);
+             CREATE INDEX idx ON t (a) WHERE b > 0;",
+        );
+        let schema = ex.read_schema().expect("schema");
+        for (column, expected) in [("t", false), ("idx", false), ("a", true), ("b", true)] {
+            assert_eq!(
+                needs_rebuild(&schema, "t", column).expect(column),
+                expected,
+                "{column}"
+            );
+        }
     }
 
     #[test]
