@@ -208,12 +208,35 @@ fn snapshot_dir(db_path: &Path) -> PathBuf {
     parent.join(".migratr").join("snapshots")
 }
 
-/// The `.db` files of a snapshot directory, oldest first.
+/// Whether `name` is `<14 digits>_<digits>_<up|down>.db`, the name `snapshot_before` gives.
+fn is_snapshot_name(name: &str) -> bool {
+    let all_digits = |s: &str, len: Option<usize>| {
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && len.is_none_or(|n| s.len() == n)
+    };
+    let Some(stem) = name.strip_suffix(".db") else {
+        return false;
+    };
+    let mut parts = stem.split('_');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(time), Some(version), Some(direction), None) => {
+            all_digits(time, Some(14))
+                && all_digits(version, None)
+                && matches!(direction, "up" | "down")
+        }
+        _ => false,
+    }
+}
+
+/// The snapshot files of a snapshot directory, oldest first. Other files are not migratr's.
 fn list_snapshots(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut found = Vec::new();
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
-        if path.extension().is_some_and(|e| e == "db") {
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_snapshot_name)
+        {
             found.push(path);
         }
     }
@@ -274,6 +297,23 @@ mod tests {
         // 2024-02-29 12:34:56 UTC
         let t = UNIX_EPOCH + Duration::from_secs(1_709_210_096);
         assert_eq!(timestamp(t), "20240229123456");
+    }
+
+    #[test]
+    fn pruning_deletes_only_files_named_like_snapshots() {
+        let dir = tempfile::TempDir::new().expect("tmp");
+        let old = dir.path().join("20260101000000_1_up.db");
+        let newest = dir.path().join("20260101000001_2_up.db");
+        let live = dir.path().join("app.db");
+        for file in [&old, &newest, &live] {
+            fs::write(file, "x").expect("write");
+        }
+
+        prune(dir.path(), &newest, 1).expect("prune");
+
+        assert!(!old.exists());
+        assert!(newest.exists());
+        assert!(live.exists());
     }
 
     #[test]

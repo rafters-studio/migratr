@@ -158,6 +158,27 @@ fn a_down_that_drops_what_a_create_table_added_snapshots_its_rows() {
 }
 
 #[test]
+fn an_unwritable_snapshot_directory_stops_a_destructive_up_with_nothing_changed() {
+    let dir = TempDir::new().expect("tmp");
+    let migrations = TempDir::new().expect("tmp");
+    let (mut ex, db) = file_db(&dir);
+    seed_users(&ex);
+    // A regular file where the .migratr directory must go makes the directory uncreatable.
+    fs::write(dir.path().join(".migratr"), "").expect("blocker");
+    write(
+        &migrations,
+        "20260101000000_drop_users.json",
+        DROP_USERS_SQL,
+    );
+
+    let err = up(&mut ex, &load(&migrations), None).expect_err("must refuse");
+
+    assert!(matches!(err, MigrateError::SnapshotFailed { .. }), "{err}");
+    assert!(has_table(&db, "users"));
+    assert!(ex.read_ledger().expect("ledger").is_empty());
+}
+
+#[test]
 fn an_executor_that_cannot_snapshot_stops_a_destructive_up_with_nothing_changed() {
     let dir = TempDir::new().expect("tmp");
     let migrations = TempDir::new().expect("tmp");
