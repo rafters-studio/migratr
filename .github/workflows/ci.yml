@@ -36,6 +36,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  release-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/test-release.sh
+
   sqlx-coexist:
     runs-on: ubuntu-latest
     steps:
