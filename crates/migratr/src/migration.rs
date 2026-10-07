@@ -196,17 +196,15 @@ pub enum MigrateError {
     },
 
     #[error(
-        "migration {version}: cannot drop the column from table {table}: operation \
-         {operation} earlier in the same migration changed the table or an object a rebuild \
-         would recreate, so the schema migratr read is stale and SQLite refuses the drop in \
-         place ({cause}); move the drop into its own migration"
+        "migration {version}: dropping column {column} from table {table} needs a table \
+         rebuild, which must be the first operation of its migration, but it is operation \
+         {operation}; move the earlier operations into their own migration"
     )]
-    UntrackedChange {
+    RebuildNotFirst {
         version: u64,
         table: String,
+        column: String,
         operation: usize,
-        /// SQLite's refusal of the in-place drop.
-        cause: String,
     },
 
     #[error(transparent)]

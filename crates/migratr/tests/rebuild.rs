@@ -285,7 +285,7 @@ fn an_orphaning_insert_in_the_same_migration_is_refused_and_leaves_the_database_
             .expect("set fk");
         let before = dump(ex.connection());
         let (_dir, migrations) = migration(&format!(
-            r#"{{"op": "raw_sql", "up": "INSERT INTO kids VALUES (7), (8)"}}, {}"#,
+            r#"{}, {{"op": "raw_sql", "up": "INSERT INTO kids VALUES (7), (8)"}}"#,
             drop_column("parents", "code")
         ));
 
@@ -333,7 +333,7 @@ fn several_new_orphans_in_a_without_rowid_child_are_all_counted() {
          INSERT INTO parents VALUES (1, 'a');",
     );
     let (_dir, migrations) = migration(&format!(
-        r#"{{"op": "raw_sql", "up": "INSERT INTO kids VALUES ('a', 7), ('b', 7), ('c', 8)"}}, {}"#,
+        r#"{}, {{"op": "raw_sql", "up": "INSERT INTO kids VALUES ('a', 7), ('b', 7), ('c', 8)"}}"#,
         drop_column("parents", "code")
     ));
 
@@ -603,8 +603,8 @@ fn columns(conn: &Connection, table: &str) -> Vec<String> {
         .expect("columns")
 }
 
-/// Runs `ops` then a rebuild-only drop of `t.gone` against `schema` and expects the refusal
-/// naming operation `operation`, with the database unchanged.
+/// Runs `ops` then a rebuild-only drop of `t.gone` against `schema` and expects the drop,
+/// operation `operation`, to be refused with the database unchanged.
 fn assert_refused_after(schema: &str, ops: &str, operation: usize) {
     let mut ex = seeded(schema);
     let before = dump(ex.connection());
@@ -615,8 +615,8 @@ fn assert_refused_after(schema: &str, ops: &str, operation: usize) {
     assert!(
         matches!(
             err,
-            MigrateError::UntrackedChange { ref table, operation: n, .. }
-                if table == "t" && n == operation
+            MigrateError::RebuildNotFirst { ref table, ref column, operation: n, .. }
+                if table == "t" && column == "gone" && n == operation
         ),
         "{ops}: {err:?}"
     );
@@ -627,49 +627,30 @@ fn assert_refused_after(schema: &str, ops: &str, operation: usize) {
 #[test]
 fn a_rebuild_after_an_earlier_operation_changed_the_table_is_refused() {
     let schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, gone TEXT UNIQUE)";
-    for (ops, operation) in [
-        (
-            r#"{"op": "add_column", "table": "t", "column": {"name": "c", "type": "TEXT"}}"#,
-            0,
-        ),
-        (
-            r#"{"op": "create_index", "name": "t_name", "table": "t", "columns": ["name"]}"#,
-            0,
-        ),
-        (
-            r#"{"op": "rename_column", "table": "t", "from": "name", "to": "label"}"#,
-            0,
-        ),
-        (r#"{"op": "rename_table", "from": "t", "to": "u"}"#, 0),
-        (
-            r#"{"op": "drop_column", "table": "t", "column": {"name": "name", "type": "TEXT"}}"#,
-            0,
-        ),
+    for ops in [
+        r#"{"op": "add_column", "table": "t", "column": {"name": "c", "type": "TEXT"}}"#,
+        r#"{"op": "create_index", "name": "t_name", "table": "t", "columns": ["name"]}"#,
+        r#"{"op": "rename_column", "table": "t", "from": "name", "to": "label"}"#,
+        r#"{"op": "rename_table", "from": "t", "to": "u"}"#,
+        r#"{"op": "drop_column", "table": "t", "column": {"name": "name", "type": "TEXT"}}"#,
     ] {
-        assert_refused_after(schema, ops, operation);
+        assert_refused_after(schema, ops, 1);
     }
 }
 
 #[test]
-fn an_earlier_operation_that_leaves_the_drop_possible_in_place_does_not_block_it() {
-    let mut ex = seeded(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT);
-         CREATE INDEX t_a ON t (a);",
+fn a_drop_the_pre_migration_schema_routes_to_a_rebuild_is_refused_after_any_earlier_operation() {
+    // The index is gone by the time the drop runs, but the schema read before the migration
+    // still shows it, so the drop is refused rather than guessed.
+    assert_refused_after(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, gone TEXT, b TEXT); CREATE INDEX t_gone ON t (gone);",
+        r#"{"op": "drop_index", "definition": {"name": "t_gone", "table": "t", "columns": ["gone"]}}"#,
+        1,
     );
-    let (_dir, migrations) = migration(&format!(
-        r#"{{"op": "drop_index", "definition": {{"name": "t_a", "table": "t", "columns": ["a"]}}}},
-           {{"op": "add_column", "table": "t", "column": {{"name": "c", "type": "TEXT"}}}},
-           {}"#,
-        drop_column("t", "a")
-    ));
-
-    up(&mut ex, &migrations, None).expect("up");
-
-    assert_eq!(columns(ex.connection(), "t"), ["id", "b", "c"]);
 }
 
 #[test]
-fn a_unique_column_of_a_table_created_or_renamed_earlier_is_refused_naming_that_operation() {
+fn a_unique_column_of_a_table_created_or_renamed_earlier_is_refused_by_sqlite_in_place() {
     for (ops, schema) in [
         (
             r#"{"op": "create_table", "table": "t", "columns": [{"name": "id", "type": "INTEGER", "primary_key": 1}, {"name": "gone", "type": "TEXT", "unique": true}]}"#,
@@ -680,7 +661,23 @@ fn a_unique_column_of_a_table_created_or_renamed_earlier_is_refused_naming_that_
             "CREATE TABLE old (id INTEGER PRIMARY KEY, gone TEXT UNIQUE)",
         ),
     ] {
-        assert_refused_after(schema, ops, 0);
+        let mut ex = seeded(schema);
+        let before = dump(ex.connection());
+        let (_dir, migrations) = migration(&format!("{ops}, {}", drop_column("t", "gone")));
+
+        let err = up(&mut ex, &migrations, None).expect_err(ops);
+
+        assert!(
+            matches!(
+                err,
+                MigrateError::Apply {
+                    operation: Some(1),
+                    ..
+                }
+            ),
+            "{ops}: {err:?}"
+        );
+        assert_eq!(dump(ex.connection()), before, "{ops}");
     }
 }
 
@@ -697,29 +694,37 @@ fn a_rebuild_after_an_earlier_operation_changed_a_recreated_object_is_refused() 
         r#"{"op": "raw_sql", "up": "DROP VIEW v"}"#,
         r#"{"op": "raw_sql", "up": "ALTER TABLE log RENAME TO history"}"#,
     ] {
-        assert_refused_after(schema, ops, 0);
+        assert_refused_after(schema, ops, 1);
     }
 }
 
 #[test]
-fn a_child_table_dropped_earlier_in_the_migration_is_not_checked_after() {
+fn a_refused_drop_succeeds_in_its_own_following_migration() {
     let mut ex = seeded(PARENTS_AND_KIDS);
-    let (_dir, migrations) = migration(&format!(
-        r#"{{"op": "drop_table", "table": "kids", "definition": {{"name": "kids", "columns": [], "sql": ""}}}},
-           {}"#,
-        drop_column("parents", "code")
-    ));
+    let drop_kids = r#"{"op": "drop_table", "table": "kids", "definition": {"name": "kids", "columns": [], "sql": ""}}"#;
+    let (_dir, together) = migration(&format!("{drop_kids}, {}", drop_column("parents", "code")));
+    let err = up(&mut ex, &together, None).expect_err("refused");
+    assert!(
+        matches!(err, MigrateError::RebuildNotFirst { operation: 1, .. }),
+        "{err:?}"
+    );
 
-    up(&mut ex, &migrations, None).expect("up");
+    let dir = TempDir::new().expect("tempdir");
+    fs::write(
+        dir.path().join("20260101000001_drop_kids.json"),
+        format!(r#"{{"up": [{drop_kids}]}}"#),
+    )
+    .expect("write");
+    fs::write(
+        dir.path().join("20260101000002_drop_code.json"),
+        format!(r#"{{"up": [{}]}}"#, drop_column("parents", "code")),
+    )
+    .expect("write");
+    let split = load_dir(dir.path()).expect("load");
+
+    up(&mut ex, &split, None).expect("up");
 
     assert_eq!(columns(ex.connection(), "parents"), ["id"]);
-    assert_eq!(
-        query_i64(
-            ex.connection(),
-            "SELECT count(*) FROM sqlite_master WHERE name = 'kids'"
-        ),
-        0
-    );
 }
 
 #[test]
@@ -736,7 +741,7 @@ fn raw_sql_naming_the_table_before_a_rebuild_is_refused_and_nothing_changes() {
     assert!(
         matches!(
             err,
-            MigrateError::UntrackedChange { ref table, operation: 0, .. } if table == "authors"
+            MigrateError::RebuildNotFirst { ref table, operation: 1, .. } if table == "authors"
         ),
         "{err:?}"
     );

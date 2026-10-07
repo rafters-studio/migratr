@@ -198,13 +198,6 @@ impl<'a> Dependents<'a> {
     }
 }
 
-/// The names of every object a rebuild of `table` drops or recreates, the table included.
-pub(crate) fn touched_objects(schema: &SchemaSnapshot, table: &str) -> Vec<String> {
-    std::iter::once(table.to_string())
-        .chain(Dependents::of(schema, table).all().map(|o| o.name.clone()))
-        .collect()
-}
-
 /// The statements that rebuild `table` with `change` applied, in order:
 ///
 /// 1. drop the triggers and views that name the table, directly or through another view
@@ -728,7 +721,9 @@ mod tests {
              INSERT INTO t (name) VALUES ('a');",
         );
         let schema = ex.read_schema().expect("schema");
-        let mut touched = touched_objects(&schema, "t");
+        let mut touched: Vec<&str> = std::iter::once("t")
+            .chain(Dependents::of(&schema, "t").all().map(|o| o.name.as_str()))
+            .collect();
         touched.sort();
         assert_eq!(touched, ["on_other", "t", "v1", "v2", "via_view"]);
 
