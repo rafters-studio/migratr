@@ -8,4 +8,11 @@ name = "migratr"
 path = "src/main.rs"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 migratr.workspace = true
+rusqlite = { workspace = true, features = ["backup"] }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

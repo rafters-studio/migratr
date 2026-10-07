@@ -33,4 +33,4 @@ pub use up::{UpReport, up};
 #[cfg(feature = "rusqlite")]
 pub use executor::RusqliteExecutor;
 #[cfg(feature = "rusqlite")]
-pub use snapshot::restore;
+pub use snapshot::{latest_snapshot, restore};

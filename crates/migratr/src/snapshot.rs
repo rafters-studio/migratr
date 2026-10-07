@@ -199,6 +199,17 @@ pub fn restore(
     Ok(report)
 }
 
+/// The newest snapshot beside the database at `db_path`, or `None` when there is none.
+#[cfg(feature = "rusqlite")]
+pub fn latest_snapshot(db_path: &Path) -> Result<Option<PathBuf>, MigrateError> {
+    let dir = snapshot_dir(db_path);
+    match list_snapshots(&dir) {
+        Ok(mut found) => Ok(found.pop()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(MigrateError::Io { path: dir, source }),
+    }
+}
+
 #[cfg(feature = "rusqlite")]
 fn snapshot_dir(db_path: &Path) -> PathBuf {
     let parent = match db_path.parent() {
