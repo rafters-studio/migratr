@@ -5,8 +5,8 @@ step: no confirmation, no choice. Run the steps in order. On the first failure,
 stop and report it as the Failure section says.
 
 Config is `release.toml`. The mechanics are `scripts/release.sh` and
-`scripts/sync-version.sh`, copied from runlegion/legion (`scripts/release.sh` at
-5a717f08) with two patches: the version bump also moves the `version` pin on
+`scripts/sync-version.sh`, copied from runlegion/legion (legion 0.43.5, commit
+58504b1c) with two patches: the version bump also moves the `version` pin on
 every `path = "..."` dependency, and `--activate` is refused. Check their
 behavior with `bash scripts/test-release.sh`.
 
