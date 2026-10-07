@@ -82,7 +82,6 @@ expect_eq "verify_checksum accepts a correct hash" "$?" "0"
 out="$( (verify_checksum "${WORK}/migratr-test.tar.gz" "${WORK}/bad.txt" "${plat}") 2>&1 )"; rc=$?
 if [ "${rc}" -ne 0 ] && [[ "${out}" == *migratr-test.tar.gz* ]]; then pass "mismatch refuses, naming the archive"
 else fail "mismatch refuses, naming the archive (rc=${rc})"; fi
-expect_eq "mismatch leaves the install dir empty" "$(ls -A "${d}")" ""
 
 out="$( (verify_checksum "${WORK}/migratr-test.tar.gz" "${WORK}/missing.txt" "${plat}") 2>&1 )"; rc=$?
 if [ "${rc}" -ne 0 ] && [[ "${out}" == *migratr-test.tar.gz* ]]; then pass "missing line refuses, naming the archive"

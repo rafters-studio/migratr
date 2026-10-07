@@ -283,10 +283,8 @@ main() {
   ensure_path
 
   local installed_version
-  installed_version="$("${INSTALL_DIR}/${BINARY_NAME}" --version 2>/dev/null || true)"
-  if [ -z "${installed_version}" ]; then
-    installed_version="migratr ${version#v}"
-  fi
+  installed_version="$("${INSTALL_DIR}/${BINARY_NAME}" --version 2>/dev/null)" \
+    || error "Installed ${INSTALL_DIR}/${BINARY_NAME} but it failed to run --version"
   success "Installed ${installed_version} to ${INSTALL_DIR}/${BINARY_NAME}"
 }
 
