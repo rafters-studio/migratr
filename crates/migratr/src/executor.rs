@@ -10,6 +10,14 @@ pub struct SchemaObject {
     pub sql: Option<String>,
 }
 
+/// One applied migration as recorded in the ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerRow {
+    pub version: u64,
+    pub name: String,
+    pub checksum: String,
+}
+
 /// One row of `PRAGMA table_xinfo`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnInfo {
@@ -59,6 +67,10 @@ pub trait Executor {
     /// Every row of sqlite_master plus the pragma rows migratr reads.
     fn read_schema(&mut self) -> Result<SchemaSnapshot, Self::Error>;
 
+    /// Every row of the `_migratr_migrations` ledger, ordered by version.
+    /// Empty when the ledger table does not exist.
+    fn read_ledger(&mut self) -> Result<Vec<LedgerRow>, Self::Error>;
+
     /// Run all statements in one transaction; all apply or none do.
     /// With `suspend_foreign_keys`, foreign_keys is turned off before the
     /// transaction and restored to its prior value after, on success or failure.
@@ -82,7 +94,9 @@ mod rusqlite_executor {
 
     use rusqlite::Connection;
 
-    use super::{ColumnInfo, Executor, ForeignKeyInfo, SchemaObject, SchemaSnapshot, TableInfo};
+    use super::{
+        ColumnInfo, Executor, ForeignKeyInfo, LedgerRow, SchemaObject, SchemaSnapshot, TableInfo,
+    };
 
     /// An [`Executor`] over a rusqlite connection.
     pub struct RusqliteExecutor {
@@ -166,6 +180,31 @@ mod rusqlite_executor {
             }
 
             Ok(SchemaSnapshot { objects, tables })
+        }
+
+        fn read_ledger(&mut self) -> Result<Vec<LedgerRow>, Self::Error> {
+            let exists: bool = self.conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_migratr_migrations')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(Vec::new());
+            }
+            self.conn
+                .prepare(
+                    "SELECT version, name, checksum FROM _migratr_migrations ORDER BY version",
+                )?
+                .query_map([], |row| {
+                    let version: i64 = row.get(0)?;
+                    Ok(LedgerRow {
+                        version: u64::try_from(version)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, version))?,
+                        name: row.get(1)?,
+                        checksum: row.get(2)?,
+                    })
+                })?
+                .collect()
         }
 
         fn run_atomic(
@@ -271,6 +310,37 @@ mod rusqlite_executor {
             let snap = ex.read_schema().expect("read");
             assert_eq!(snap.tables[0].name, "we\"ird");
             assert_eq!(snap.tables[0].columns.len(), 1);
+        }
+
+        #[test]
+        fn read_ledger_is_empty_without_the_table_and_lists_rows_with_it() {
+            let mut ex = executor();
+            assert!(ex.read_ledger().expect("no table").is_empty());
+            ex.run_atomic(
+                &[
+                    s("CREATE TABLE _migratr_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL)"),
+                    s("INSERT INTO _migratr_migrations VALUES (2, 'b', 'cb', 't')"),
+                    s("INSERT INTO _migratr_migrations VALUES (1, 'a', 'ca', 't')"),
+                ],
+                false,
+            )
+            .expect("seed");
+            let rows = ex.read_ledger().expect("rows");
+            assert_eq!(
+                rows,
+                vec![
+                    LedgerRow {
+                        version: 1,
+                        name: "a".into(),
+                        checksum: "ca".into()
+                    },
+                    LedgerRow {
+                        version: 2,
+                        name: "b".into(),
+                        checksum: "cb".into()
+                    },
+                ]
+            );
         }
 
         #[test]

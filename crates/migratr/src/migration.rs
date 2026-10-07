@@ -161,6 +161,24 @@ pub enum MigrateError {
         path: PathBuf,
         source: std::io::Error,
     },
+
+    #[error(
+        "migration {version}_{name} was edited after it was applied: its checksum no longer matches the ledger"
+    )]
+    ChecksumMismatch { version: u64, name: String },
+
+    #[error("migration {version}_{name} is in the ledger but its file is missing")]
+    MissingFile { version: u64, name: String },
+
+    #[error("migration {version} failed and was rolled back: {source}; statements: {statement}")]
+    Apply {
+        version: u64,
+        statement: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[error(transparent)]
+    Executor(Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// The JSON body of a migration file.
