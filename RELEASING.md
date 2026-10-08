@@ -15,12 +15,13 @@ Replace `X.Y.Z` with the new version, `<level>` with `patch`, `minor` or
 
 ## 1. Preconditions
 
-On `main`, in sync with origin, clean tree.
+On `main`, in sync with origin, no uncommitted changes to tracked files.
+Untracked files are ignored, as `release.sh`'s own guard ignores them.
 
 ```bash
-git rev-parse --abbrev-ref HEAD            # main
-git fetch origin main && git status -sb    # no "ahead"/"behind"
-git status --porcelain                     # empty
+git rev-parse --abbrev-ref HEAD                      # main
+git fetch origin main && git status -sb              # no "ahead"/"behind"
+git status --porcelain --untracked-files=no          # empty
 ```
 
 If any fails, stop and report which. Change nothing.
@@ -31,6 +32,11 @@ Dispatch the `legion:changelog` agent for migratr. It prepends `## X.Y.Z` to
 `CHANGELOG.md` with a line `<Patch|Minor|Major> release: <rationale>`. The bump
 level is that word, lowercased. Current choice (Sean, 2026-10-07): the changelog
 agent's rationale sets the bump level, with no operator; revisable.
+
+Read the result back from `CHANGELOG.md`: `X.Y.Z` is the first `## X.Y.Z`
+heading, and `<level>` is the first word of the line under it, lowercased. If the
+agent failed, or the top of `CHANGELOG.md` is not a `## X.Y.Z` heading followed by
+a `Patch`, `Minor` or `Major release:` line, stop and report it.
 
 Leave the entry uncommitted. `release.sh` takes it into the release commit.
 
@@ -47,21 +53,24 @@ The pr-write gate needs an issue to map. Note the issue number.
 ## 4. Stage the release commit
 
 ```bash
+scripts/release.sh <level> --dry-run    # prints the steps, changes nothing
 scripts/release.sh <level>
 ```
 
 It runs the preflight commands from `release.toml`, bumps `Cargo.toml`
 (`[workspace.package]` and the three path-dependency pins), refreshes
 `Cargo.lock`, commits `chore(release): X.Y.Z` on `release/X.Y.Z`, and pushes that
-branch. Add `--dry-run` first to see the steps with nothing mutated.
+branch. If the dry run fails, stop and report its message.
 
 ## 5. Gates, PR, merge queue
 
 On `release/X.Y.Z`, run `/legion:legion-simplify`, then `/legion:legion-pr-write`
-(both are keyed to the release commit). Then:
+(both are keyed to the release commit). pr-write validates a body file, BODY,
+that maps the release issue's criterion. Then open the PR with that body; its
+output includes `created PR #<pr>`, which gives `<pr>`:
 
 ```bash
-legion pr create --repo migratr --title "chore(release): vX.Y.Z" --head release/X.Y.Z --closes <issue>
+legion pr create --repo migratr --title "chore(release): vX.Y.Z" --head release/X.Y.Z --closes <issue> --body "$(cat BODY)"
 legion pr merge --repo migratr --number <pr>
 ```
 
@@ -96,6 +105,9 @@ before its release exists.
 
 ## 8. Docs worktree and changelog copy
 
+`--docs-worktree` finds shingle through `legion watch list`, where it is
+registered.
+
 ```bash
 scripts/release.sh --docs-worktree        # prints W
 cp CHANGELOG.md W/sites/smugglr.dev/src/migratr/CHANGELOG.md
@@ -110,7 +122,16 @@ changed, and may write nothing.
 
 ## 9. Docs PR
 
-In `W`: commit. Create the shingle issue:
+In `W`: commit with the message `docs(migratr): vX.Y.Z on smugglr.dev`. Look for
+an open PR on the docs branch:
+
+```bash
+gh pr list --repo rafters-studio/shingle --head docs/migratr-current --state open --json number --jq '.[0].number'
+```
+
+If it prints a number, that is `<shingle-pr>`: push with
+`legion push --repo shingle --branch docs/migratr-current`, skip to the poll
+below, and create no issue. Otherwise create the shingle issue:
 
 ```bash
 gh issue create --repo rafters-studio/shingle \
@@ -118,15 +139,16 @@ gh issue create --repo rafters-studio/shingle \
   --body "https://smugglr.dev/migratr/changelog/ shows the X.Y.Z entry"
 ```
 
-Run `/legion:legion-simplify` and `/legion:legion-pr-write` in `W`. Then:
+Run `/legion:legion-simplify` and `/legion:legion-pr-write` in `W` (BODY maps
+the shingle issue's criterion). Then push, open and merge:
 
 ```bash
-legion pr create --repo shingle --head docs/migratr-current --closes <shingle-issue>
+legion push --repo shingle --branch docs/migratr-current
+legion pr create --repo shingle --title "docs(migratr): vX.Y.Z on smugglr.dev" --head docs/migratr-current --closes <shingle-issue> --body "$(cat BODY)"
 legion pr merge --repo shingle --number <shingle-pr>
 ```
 
-If an open PR already exists on `docs/migratr-current`, push to it instead of
-creating one. Then poll up to 90 times, 20 seconds apart, until the PR state is
+On either path, poll up to 90 times, 20 seconds apart, until the PR state is
 `MERGED`:
 
 ```bash
@@ -141,7 +163,7 @@ scripts/release.sh --docs-worktree-done=W
 
 ## 11. Wait for the live site
 
-Up to 30 times, a few minutes apart, fetch https://smugglr.dev/migratr/changelog/
+Up to 30 times, 60 seconds apart, fetch https://smugglr.dev/migratr/changelog/
 and https://smugglr.dev/migratr/ with the WebFetch tool until both show `X.Y.Z`.
 Do not use `curl`: legion's hook stops it for operator approval.
 
@@ -157,6 +179,10 @@ live-site result.
   `## <new>` header check. Stop and report both versions.
 - Release-side failures (queue ejection, merge timeout, tag failure): report
   `release.sh`'s message verbatim and stop.
+- A release-side gate fails (simplify or pr-write in step 5): stop and report
+  the gate's output, the release issue and the pushed `release/X.Y.Z` branch.
+  `release.sh` refuses to stage again while that branch exists, so a later run
+  first deletes the unmerged branch and reuses or closes the issue.
 - Step 7 times out: report "release.yml has not published vX.Y.Z" with the
   Actions run URL. The docs steps do not run.
 - Docs-step failures (worktree refused, shingle gates fail, PR ejected, merge
