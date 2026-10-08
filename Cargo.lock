@@ -311,7 +311,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "migratr"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "migratr-format",
  "migratr-macros",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "migratr-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "migratr",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "migratr-format"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -347,14 +347,14 @@ dependencies = [
 
 [[package]]
 name = "migratr-macros"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "migratr-format",
 ]
 
 [[package]]
 name = "migratr-oracle"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "migratr",
  "rusqlite",
