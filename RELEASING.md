@@ -67,7 +67,7 @@ branch. If the dry run fails, stop and report its message.
 On `release/X.Y.Z`, run `/legion:legion-simplify`, then `/legion:legion-pr-write`
 (both are keyed to the release commit). pr-write validates a body file, BODY,
 that maps the release issue's criterion. Then open the PR with that body; its
-output ends with the PR URL, whose last path segment is `<pr>`:
+output includes `created PR #<pr>`, which gives `<pr>`:
 
 ```bash
 legion pr create --repo migratr --title "chore(release): vX.Y.Z" --head release/X.Y.Z --closes <issue> --body "$(cat BODY)"
