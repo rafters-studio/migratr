@@ -13,6 +13,13 @@ behavior with `bash scripts/test-release.sh`.
 Replace `X.Y.Z` with the new version, `<level>` with `patch`, `minor` or
 `major`, `<pr>` with the release PR number, and `W` with the docs worktree path.
 
+## Keeping state
+
+A release can outlive one agent session. After every step that creates something
+(the release issue, the release PR, the tag, the docs worktree, the shingle PR),
+comment it on the release issue. To resume, read that issue's comments, check
+what exists, and continue at the first step not done.
+
 ## 1. Preconditions
 
 On `main`, in sync with origin, no uncommitted changes to tracked files.
@@ -21,7 +28,8 @@ Untracked files are ignored, as `release.sh`'s own guard ignores them.
 ```bash
 git rev-parse --abbrev-ref HEAD                      # main
 git fetch origin main && git status -sb              # no "ahead"/"behind"
-git status --porcelain --untracked-files=no          # empty
+git status --porcelain --untracked-files=no          # empty, or only CHANGELOG.md when resuming after step 2
+git branch --list 'release/*'                        # empty
 ```
 
 If any fails, stop and report which. Change nothing.
@@ -33,10 +41,11 @@ Dispatch the `legion:changelog` agent for migratr. It prepends `## X.Y.Z` to
 level is that word, lowercased. Current choice (Sean, 2026-10-07): the changelog
 agent's rationale sets the bump level, with no operator; revisable.
 
-Read the result back from `CHANGELOG.md`: `X.Y.Z` is the first `## X.Y.Z`
-heading, and `<level>` is the first word of the line under it, lowercased. If the
-agent failed, or the top of `CHANGELOG.md` is not a `## X.Y.Z` heading followed by
-a `Patch`, `Minor` or `Major release:` line, stop and report it.
+Tell it to put the `<Patch|Minor|Major> release: <rationale>` line as the first
+paragraph under the heading. Read the result back from `CHANGELOG.md`: `X.Y.Z` is
+the first `## X.Y.Z` heading, and `<level>` is the word before `release:` in the
+first paragraph under it, lowercased. If the agent failed, or the entry has no
+such heading and line, stop and report it.
 
 Leave the entry uncommitted. `release.sh` takes it into the release commit.
 
@@ -53,20 +62,21 @@ The pr-write gate needs an issue to map. Note the issue number.
 ## 4. Stage the release commit
 
 ```bash
-scripts/release.sh <level> --dry-run    # prints the steps, changes nothing
 scripts/release.sh <level>
 ```
 
 It runs the preflight commands from `release.toml`, bumps `Cargo.toml`
 (`[workspace.package]` and the three path-dependency pins), refreshes
 `Cargo.lock`, commits `chore(release): X.Y.Z` on `release/X.Y.Z`, and pushes that
-branch. If the dry run fails, stop and report its message.
+branch. It refuses when the `## X.Y.Z` heading does not equal the version it
+computes from `<level>`; stop and report its message.
 
 ## 5. Gates, PR, merge queue
 
 On `release/X.Y.Z`, run `/legion:legion-simplify`, then `/legion:legion-pr-write`
-(both are keyed to the release commit). pr-write validates a body file, BODY,
-that maps the release issue's criterion. Then open the PR with that body; its
+(both are keyed to the release commit). pr-write runs
+`legion pr write-check --repo migratr --issue <issue>` on a body file, BODY, kept
+in a scratch directory outside the repo, that maps the release issue's criterion. Then open the PR with that body; its
 output includes `created PR #<pr>`, which gives `<pr>`:
 
 ```bash
@@ -175,8 +185,8 @@ live-site result.
 ## Failure
 
 - Step 1 fails: stop and report which precondition. Nothing has changed.
-- The changelog header disagrees with the level: `release.sh` refuses at its
-  `## <new>` header check. Stop and report both versions.
+- The `## X.Y.Z` heading disagrees with the version `release.sh` computes from
+  `<level>`: it refuses at its header check. Stop and report both versions.
 - Release-side failures (queue ejection, merge timeout, tag failure): report
   `release.sh`'s message verbatim and stop.
 - A release-side gate fails (simplify or pr-write in step 5): stop and report
