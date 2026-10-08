@@ -21,3 +21,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+rstest.workspace = true
+rstest-bdd.workspace = true
+rstest-bdd-macros.workspace = true
