@@ -54,7 +54,7 @@ Leave the entry uncommitted. `release.sh` takes it into the release commit.
 ```bash
 gh issue create --repo rafters-studio/migratr \
   --title "chore(release): vX.Y.Z" \
-  --body "migratr X.Y.Z is tagged, on crates.io, and on a GitHub release with four archives and checksums.txt"
+  --body "$(printf '## Acceptance criteria\n\n- migratr X.Y.Z is tagged, on crates.io, and on a GitHub release with four archives and checksums.txt\n')"
 ```
 
 The pr-write gate needs an issue to map. Note the issue number.
@@ -146,7 +146,7 @@ below, and create no issue. Otherwise create the shingle issue:
 ```bash
 gh issue create --repo rafters-studio/shingle \
   --title "docs(migratr): vX.Y.Z on smugglr.dev" \
-  --body "https://smugglr.dev/migratr/changelog/ shows the X.Y.Z entry"
+  --body "$(printf '## Acceptance criteria\n\n- https://smugglr.dev/migratr/changelog/ shows the X.Y.Z entry\n')"
 ```
 
 Run `/legion:legion-simplify` and `/legion:legion-pr-write` in `W` (BODY maps
@@ -173,9 +173,20 @@ scripts/release.sh --docs-worktree-done=W
 
 ## 11. Wait for the live site
 
-Up to 30 times, 60 seconds apart, fetch https://smugglr.dev/migratr/changelog/
-and https://smugglr.dev/migratr/ with the WebFetch tool until both show `X.Y.Z`.
-Do not use `curl`: legion's hook stops it for operator approval.
+Workers Builds deploys shingle's main and reports it as a check run. Wait for the
+`Workers Builds: smugglr-shingle` check on the merged commit, polling every 20
+seconds for up to 30 minutes:
+
+```bash
+sha="$(gh api repos/rafters-studio/shingle/commits/main --jq .sha)"
+gh api repos/rafters-studio/shingle/commits/$sha/check-runs \
+  --jq '.check_runs[] | select(.name=="Workers Builds: smugglr-shingle") | .conclusion'
+```
+
+When it prints `success`, fetch https://smugglr.dev/migratr/changelog/?r=X.Y.Z and
+https://smugglr.dev/migratr/?r=X.Y.Z with the WebFetch tool and confirm both show
+`X.Y.Z`. The query string matters: WebFetch caches a URL for 15 minutes. Do not use
+`curl`: legion's hook stops it for operator approval.
 
 ## 12. Report
 
