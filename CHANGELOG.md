@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.4
+
+Patch release: one trait and two functions added to the existing `migratr` library API, with no change to the CLI, the migration file format, or the ledger's schema, and no schema migration.
+
+The shared-reader release. A program that drives migrations over something other than a rusqlite connection can now read a database's schema and ledger through migratr itself, by supplying only a way to run a SQL statement and return its rows as JSON. Until now such a caller had to copy those reads, as smugglr's `--migratr` does for its `Executor` over HTTP-SQL. `RusqliteExecutor` now reads through the same code, so the queries and decoding exist once. It returns the same schema and ledger as before, though some of the errors it returns for a malformed row are different variants of `rusqlite::Error`.
+
+### New
+- **One reader of the schema and ledger, for any way of running SQL** (PR #56, #55): the new `migratr::SqlReader` trait has two methods: `rows(sql)` runs a statement and returns its rows as `Vec<Vec<serde_json::Value>>`, and `malformed(what)` builds the caller's error for a row that is not what its statement promises. `migratr::read_schema_through(&mut reader, skip)` returns the same `SchemaSnapshot` that `Executor::read_schema` returns, and `migratr::read_ledger_through(&mut reader)` returns the ledger rows ordered by version, or an empty list when `_migratr_migrations` does not exist. The `skip` predicate names tables the reader must not touch, such as a host's own: a skipped table is not queried, and every `sqlite_master` object on it, such as an index, is left out of the snapshot. A value of the wrong type, a row with too few columns, and a negative ledger version are all errors. A test in `crates/migratr/tests/reader.rs` reads one database through a JSON-row reader and through `RusqliteExecutor` and asserts that the schema and the ledger match. All three items build with default features off.
+
+### Changed
+- **`RusqliteExecutor` reads through the shared reader, which changes some error variants** (PR #56, #55): `read_schema` and `read_ledger` are now thin calls into `read_schema_through` and `read_ledger_through`, and return what they returned before for a well-formed database. A negative ledger version used to return `rusqlite::Error::IntegralValueOutOfRange` and now returns `rusqlite::Error::InvalidColumnName` carrying the text "a negative ledger version". A row of the wrong shape now returns that same variant with a description in place of rusqlite's own conversion error, and a blob where text is expected fails as "a value that is not text", because the reader sees a blob as null. Code that matches on those specific variants needs updating; the refusal itself is unchanged.
+
 ## 0.1.3
 
 Patch release: two additive functions in the existing `migratr` library API, with no change to the behavior of `up` or `down`, the CLI, the migration file format, or the ledger's schema, and no schema migration.
