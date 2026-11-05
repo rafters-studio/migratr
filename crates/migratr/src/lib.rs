@@ -8,6 +8,7 @@ mod error;
 mod executor;
 mod ledger;
 mod migration;
+mod reader;
 mod rebuild;
 mod scaffold;
 mod schema_file;
@@ -27,6 +28,7 @@ pub use migration::{
     Column, ForeignKey, GeneratedColumn, IndexDef, MigrateError, Migration, Op, TableDef, load_dir,
 };
 pub use migratr_macros::embed;
+pub use reader::{SqlReader, read_ledger_through, read_schema_through};
 pub use rebuild::rebuild_tables;
 pub use scaffold::scaffold;
 pub use schema_file::write_schema;
