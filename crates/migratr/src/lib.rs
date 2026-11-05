@@ -22,10 +22,12 @@ pub use executor::{
     AtomicError, ColumnInfo, Executor, ForeignKeyInfo, LedgerRow, SchemaObject, SchemaSnapshot,
     TableInfo,
 };
+pub use ledger::record_applied;
 pub use migration::{
     Column, ForeignKey, GeneratedColumn, IndexDef, MigrateError, Migration, Op, TableDef, load_dir,
 };
 pub use migratr_macros::embed;
+pub use rebuild::rebuild_tables;
 pub use scaffold::scaffold;
 pub use schema_file::write_schema;
 pub use snapshot::RestoreReport;

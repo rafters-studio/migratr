@@ -2,7 +2,7 @@ use std::fs;
 
 use migratr::{
     AtomicError, Executor, LedgerRow, MigrateError, Migration, RusqliteExecutor, SchemaSnapshot,
-    load_dir, up,
+    load_dir, rebuild_tables, up,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -791,4 +791,57 @@ fn names(conn: &Connection) -> Vec<String> {
     .expect("query")
     .collect::<Result<_, _>>()
     .expect("names")
+}
+
+/// What `rebuild_tables` reports for `ops` on a database seeded with `schema`.
+fn reported(schema: &str, ops: &str) -> Vec<String> {
+    let mut ex = seeded(schema);
+    let snapshot = ex.read_schema().expect("schema");
+    let (_dir, migrations) = migration(ops);
+    rebuild_tables(&snapshot, &migrations[0]).expect("reported")
+}
+
+const REPORTED_SCHEMA: &str =
+    "CREATE TABLE t (id INTEGER PRIMARY KEY, gone TEXT UNIQUE, plain TEXT);
+     CREATE TABLE u (id INTEGER PRIMARY KEY, gone TEXT UNIQUE, indexed TEXT);
+     CREATE INDEX u_indexed ON u (indexed);";
+
+#[test]
+fn a_dropped_column_is_reported_only_when_it_needs_the_rebuild() {
+    assert_eq!(reported(REPORTED_SCHEMA, &drop_column("t", "gone")), ["t"]);
+    assert!(reported(REPORTED_SCHEMA, &drop_column("t", "plain")).is_empty());
+}
+
+#[test]
+fn an_added_column_is_reported_only_when_it_needs_the_rebuild() {
+    let add = |column: &str| {
+        format!(
+            r#"{{"op": "add_column", "table": "t", "column": {{"name": "c", "type": "TEXT"{column}}}}}"#
+        )
+    };
+    assert_eq!(
+        reported(REPORTED_SCHEMA, &add(r#", "unique": true"#)),
+        ["t"]
+    );
+    assert!(reported(REPORTED_SCHEMA, &add("")).is_empty());
+}
+
+#[test]
+fn each_rebuilt_table_is_reported_once_in_operation_order() {
+    let ops = format!(
+        "{}, {}, {}",
+        drop_column("u", "gone"),
+        drop_column("t", "gone"),
+        drop_column("u", "indexed"),
+    );
+    assert_eq!(reported(REPORTED_SCHEMA, &ops), ["u", "t"]);
+}
+
+#[test]
+fn an_index_the_migration_dropped_first_does_not_count() {
+    let ops = format!(
+        r#"{{"op": "drop_index", "definition": {{"name": "u_indexed", "table": "u", "columns": ["indexed"]}}}}, {}"#,
+        drop_column("u", "indexed"),
+    );
+    assert!(reported(REPORTED_SCHEMA, &ops).is_empty());
 }
