@@ -126,7 +126,7 @@ fn parse<'a>(schema: &'a SchemaSnapshot, table: &str) -> Result<ParsedTable<'a>,
 /// named by another column (a generated expression or CHECK) or a table constraint. False
 /// when the table or column is absent, so the in-place statement reports it. Indexes named in
 /// `dropped_indexes` no longer exist when the column is dropped, so they do not count.
-pub(crate) fn needs_rebuild(
+fn needs_rebuild(
     schema: &SchemaSnapshot,
     table: &str,
     column: &str,
@@ -176,27 +176,41 @@ pub fn rebuild_tables(
     migration: &Migration,
 ) -> Result<Vec<String>, MigrateError> {
     let mut tables: Vec<String> = Vec::new();
-    for (i, op) in migration.up.iter().enumerate() {
-        let (table, rebuilds) = match op {
-            Op::AddColumn { table, column } => (table, add_needs_rebuild(column)),
-            Op::DropColumn { table, column } => {
-                let dropped_indexes: Vec<&str> = migration.up[..i]
-                    .iter()
-                    .filter_map(|o| match o {
-                        Op::DropIndex { definition } => Some(definition.name.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                let rebuilds = needs_rebuild(schema, table, &column.name, &dropped_indexes)?;
-                (table, rebuilds)
-            }
-            _ => continue,
-        };
-        if rebuilds && !tables.iter().any(|t| t.eq_ignore_ascii_case(table)) {
+    for i in 0..migration.up.len() {
+        if let Some((table, _)) = op_rebuild(schema, &migration.up, i)?
+            && !tables.iter().any(|t| t.eq_ignore_ascii_case(table))
+        {
             tables.push(table.clone());
         }
     }
     Ok(tables)
+}
+
+/// The table and column of operation `i` of `ops` when that operation needs the rebuild on a
+/// database whose schema before the migration is `schema`: the one decision `up` and
+/// [`rebuild_tables`] share. An earlier `DropIndex` has removed its index by the time the
+/// column goes.
+pub(crate) fn op_rebuild<'a>(
+    schema: &SchemaSnapshot,
+    ops: &'a [Op],
+    i: usize,
+) -> Result<Option<(&'a String, &'a Column)>, MigrateError> {
+    let (table, column, rebuilds) = match &ops[i] {
+        Op::AddColumn { table, column } => (table, column, add_needs_rebuild(column)),
+        Op::DropColumn { table, column } => {
+            let dropped_indexes: Vec<&str> = ops[..i]
+                .iter()
+                .filter_map(|o| match o {
+                    Op::DropIndex { definition } => Some(definition.name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let rebuilds = needs_rebuild(schema, table, &column.name, &dropped_indexes)?;
+            (table, column, rebuilds)
+        }
+        _ => return Ok(None),
+    };
+    Ok(rebuilds.then_some((table, column)))
 }
 
 fn index_names(object: &SchemaObject, column: &str) -> bool {
