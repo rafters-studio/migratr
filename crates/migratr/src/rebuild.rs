@@ -8,7 +8,7 @@
 //! suspended by the executor; the caller ends the migration with [`fk_check`].
 
 use crate::executor::{SchemaObject, SchemaSnapshot, TableInfo};
-use crate::migration::{Column, MigrateError};
+use crate::migration::{Column, MigrateError, Migration, Op};
 use crate::sql_ddl::{
     TableBody, TokenKind, create_table_name_span, has_keyword, index_names_column,
     leading_identifier, mentions_identifier, names_own_column, quote_ident, quote_literal,
@@ -126,7 +126,7 @@ fn parse<'a>(schema: &'a SchemaSnapshot, table: &str) -> Result<ParsedTable<'a>,
 /// named by another column (a generated expression or CHECK) or a table constraint. False
 /// when the table or column is absent, so the in-place statement reports it. Indexes named in
 /// `dropped_indexes` no longer exist when the column is dropped, so they do not count.
-pub(crate) fn needs_rebuild(
+fn needs_rebuild(
     schema: &SchemaSnapshot,
     table: &str,
     column: &str,
@@ -164,6 +164,53 @@ pub(crate) fn needs_rebuild(
         })
         .any(|o| index_names(o, column));
     Ok(constrained || named_elsewhere || indexed)
+}
+
+/// The tables `migration` would rebuild on a database whose schema is `schema`, read through
+/// [`Executor::read_schema`](crate::Executor::read_schema), each named once in operation order.
+/// Empty when it needs no rebuild. Decides as `up` does, and so `up` refuses a migration whose
+/// rebuild is not its first operation even though its table is reported here. Refused with
+/// `UnparseableTable` when a dropped column's table has a CREATE statement that does not split.
+pub fn rebuild_tables(
+    schema: &SchemaSnapshot,
+    migration: &Migration,
+) -> Result<Vec<String>, MigrateError> {
+    let mut tables: Vec<String> = Vec::new();
+    for i in 0..migration.up.len() {
+        if let Some((table, _)) = op_rebuild(schema, &migration.up, i)?
+            && !tables.iter().any(|t| t.eq_ignore_ascii_case(table))
+        {
+            tables.push(table.clone());
+        }
+    }
+    Ok(tables)
+}
+
+/// The table and column of operation `i` of `ops` when that operation needs the rebuild on a
+/// database whose schema before the migration is `schema`: the one decision `up` and
+/// [`rebuild_tables`] share. An earlier `DropIndex` has removed its index by the time the
+/// column goes.
+pub(crate) fn op_rebuild<'a>(
+    schema: &SchemaSnapshot,
+    ops: &'a [Op],
+    i: usize,
+) -> Result<Option<(&'a String, &'a Column)>, MigrateError> {
+    let (table, column, rebuilds) = match &ops[i] {
+        Op::AddColumn { table, column } => (table, column, add_needs_rebuild(column)),
+        Op::DropColumn { table, column } => {
+            let dropped_indexes: Vec<&str> = ops[..i]
+                .iter()
+                .filter_map(|o| match o {
+                    Op::DropIndex { definition } => Some(definition.name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let rebuilds = needs_rebuild(schema, table, &column.name, &dropped_indexes)?;
+            (table, column, rebuilds)
+        }
+        _ => return Ok(None),
+    };
+    Ok(rebuilds.then_some((table, column)))
 }
 
 fn index_names(object: &SchemaObject, column: &str) -> bool {

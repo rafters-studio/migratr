@@ -1,4 +1,4 @@
-use crate::executor::LedgerRow;
+use crate::executor::{Executor, LedgerRow};
 use crate::migration::{MigrateError, Migration};
 use crate::sql_ddl::quote_literal;
 
@@ -25,6 +25,20 @@ pub(crate) fn insert_row(migration: &Migration) -> String {
 /// The statement that removes the ledger row of the reverted migration `version`.
 pub(crate) fn delete_row(version: u64) -> String {
     format!("DELETE FROM _migratr_migrations WHERE version = {version}")
+}
+
+/// Records `migration` as applied without running its operations, creating the ledger when it
+/// is absent. For a database that already has the migration's shape. The ledger and the row
+/// land in one atomic run. A version the ledger already holds is refused with `Apply`.
+pub fn record_applied(exec: &mut impl Executor, migration: &Migration) -> Result<(), MigrateError> {
+    let statements = [CREATE_LEDGER.to_string(), insert_row(migration)];
+    exec.run_atomic(&statements, false)
+        .map_err(|failure| MigrateError::Apply {
+            version: migration.version,
+            statement: failure.index.and_then(|i| statements.get(i)).cloned(),
+            operation: None,
+            source: Box::new(failure.source),
+        })
 }
 
 /// Checks every ledger row against the migration file of the same version.
