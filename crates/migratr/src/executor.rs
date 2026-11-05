@@ -118,11 +118,11 @@ mod rusqlite_executor {
     use std::path::{Path, PathBuf};
 
     use rusqlite::Connection;
+    use rusqlite::types::ValueRef;
+    use serde_json::Value;
 
-    use super::{
-        AtomicError, ColumnInfo, Executor, ForeignKeyInfo, LedgerRow, SchemaObject, SchemaSnapshot,
-        TableInfo,
-    };
+    use super::{AtomicError, Executor, LedgerRow, SchemaSnapshot};
+    use crate::reader::{SqlReader, read_ledger_through, read_schema_through};
 
     /// An [`Executor`] over a rusqlite connection.
     pub struct RusqliteExecutor {
@@ -143,94 +143,47 @@ mod rusqlite_executor {
         conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))
     }
 
-    fn quote_ident(name: &str) -> String {
-        format!("\"{}\"", name.replace('"', "\"\""))
+    /// A connection as a [`SqlReader`].
+    struct Reader<'a>(&'a Connection);
+
+    impl SqlReader for Reader<'_> {
+        type Error = rusqlite::Error;
+
+        fn rows(&mut self, sql: &str) -> Result<Vec<Vec<Value>>, Self::Error> {
+            let mut statement = self.0.prepare(sql)?;
+            let columns = statement.column_count();
+            statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|at| {
+                            Ok(match row.get_ref(at)? {
+                                ValueRef::Integer(n) => Value::from(n),
+                                ValueRef::Real(n) => Value::from(n),
+                                ValueRef::Text(text) => {
+                                    Value::from(String::from_utf8_lossy(text).into_owned())
+                                }
+                                ValueRef::Null | ValueRef::Blob(_) => Value::Null,
+                            })
+                        })
+                        .collect()
+                })?
+                .collect()
+        }
+
+        fn malformed(&self, what: &str) -> Self::Error {
+            rusqlite::Error::InvalidColumnName(what.to_owned())
+        }
     }
 
     impl Executor for RusqliteExecutor {
         type Error = rusqlite::Error;
 
         fn read_schema(&mut self) -> Result<SchemaSnapshot, Self::Error> {
-            let objects = self
-                .conn
-                .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY rowid")?
-                .query_map([], |row| {
-                    Ok(SchemaObject {
-                        kind: row.get(0)?,
-                        name: row.get(1)?,
-                        tbl_name: row.get(2)?,
-                        sql: row.get(3)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-
-            let mut tables = Vec::new();
-            for object in objects.iter().filter(|o| o.kind == "table") {
-                let quoted = quote_ident(&object.name);
-                let columns = self
-                    .conn
-                    .prepare(&format!("PRAGMA table_xinfo({quoted})"))?
-                    .query_map([], |row| {
-                        Ok(ColumnInfo {
-                            cid: row.get(0)?,
-                            name: row.get(1)?,
-                            decl_type: row.get(2)?,
-                            not_null: row.get(3)?,
-                            default_value: row.get(4)?,
-                            pk: row.get(5)?,
-                            hidden: row.get(6)?,
-                        })
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                let foreign_keys = self
-                    .conn
-                    .prepare(&format!("PRAGMA foreign_key_list({quoted})"))?
-                    .query_map([], |row| {
-                        Ok(ForeignKeyInfo {
-                            id: row.get(0)?,
-                            seq: row.get(1)?,
-                            table: row.get(2)?,
-                            from: row.get(3)?,
-                            to: row.get(4)?,
-                            on_update: row.get(5)?,
-                            on_delete: row.get(6)?,
-                            match_clause: row.get(7)?,
-                        })
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                tables.push(TableInfo {
-                    name: object.name.clone(),
-                    columns,
-                    foreign_keys,
-                });
-            }
-
-            Ok(SchemaSnapshot { objects, tables })
+            read_schema_through(&mut Reader(&self.conn), |_| false)
         }
 
         fn read_ledger(&mut self) -> Result<Vec<LedgerRow>, Self::Error> {
-            let exists: bool = self.conn.query_row(
-                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_migratr_migrations')",
-                [],
-                |row| row.get(0),
-            )?;
-            if !exists {
-                return Ok(Vec::new());
-            }
-            self.conn
-                .prepare(
-                    "SELECT version, name, checksum FROM _migratr_migrations ORDER BY version",
-                )?
-                .query_map([], |row| {
-                    let version: i64 = row.get(0)?;
-                    Ok(LedgerRow {
-                        version: u64::try_from(version)
-                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, version))?,
-                        name: row.get(1)?,
-                        checksum: row.get(2)?,
-                    })
-                })?
-                .collect()
+            read_ledger_through(&mut Reader(&self.conn))
         }
 
         fn run_atomic(
