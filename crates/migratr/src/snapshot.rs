@@ -332,8 +332,9 @@ mod tests {
         let add = Op::CreateIndex {
             name: "i".into(),
             table: "t".into(),
-            columns: vec!["a".into()],
+            columns: vec![crate::migration::IndexColumn::Name("a".into())],
             unique: false,
+            where_clause: None,
         };
         let raw = Op::RawSql {
             up: "SELECT 1".into(),

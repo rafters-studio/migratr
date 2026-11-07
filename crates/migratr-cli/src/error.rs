@@ -28,6 +28,7 @@ impl CliError {
                 MigrateError::Irreversible { .. } => "irreversible",
                 MigrateError::UnparseableTable { .. } => "unparseable_table",
                 MigrateError::ForeignKeyViolation { .. } => "foreign_key_violation",
+                MigrateError::NoSuchForeignKey { .. } => "no_such_foreign_key",
                 MigrateError::ColumnInUse { .. } => "column_in_use",
                 MigrateError::RebuildNotFirst { .. } => "rebuild_not_first",
                 MigrateError::SnapshotFailed { .. } => "snapshot_failed",

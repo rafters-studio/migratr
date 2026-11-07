@@ -6,6 +6,7 @@ use serde_json::Value;
 use crate::executor::{
     ColumnInfo, ForeignKeyInfo, LedgerRow, SchemaObject, SchemaSnapshot, TableInfo,
 };
+use crate::migration::ForeignKeyDef;
 use crate::sql_ddl::quote_literal;
 
 const OBJECTS: &str = "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY rowid";
@@ -138,6 +139,40 @@ pub fn foreign_key_violations_through<R: SqlReader>(
     }
     found.sort();
     Ok(found)
+}
+
+/// The number of rows of `key`'s table that the foreign key `key` would refuse: rows whose key
+/// columns are all non-NULL and match no row of the parent.
+pub fn missing_parents_through<R: SqlReader>(
+    reader: &mut R,
+    key: &ForeignKeyDef,
+) -> Result<u64, R::Error> {
+    let child = |column: &String| format!("\"child\".{}", quoted(column));
+    let present: Vec<String> = key
+        .columns
+        .iter()
+        .map(|c| format!("{} IS NOT NULL", child(c)))
+        .collect();
+    let matched: Vec<String> = key
+        .references
+        .columns
+        .iter()
+        .zip(&key.columns)
+        .map(|(p, c)| format!("\"parent\".{} = {}", quoted(p), child(c)))
+        .collect();
+    let sql = format!(
+        "SELECT count(*) FROM {} AS \"child\" WHERE {} AND NOT EXISTS \
+         (SELECT 1 FROM {} AS \"parent\" WHERE {})",
+        quoted(&key.table),
+        present.join(" AND "),
+        quoted(&key.references.table),
+        matched.join(" AND "),
+    );
+    let rows = reader.rows(&sql)?;
+    let row = rows
+        .first()
+        .ok_or_else(|| reader.malformed("no row from a count"))?;
+    u64::try_from(number(reader, row, 0)?).map_err(|_| reader.malformed("a negative count"))
 }
 
 /// Every row of the ledger, ordered by version. Empty when the ledger table does not exist.

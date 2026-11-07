@@ -271,6 +271,104 @@ pub(crate) fn has_keyword(sql: &str, keyword: &str) -> bool {
     tokens(sql).iter().any(|t| t.is_keyword(keyword))
 }
 
+fn is_punct(tokens: &[Token], at: usize, text: &str) -> bool {
+    tokens
+        .get(at)
+        .is_some_and(|t| t.kind == TokenKind::Punct && t.text == text)
+}
+
+/// The index of the table name a `REFERENCES` at `at` names, past any `schema.` qualifier.
+fn parent_at(tokens: &[Token], at: usize) -> usize {
+    if is_punct(tokens, at + 2, ".") {
+        at + 3
+    } else {
+        at + 1
+    }
+}
+
+/// Whether `item`, a table constraint of a CREATE TABLE body, is a `FOREIGN KEY` over exactly
+/// `columns` that references `parent`, with or without a `CONSTRAINT name` before it.
+pub(crate) fn is_foreign_key_item(item: &str, columns: &[String], parent: &str) -> bool {
+    let toks = tokens(item);
+    let mut at = if toks.first().is_some_and(|t| t.is_keyword("CONSTRAINT")) {
+        2
+    } else {
+        0
+    };
+    if !(toks.get(at).is_some_and(|t| t.is_keyword("FOREIGN"))
+        && toks.get(at + 1).is_some_and(|t| t.is_keyword("KEY"))
+        && is_punct(&toks, at + 2, "("))
+    {
+        return false;
+    }
+    at += 3;
+    let mut named: Vec<&Token> = Vec::new();
+    while let Some(token) = toks.get(at) {
+        at += 1;
+        match token.kind {
+            TokenKind::Punct if token.text == ")" => break,
+            TokenKind::Punct => {}
+            _ => named.push(token),
+        }
+    }
+    named.len() == columns.len()
+        && named.iter().zip(columns).all(|(t, c)| t.names(c))
+        && toks.get(at).is_some_and(|t| t.is_keyword("REFERENCES"))
+        && toks
+            .get(parent_at(&toks, at))
+            .is_some_and(|t| t.names(parent))
+}
+
+/// The byte range in `item`, a column definition, of its `REFERENCES parent ...` clause: the
+/// parent table, its column list, its ON, MATCH and DEFERRABLE parts, any `CONSTRAINT name`
+/// before it, and the whitespace before that. `None` when no such clause references `parent`.
+pub(crate) fn references_clause(item: &str, parent: &str) -> Option<Range<usize>> {
+    let toks = tokens(item);
+    let kw = |at: usize, word: &str| toks.get(at).is_some_and(|t| t.is_keyword(word));
+    let at = (0..toks.len()).find(|&i| {
+        kw(i, "REFERENCES")
+            && toks
+                .get(parent_at(&toks, i))
+                .is_some_and(|t| t.names(parent))
+    })?;
+    let mut next = parent_at(&toks, at);
+    let mut end = toks[next].span.end;
+    next += 1;
+    if is_punct(&toks, next, "(") {
+        while !is_punct(&toks, next, ")") {
+            toks.get(next)?;
+            next += 1;
+        }
+        end = toks[next].span.end;
+        next += 1;
+    }
+    loop {
+        let words = if kw(next, "ON") && (kw(next + 1, "DELETE") || kw(next + 1, "UPDATE")) {
+            if kw(next + 2, "SET") || kw(next + 2, "NO") {
+                4
+            } else {
+                3
+            }
+        } else if kw(next, "MATCH") {
+            2
+        } else if kw(next, "NOT") && kw(next + 1, "DEFERRABLE") {
+            if kw(next + 2, "INITIALLY") { 4 } else { 2 }
+        } else if kw(next, "DEFERRABLE") {
+            if kw(next + 1, "INITIALLY") { 3 } else { 1 }
+        } else {
+            break;
+        };
+        end = toks.get(next + words - 1)?.span.end;
+        next += words;
+    }
+    let start = if at >= 2 && kw(at - 2, "CONSTRAINT") {
+        toks[at - 2].span.start
+    } else {
+        toks[at].span.start
+    };
+    Some(item[..start].trim_end().len()..end)
+}
+
 /// `sql` with each table a `REFERENCES` clause names that is the first of a pair in `renames`
 /// naming the pair's second instead.
 pub(crate) fn rename_references(sql: &str, renames: &[(&str, &str)]) -> String {

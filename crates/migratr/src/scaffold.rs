@@ -9,7 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value, json};
 
 use crate::migration::{
-    Column, ForeignKey, GeneratedColumn, IndexDef, MigrateError, Op, TableDef, split_file_name,
+    Column, ForeignKey, GeneratedColumn, IndexColumn, IndexDef, MigrateError, Op, TableDef,
+    split_file_name,
 };
 use crate::schema_file::{self, SchemaFile, SchemaFileObject};
 use crate::sql_ddl::{Token, TokenKind, has_keyword, table_body, tokens};
@@ -569,7 +570,7 @@ fn index_def(object: &SchemaFileObject) -> Option<IndexDef> {
         .split(',')
         .map(|key| {
             let mut key = tokens(key);
-            (key.len() == 1).then(|| key.remove(0).text)
+            (key.len() == 1).then(|| IndexColumn::Name(key.remove(0).text))
         })
         .collect::<Option<Vec<_>>>()?;
     let where_clause = match toks.get(next) {
@@ -853,7 +854,10 @@ mod tests {
             IndexDef {
                 name: "users_email".into(),
                 table: "users".into(),
-                columns: vec!["email".into(), "id".into()],
+                columns: vec![
+                    IndexColumn::Name("email".into()),
+                    IndexColumn::Name("id".into())
+                ],
                 unique: true,
                 where_clause: Some("id > 0".into()),
             }

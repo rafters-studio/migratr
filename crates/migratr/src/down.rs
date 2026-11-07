@@ -6,7 +6,7 @@ use crate::migration::{IndexDef, MigrateError, Migration, Op};
 use crate::rebuild::add_needs_rebuild;
 use crate::snapshot::Direction;
 use crate::sql_ddl::quote_ident as ident;
-use crate::up::{apply, ident_list};
+use crate::up::{apply, create_index};
 
 /// What a `down` run reverted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,7 +62,10 @@ pub fn down(
                 Op::AddColumn { table, column } | Op::DropColumn { table, column }
                     if add_needs_rebuild(column) || column.references.is_some() =>
                 {
-                    Some((i, table, column))
+                    Some((i, table, column.name.clone()))
+                }
+                Op::AddForeignKey(key) | Op::DropForeignKey { definition: key } => {
+                    Some((i, &key.table, key.columns.join(", ")))
                 }
                 _ => None,
             })
@@ -70,7 +73,7 @@ pub fn down(
             return Err(MigrateError::RebuildNotFirst {
                 version: *version,
                 table: table.clone(),
-                column: column.name.clone(),
+                column,
                 operation: ops.len() - 1 - i,
             });
         }
@@ -170,39 +173,35 @@ fn inverse(op: &Op) -> Option<Op> {
             table,
             columns,
             unique,
+            where_clause,
         } => Op::DropIndex {
             definition: IndexDef {
                 name: name.clone(),
                 table: table.clone(),
                 columns: columns.clone(),
                 unique: *unique,
-                where_clause: None,
+                where_clause: where_clause.clone(),
             },
         },
         Op::DropIndex { definition } => Op::RawSql {
-            up: create_index(definition),
+            up: create_index(
+                &definition.name,
+                &definition.table,
+                &definition.columns,
+                definition.unique,
+                definition.where_clause.as_deref(),
+            ),
             down: None,
         },
+        Op::AddForeignKey(key) => Op::DropForeignKey {
+            definition: key.clone(),
+        },
+        Op::DropForeignKey { definition } => Op::AddForeignKey(definition.clone()),
         Op::RawSql { down, .. } => Op::RawSql {
             up: down.clone()?,
             down: None,
         },
     })
-}
-
-/// The CREATE INDEX statement for `index`, partial clause included.
-fn create_index(index: &IndexDef) -> String {
-    let mut sql = format!(
-        "CREATE {}INDEX {} ON {} ({})",
-        if index.unique { "UNIQUE " } else { "" },
-        ident(&index.name),
-        ident(&index.table),
-        ident_list(index.columns.iter().map(String::as_str)),
-    );
-    if let Some(clause) = &index.where_clause {
-        sql.push_str(&format!(" WHERE {clause}"));
-    }
-    sql
 }
 
 #[cfg(test)]
@@ -259,16 +258,21 @@ mod tests {
 
     #[test]
     fn dropped_partial_index_recreates_with_its_where_clause() {
-        let index = IndexDef {
-            name: "i".into(),
-            table: "t".into(),
-            columns: vec!["a".into()],
-            unique: true,
-            where_clause: Some("a > 0".into()),
+        let op = Op::DropIndex {
+            definition: IndexDef {
+                name: "i".into(),
+                table: "t".into(),
+                columns: vec![crate::migration::IndexColumn::Name("a".into())],
+                unique: true,
+                where_clause: Some("a > 0".into()),
+            },
         };
         assert_eq!(
-            create_index(&index),
-            "CREATE UNIQUE INDEX \"i\" ON \"t\" (\"a\") WHERE a > 0"
+            inverse(&op),
+            Some(raw(
+                "CREATE UNIQUE INDEX \"i\" ON \"t\" (\"a\") WHERE a > 0",
+                None
+            ))
         );
     }
 }

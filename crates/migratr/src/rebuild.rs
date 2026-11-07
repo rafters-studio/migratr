@@ -12,8 +12,8 @@ use crate::executor::{SchemaObject, SchemaSnapshot, TableInfo};
 use crate::migration::{Column, MigrateError, Migration, Op};
 use crate::sql_ddl::{
     TableBody, TokenKind, create_table_name_span, has_keyword, index_names_column,
-    leading_identifier, mentions_identifier, names_own_column, quote_ident, quote_literal,
-    rename_references, table_body, tokens,
+    is_foreign_key_item, leading_identifier, mentions_identifier, names_own_column, quote_ident,
+    quote_literal, references_clause, rename_references, table_body, tokens,
 };
 
 /// A change to one table that the rebuild makes.
@@ -26,6 +26,16 @@ pub(crate) enum TableChange {
     /// the column's SQL; existing rows get its default, or NULL.
     AddColumn {
         definition: String,
+    },
+    /// Adds a table constraint, as the last item of the stored CREATE statement.
+    AddConstraint {
+        definition: String,
+    },
+    /// Removes the foreign key over `columns` that references `parent`: a table-level
+    /// `FOREIGN KEY` item, or the `REFERENCES` clause of the one column's definition.
+    DropForeignKey {
+        columns: Vec<String>,
+        parent: String,
     },
 }
 
@@ -66,16 +76,15 @@ impl ParsedTable<'_> {
             .map(|i| self.item(i))
     }
 
-    /// The CREATE statement with `definition` as a new column after the last column item,
-    /// ahead of any table constraints.
-    fn with_column(&self, definition: &str) -> String {
-        let end = self.body.items[self.info.columns.len() - 1].end;
+    /// The CREATE statement with `definition` as a new item after item `index`.
+    fn with_item_after(&self, index: usize, definition: &str) -> String {
+        let end = self.body.items[index].end;
         format!("{}, {}{}", &self.sql[..end], definition, &self.sql[end..])
     }
 
-    /// The CREATE statement without column `index`. The item goes with the comma after it,
+    /// The CREATE statement without item `index`. The item goes with the comma after it,
     /// or before it when it is the last item.
-    fn without_column(&self, index: usize) -> String {
+    fn without_item(&self, index: usize) -> String {
         let items = &self.body.items;
         let removed = match items.get(index + 1) {
             Some(next) => items[index].start..next.start,
@@ -83,6 +92,28 @@ impl ParsedTable<'_> {
             None => items[index].clone(),
         };
         format!("{}{}", &self.sql[..removed.start], &self.sql[removed.end..])
+    }
+
+    /// The CREATE statement without the foreign key over `columns` that references `parent`,
+    /// or `None` when the table has no such key.
+    fn without_foreign_key(&self, columns: &[String], parent: &str) -> Option<String> {
+        let constraints = self.info.columns.len()..self.body.items.len();
+        if let Some(index) = constraints
+            .into_iter()
+            .find(|&i| is_foreign_key_item(self.item(i), columns, parent))
+        {
+            return Some(self.without_item(index));
+        }
+        let [column] = columns else {
+            return None;
+        };
+        let item = &self.body.items[self.column_index(column)?];
+        let clause = references_clause(&self.sql[item.clone()], parent)?;
+        Some(format!(
+            "{}{}",
+            &self.sql[..item.start + clause.start],
+            &self.sql[item.start + clause.end..]
+        ))
     }
 }
 
@@ -187,16 +218,19 @@ pub fn rebuild_tables(
     Ok(tables)
 }
 
-/// The table and column of operation `i` of `ops` when that operation needs the rebuild on a
+/// The table and columns of operation `i` of `ops` when that operation needs the rebuild on a
 /// database whose schema before the migration is `schema`: the one decision `up` and
 /// [`rebuild_tables`] share. An earlier `DropIndex` has removed its index by the time the
-/// column goes.
+/// column goes. A foreign key is always added or dropped by the rebuild.
 pub(crate) fn op_rebuild<'a>(
     schema: &SchemaSnapshot,
     ops: &'a [Op],
     i: usize,
-) -> Result<Option<(&'a String, &'a Column)>, MigrateError> {
+) -> Result<Option<(&'a String, String)>, MigrateError> {
     let (table, column, rebuilds) = match &ops[i] {
+        Op::AddForeignKey(key) | Op::DropForeignKey { definition: key } => {
+            return Ok(Some((&key.table, key.columns.join(", "))));
+        }
         Op::AddColumn { table, column } => (table, column, add_needs_rebuild(column)),
         Op::DropColumn { table, column } => {
             let dropped_indexes: Vec<&str> = ops[..i]
@@ -211,7 +245,7 @@ pub(crate) fn op_rebuild<'a>(
         }
         _ => return Ok(None),
     };
-    Ok(rebuilds.then_some((table, column)))
+    Ok(rebuilds.then(|| (table, column.name.clone())))
 }
 
 fn index_names(object: &SchemaObject, column: &str) -> bool {
@@ -450,9 +484,26 @@ pub(crate) fn rebuild_statements(
             if let Some(user) = dependents.all().find(uses_column) {
                 return Err(column_in_use(user.name.clone()));
             }
-            (parsed.without_column(dropped), Some(dropped))
+            (parsed.without_item(dropped), Some(dropped))
         }
-        TableChange::AddColumn { definition } => (parsed.with_column(definition), None),
+        TableChange::AddColumn { definition } => (
+            parsed.with_item_after(parsed.info.columns.len() - 1, definition),
+            None,
+        ),
+        TableChange::AddConstraint { definition } => (
+            parsed.with_item_after(parsed.body.items.len() - 1, definition),
+            None,
+        ),
+        TableChange::DropForeignKey { columns, parent } => (
+            parsed.without_foreign_key(columns, parent).ok_or_else(|| {
+                MigrateError::NoSuchForeignKey {
+                    table: table_name.clone(),
+                    columns: columns.clone(),
+                    parent: parent.clone(),
+                }
+            })?,
+            None,
+        ),
     };
 
     let family_names = family(schema, table_name);

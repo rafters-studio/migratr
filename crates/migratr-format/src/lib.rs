@@ -67,13 +67,101 @@ pub struct TableDef {
     pub sql: String,
 }
 
+/// The table and columns a foreign key references.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParentKey {
+    pub table: String,
+    pub columns: Vec<String>,
+}
+
+/// A foreign key from columns of a table to a parent key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForeignKeyDef {
+    pub table: String,
+    pub columns: Vec<String>,
+    pub references: ParentKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_delete: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_update: Option<String>,
+}
+
+/// One key of an index: a column name, written in a file as a bare string, or an object naming
+/// a column or an expression, either of which may be `desc`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum IndexColumn {
+    Name(String),
+    Column {
+        name: String,
+        desc: bool,
+    },
+    /// The expression, verbatim.
+    Expr {
+        expr: String,
+        desc: bool,
+    },
+}
+
+/// The object form of an [`IndexColumn`] as a file writes it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IndexKey {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    expr: Option<String>,
+    #[serde(default)]
+    desc: bool,
+}
+
+impl<'de> Deserialize<'de> for IndexColumn {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = IndexColumn;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a column name, or an object with `name` or `expr` and `desc`")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, name: &str) -> Result<IndexColumn, E> {
+                Ok(IndexColumn::Name(name.to_string()))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<IndexColumn, A::Error> {
+                let key = IndexKey::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                match (key.name, key.expr) {
+                    (Some(name), None) => Ok(IndexColumn::Column {
+                        name,
+                        desc: key.desc,
+                    }),
+                    (None, Some(expr)) => Ok(IndexColumn::Expr {
+                        expr,
+                        desc: key.desc,
+                    }),
+                    _ => Err(serde::de::Error::custom(
+                        "an index column has exactly one of `name` and `expr`",
+                    )),
+                }
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 /// An index with everything needed to recreate it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndexDef {
     pub name: String,
     pub table: String,
-    pub columns: Vec<String>,
+    pub columns: Vec<IndexColumn>,
     #[serde(default)]
     pub unique: bool,
     /// The WHERE expression of a partial index, verbatim.
@@ -118,12 +206,19 @@ pub enum Op {
     CreateIndex {
         name: String,
         table: String,
-        columns: Vec<String>,
+        columns: Vec<IndexColumn>,
         #[serde(default)]
         unique: bool,
+        /// The WHERE expression of a partial index, verbatim.
+        #[serde(default, rename = "where", skip_serializing_if = "Option::is_none")]
+        where_clause: Option<String>,
     },
     DropIndex {
         definition: IndexDef,
+    },
+    AddForeignKey(ForeignKeyDef),
+    DropForeignKey {
+        definition: ForeignKeyDef,
     },
     RawSql {
         up: String,
