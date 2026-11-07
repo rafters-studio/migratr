@@ -389,3 +389,105 @@ fn a_create_table_with_checks_and_unique_writes_and_enforces_each() {
         );
     }
 }
+
+#[test]
+fn an_index_column_with_a_collate_writes_it_and_the_index_uses_it() {
+    let dir = TempDir::new().expect("tempdir");
+    write(
+        dir.path(),
+        "20260101000001_people.json",
+        &format!(
+            r#"{}, {{"op": "create_index", "name": "people_email", "table": "people",
+                "columns": [{{"name": "email", "collate": "NOCASE"}}]}}"#,
+            r#"{"op": "create_table", "table": "people", "columns": [{"name": "email", "type": "TEXT"}]}"#
+        ),
+    );
+    let mut ex = executor();
+    up(&mut ex, &load_dir(dir.path()).expect("load"), None).expect("up");
+
+    let conn = ex.connection();
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'people_email'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("sql");
+    assert_eq!(
+        sql,
+        "CREATE INDEX \"people_email\" ON \"people\" (\"email\" COLLATE NOCASE)"
+    );
+    let collation: String = conn
+        .query_row(
+            "SELECT coll FROM pragma_index_xinfo('people_email') WHERE name = 'email'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("collation");
+    assert_eq!(collation, "NOCASE");
+}
+
+#[test]
+fn a_named_check_writes_its_constraint_name_and_enforces_it() {
+    let dir = TempDir::new().expect("tempdir");
+    write(
+        dir.path(),
+        "20260101000001_seats.json",
+        r#"{"op": "create_table", "table": "seats", "columns": [{"name": "num", "type": "INTEGER"}],
+           "checks": ["num < 100", {"name": "positive", "expr": "num > 0"}]}"#,
+    );
+    let mut ex = executor();
+    up(&mut ex, &load_dir(dir.path()).expect("load"), None).expect("up");
+
+    let conn = ex.connection();
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'seats'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("sql");
+    assert_eq!(
+        sql,
+        "CREATE TABLE \"seats\" (\"num\" INTEGER, CHECK (num < 100), \
+         CONSTRAINT \"positive\" CHECK (num > 0))"
+    );
+    let err = conn
+        .execute("INSERT INTO seats (num) VALUES (0)", [])
+        .expect_err("a row breaking the named check");
+    assert!(err.to_string().contains("positive"), "{err}");
+}
+
+#[test]
+fn a_create_trigger_naming_another_trigger_or_table_is_refused_and_nothing_runs() {
+    let statement = "CREATE TRIGGER stamp AFTER INSERT ON one BEGIN SELECT 1; END";
+    for (name, table) in [("other", "one"), ("stamp", "two")] {
+        let dir = TempDir::new().expect("tempdir");
+        write(
+            dir.path(),
+            "20260101000001_one.json",
+            &format!(
+                r#"{}, {{"op": "create_trigger", "name": "{name}", "table": "{table}", "sql": "{statement}"}}"#,
+                create_table("one")
+            ),
+        );
+        let mut ex = executor();
+
+        let err = up(&mut ex, &load_dir(dir.path()).expect("load"), None)
+            .expect_err("a trigger that disagrees with its statement");
+
+        assert!(
+            matches!(
+                &err,
+                MigrateError::TriggerMismatch { version: 20260101000001, operation: 1, statement, .. }
+                    if statement == &Some(("stamp".to_string(), "one".to_string()))
+            ),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        for named in [name, table, "stamp", "one"] {
+            assert!(message.contains(named), "{message}");
+        }
+        assert!(table_names(&mut ex).is_empty(), "nothing ran");
+    }
+}

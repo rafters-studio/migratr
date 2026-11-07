@@ -13,7 +13,7 @@ use crate::migration::{
     TriggerDef, split_file_name,
 };
 use crate::schema_file::{self, SchemaFile, SchemaFileObject};
-use crate::sql_ddl::{Token, TokenKind, has_keyword, table_body, tokens};
+use crate::sql_ddl::{Token, TokenKind, has_keyword, on_table, table_body, tokens};
 
 /// Writes `<timestamp>_<name>.json` into `dir` and returns its path.
 ///
@@ -564,16 +564,6 @@ fn default_value(item: &str, toks: &[Token], at: usize) -> Option<(String, usize
         .position(|t| t.span.start >= end)
         .unwrap_or(toks.len());
     Some((item[start..end].to_string(), next))
-}
-
-/// The table named after the first `ON` of a stored CREATE INDEX or CREATE TRIGGER, without
-/// its schema, and the index of its token.
-fn on_table(toks: &[Token]) -> Option<(String, usize)> {
-    let mut at = toks.iter().position(|t| t.is_keyword("ON"))? + 1;
-    if toks.get(at + 1).is_some_and(|t| t.text == ".") {
-        at += 2;
-    }
-    Some((toks.get(at)?.text.clone(), at))
 }
 
 /// An index's definition from its stored CREATE INDEX. `None` when a key is anything but a

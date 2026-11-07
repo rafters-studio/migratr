@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub use crate::format::{
-    Column, ForeignKey, ForeignKeyDef, GeneratedColumn, IndexColumn, IndexDef, Migration, Op,
-    ParentKey, TableDef, TriggerDef, split_file_name,
+    Check, Column, ForeignKey, ForeignKeyDef, GeneratedColumn, IndexColumn, IndexDef, Migration,
+    Op, ParentKey, TableDef, TriggerDef, split_file_name,
 };
 use crate::format::{FormatError, parse_all};
 
@@ -91,6 +91,23 @@ pub enum MigrateError {
 
     #[error("restore needs confirmation; it would discard {}", report.discards())]
     RestoreNotConfirmed { report: Box<crate::RestoreReport> },
+
+    #[error(
+        "migration {version}: operation {operation} is create_trigger {name} on table {table}, \
+         but its statement {}",
+        match statement {
+            Some((name, table)) => format!("creates trigger {name} on table {table}"),
+            None => "is not a CREATE TRIGGER".to_string(),
+        }
+    )]
+    TriggerMismatch {
+        version: u64,
+        operation: usize,
+        name: String,
+        table: String,
+        /// The trigger and table the statement names; `None` when it names none.
+        statement: Option<(String, String)>,
+    },
 
     #[error("{kind} {name} is not in schema.json")]
     UnknownObject { kind: String, name: String },
@@ -334,11 +351,13 @@ mod tests {
                 IndexColumn::Name("a".into()),
                 IndexColumn::Column {
                     name: "b".into(),
-                    desc: true
+                    desc: true,
+                    collate: None,
                 },
                 IndexColumn::Expr {
                     expr: "lower(c)".into(),
-                    desc: false
+                    desc: false,
+                    collate: None,
                 },
             ]
         );
@@ -364,7 +383,7 @@ mod tests {
         )
         .expect("parse");
         assert!(matches!(&m.up[0], Op::CreateTable { checks, unique, .. }
-            if checks == &["a > 0"] && unique == &[vec!["a".to_string(), "b".to_string()]]));
+            if checks == &[Check::Expr("a > 0".into())] && unique == &[vec!["a".to_string(), "b".to_string()]]));
         assert_eq!(m.up[1], Op::CreateTrigger(trigger.clone()));
         assert_eq!(
             m.up[2],
@@ -410,6 +429,57 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[test]
+    fn an_index_column_that_is_only_a_name_hashes_the_same_however_written() {
+        let checksum = |column: &str| {
+            parse(
+                FILE,
+                &format!(
+                    r#"{{"up": [{{"op": "create_index", "name": "i", "table": "t", "columns": [{column}]}}]}}"#
+                ),
+            )
+            .expect("parse")
+            .checksum
+        };
+        let bare = checksum(r#""a""#);
+        assert_eq!(checksum(r#"{"name": "a"}"#), bare);
+        assert_eq!(checksum(r#"{"name": "a", "desc": false}"#), bare);
+        assert_ne!(checksum(r#"{"name": "a", "desc": true}"#), bare);
+        assert_ne!(checksum(r#"{"name": "a", "collate": "NOCASE"}"#), bare);
+    }
+
+    #[test]
+    fn an_index_collate_and_a_named_check_parse() {
+        let m = parse(
+            FILE,
+            r#"{"up": [
+              {"op": "create_index", "name": "i", "table": "t",
+               "columns": [{"name": "a", "collate": "NOCASE"}, {"expr": "lower(b)", "collate": "RTRIM", "desc": true}]},
+              {"op": "create_table", "table": "t", "columns": [{"name": "a", "type": "INTEGER"}],
+               "checks": ["a > 0", {"name": "positive", "expr": "a > 0"}]}
+            ]}"#,
+        )
+        .expect("parse");
+        assert!(
+            matches!(&m.up[0], Op::CreateIndex { columns, .. } if columns == &[
+                IndexColumn::Column { name: "a".into(), desc: false, collate: Some("NOCASE".into()) },
+                IndexColumn::Expr { expr: "lower(b)".into(), desc: true, collate: Some("RTRIM".into()) },
+            ])
+        );
+        assert!(
+            matches!(&m.up[1], Op::CreateTable { checks, .. } if checks == &[
+                Check::Expr("a > 0".into()),
+                Check::Named { name: "positive".into(), expr: "a > 0".into() },
+            ])
+        );
+
+        let (path, _) = parse_err(
+            r#"{"up": [{"op": "create_table", "table": "t", "columns": [],
+                "checks": [{"name": "c", "expr": "1", "bogus": 1}]}]}"#,
+        );
+        assert_eq!(path, "up[0].checks[0].bogus");
     }
 
     /// Files written before an operation gained a field keep the checksum they were applied
