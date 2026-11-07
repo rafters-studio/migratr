@@ -309,46 +309,6 @@ fn orphan(ex: &RusqliteExecutor, rows: &str) {
         .expect("orphans");
 }
 
-/// Counts the snapshots and atomic runs it is asked for, so a refusal can show it came before
-/// any change.
-struct Untouched {
-    inner: RusqliteExecutor,
-    asked: usize,
-}
-
-impl Executor for Untouched {
-    type Error = rusqlite::Error;
-
-    fn read_schema(&mut self) -> Result<SchemaSnapshot, Self::Error> {
-        self.inner.read_schema()
-    }
-
-    fn read_ledger(&mut self) -> Result<Vec<LedgerRow>, Self::Error> {
-        self.inner.read_ledger()
-    }
-
-    fn foreign_key_violations(
-        &mut self,
-        tables: &[&str],
-    ) -> Result<Option<Vec<(String, u64)>>, Self::Error> {
-        self.inner.foreign_key_violations(tables)
-    }
-
-    fn run_atomic(
-        &mut self,
-        statements: &[String],
-        suspend_foreign_keys: bool,
-    ) -> Result<(), AtomicError<Self::Error>> {
-        self.asked += 1;
-        self.inner.run_atomic(statements, suspend_foreign_keys)
-    }
-
-    fn snapshot(&mut self, file_name: &str) -> Result<Option<std::path::PathBuf>, Self::Error> {
-        self.asked += 1;
-        self.inner.snapshot(file_name)
-    }
-}
-
 #[test]
 fn violations_that_existed_before_the_migration_refuse_it_before_any_change_with_the_exact_count() {
     for prior in [true, false] {
@@ -358,7 +318,11 @@ fn violations_that_existed_before_the_migration_refuse_it_before_any_change_with
             .connection()
             .pragma_update(None, "foreign_keys", prior)
             .expect("set fk");
-        let mut ex = Untouched { inner, asked: 0 };
+        let mut ex = Recorded {
+            inner,
+            sent: Vec::new(),
+            snapshots: 0,
+        };
         let before = dump(ex.inner.connection());
         let (_dir, migrations) = migration(&drop_column("parents", "code"));
 
@@ -372,7 +336,10 @@ fn violations_that_existed_before_the_migration_refuse_it_before_any_change_with
             "{err:?}"
         );
         assert!(err.to_string().contains("kids") && err.to_string().contains('2'));
-        assert_eq!(ex.asked, 0, "asked for a change");
+        assert!(
+            ex.sent.is_empty() && ex.snapshots == 0,
+            "asked for a change"
+        );
         assert_eq!(dump(ex.inner.connection()), before);
         assert_eq!(foreign_keys(ex.inner.connection()), prior);
     }
@@ -525,10 +492,11 @@ impl Executor for D1Like {
     }
 }
 
-/// Records the statements a plain executor over a file receives.
+/// Records the statements and snapshot requests a plain executor receives.
 struct Recorded {
     inner: RusqliteExecutor,
     sent: Vec<String>,
+    snapshots: usize,
 }
 
 impl Executor for Recorded {
@@ -559,6 +527,7 @@ impl Executor for Recorded {
     }
 
     fn snapshot(&mut self, file_name: &str) -> Result<Option<std::path::PathBuf>, Self::Error> {
+        self.snapshots += 1;
         self.inner.snapshot(file_name)
     }
 }
@@ -576,6 +545,7 @@ fn the_same_rebuild_statements_run_on_a_file_and_on_a_place_like_d1() {
         let mut file = Recorded {
             inner: RusqliteExecutor::new(conn),
             sent: Vec::new(),
+            snapshots: 0,
         };
         let mut place = D1Like {
             inner: seeded(schema),
