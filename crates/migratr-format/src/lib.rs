@@ -89,7 +89,10 @@ pub struct ForeignKeyDef {
 }
 
 /// One key of an index: a column name, written in a file as a bare string, or an object naming
-/// a column or an expression, either of which may be `desc`.
+/// a column or an expression, either of which may be `desc` and may carry a `collate`.
+///
+/// A column that is only a name parses as [`IndexColumn::Name`] however it is written (`"a"`,
+/// `{"name": "a"}` or `{"name": "a", "desc": false}`), so every spelling hashes the same.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum IndexColumn {
@@ -97,11 +100,17 @@ pub enum IndexColumn {
     Column {
         name: String,
         desc: bool,
+        /// The collation, written as `COLLATE <name>` after the column.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        collate: Option<String>,
     },
     /// The expression, verbatim.
     Expr {
         expr: String,
         desc: bool,
+        /// The collation, written as `COLLATE <name>` after the expression.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        collate: Option<String>,
     },
 }
 
@@ -115,6 +124,8 @@ struct IndexKey {
     expr: Option<String>,
     #[serde(default)]
     desc: bool,
+    #[serde(default)]
+    collate: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for IndexColumn {
@@ -124,7 +135,9 @@ impl<'de> Deserialize<'de> for IndexColumn {
             type Value = IndexColumn;
 
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a column name, or an object with `name` or `expr` and `desc`")
+                f.write_str(
+                    "a column name, or an object with `name` or `expr`, `desc` and `collate`",
+                )
             }
 
             fn visit_str<E: serde::de::Error>(self, name: &str) -> Result<IndexColumn, E> {
@@ -135,20 +148,74 @@ impl<'de> Deserialize<'de> for IndexColumn {
                 self,
                 map: A,
             ) -> Result<IndexColumn, A::Error> {
-                let key = IndexKey::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
-                match (key.name, key.expr) {
+                let IndexKey {
+                    name,
+                    expr,
+                    desc,
+                    collate,
+                } = IndexKey::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                match (name, expr) {
+                    (Some(name), None) if !desc && collate.is_none() => Ok(IndexColumn::Name(name)),
                     (Some(name), None) => Ok(IndexColumn::Column {
                         name,
-                        desc: key.desc,
+                        desc,
+                        collate,
                     }),
                     (None, Some(expr)) => Ok(IndexColumn::Expr {
                         expr,
-                        desc: key.desc,
+                        desc,
+                        collate,
                     }),
                     _ => Err(serde::de::Error::custom(
                         "an index column has exactly one of `name` and `expr`",
                     )),
                 }
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// A table-level CHECK: an expression, written in a file as a string, or an object naming the
+/// constraint, written as `CONSTRAINT "name" CHECK (expr)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum Check {
+    /// The expression, verbatim.
+    Expr(String),
+    Named {
+        name: String,
+        /// The expression, verbatim.
+        expr: String,
+    },
+}
+
+/// The object form of a [`Check`] as a file writes it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NamedCheck {
+    name: String,
+    expr: String,
+}
+
+impl<'de> Deserialize<'de> for Check {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Check;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an expression, or an object with `name` and `expr`")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, expr: &str) -> Result<Check, E> {
+                Ok(Check::Expr(expr.to_string()))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Check, A::Error> {
+                let NamedCheck { name, expr } =
+                    NamedCheck::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(Check::Named { name, expr })
             }
         }
         deserializer.deserialize_any(Visitor)
@@ -175,7 +242,10 @@ pub struct IndexDef {
 pub struct TriggerDef {
     pub name: String,
     pub table: String,
-    /// The CREATE TRIGGER statement, verbatim.
+    /// The CREATE TRIGGER statement, verbatim. It is hashed exactly as written, whitespace
+    /// included, so reformatting it changes the migration's checksum. A create_trigger whose
+    /// `name` or `table` differ from the ones the statement names is refused before anything
+    /// runs.
     pub sql: String,
 }
 
@@ -183,18 +253,46 @@ pub struct TriggerDef {
 ///
 /// Serde represents it externally tagged (`{"add_column": {...}}`); a migration file
 /// writes the tag as an `op` field instead, and the parser converts between the two.
+///
+/// The list of operations grows, so code outside migratr that matches on it handles an
+/// operation it does not know:
+///
+/// ```compile_fail
+/// fn name(op: &migratr_format::Op) -> &'static str {
+///     use migratr_format::Op::*;
+///     match op {
+///         CreateTable { .. } => "create_table",
+///         DropTable { .. } => "drop_table",
+///         RenameTable { .. } => "rename_table",
+///         AddColumn { .. } => "add_column",
+///         DropColumn { .. } => "drop_column",
+///         RenameColumn { .. } => "rename_column",
+///         CreateIndex { .. } => "create_index",
+///         DropIndex { .. } => "drop_index",
+///         AddForeignKey(_) => "add_foreign_key",
+///         DropForeignKey { .. } => "drop_foreign_key",
+///         CreateTrigger(_) => "create_trigger",
+///         DropTrigger { .. } => "drop_trigger",
+///         RawSql { .. } => "raw_sql",
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
 pub enum Op {
     CreateTable {
         table: String,
         columns: Vec<Column>,
         #[serde(default)]
         without_rowid: bool,
-        /// Table-level CHECK expressions, each verbatim.
+        /// Table-level CHECKs, written in this order. The order is significant: reordering
+        /// them changes the migration's checksum.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        checks: Vec<String>,
-        /// Table-level UNIQUE constraints, each a list of columns.
+        checks: Vec<Check>,
+        /// Table-level UNIQUE constraints, each a list of columns, written in this order. The
+        /// order of the lists and of the columns in each is significant: reordering either
+        /// changes the migration's checksum.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         unique: Vec<Vec<String>>,
     },
@@ -255,7 +353,10 @@ pub struct Migration {
     /// The snake_case name from the file name.
     pub name: String,
     pub up: Vec<Op>,
-    /// SHA-256 hex digest of the canonical JSON of `version`, `name` and `up`.
+    /// SHA-256 hex digest of the canonical JSON of `version`, `name` and `up`. An index column
+    /// that is only a name has one canonical form however it is written; the order of checks,
+    /// of unique lists and of their columns is significant, and a trigger's statement is
+    /// hashed exactly as written.
     pub checksum: String,
 }
 

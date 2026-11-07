@@ -205,6 +205,7 @@ fn inverse(op: &Op) -> Option<Op> {
             up: down.clone()?,
             down: None,
         },
+        _ => unreachable!("every operation migratr-format defines is inverted above"),
     })
 }
 

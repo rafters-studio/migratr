@@ -33,6 +33,7 @@ impl CliError {
                 MigrateError::RebuildNotFirst { .. } => "rebuild_not_first",
                 MigrateError::SnapshotFailed { .. } => "snapshot_failed",
                 MigrateError::RestoreNotConfirmed { .. } => "restore_not_confirmed",
+                MigrateError::TriggerMismatch { .. } => "trigger_mismatch",
                 MigrateError::UnknownObject { .. } => "unknown_object",
                 MigrateError::Executor(_) => "database",
             },

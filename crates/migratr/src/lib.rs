@@ -25,7 +25,7 @@ pub use executor::{
 };
 pub use ledger::record_applied;
 pub use migration::{
-    Column, ForeignKey, ForeignKeyDef, GeneratedColumn, IndexColumn, IndexDef, MigrateError,
+    Check, Column, ForeignKey, ForeignKeyDef, GeneratedColumn, IndexColumn, IndexDef, MigrateError,
     Migration, Op, ParentKey, TableDef, TriggerDef, load_dir,
 };
 pub use migratr_macros::embed;

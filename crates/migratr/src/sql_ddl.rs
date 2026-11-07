@@ -197,6 +197,49 @@ pub(crate) fn leading_identifier(sql: &str) -> Option<String> {
         .map(|t| t.text)
 }
 
+/// The table named after the first `ON` of a stored CREATE INDEX or CREATE TRIGGER, without
+/// its schema, and the index of its token.
+pub(crate) fn on_table(toks: &[Token]) -> Option<(String, usize)> {
+    let mut at = toks.iter().position(|t| t.is_keyword("ON"))? + 1;
+    if toks.get(at + 1).is_some_and(|t| t.text == ".") {
+        at += 2;
+    }
+    Some((toks.get(at)?.text.clone(), at))
+}
+
+/// The trigger and table a CREATE TRIGGER statement names, each without its schema. `None`
+/// when `sql` is not a CREATE TRIGGER statement.
+pub(crate) fn trigger_target(sql: &str) -> Option<(String, String)> {
+    let toks = tokens(sql);
+    if !toks.first()?.is_keyword("CREATE") {
+        return None;
+    }
+    let mut at = 1;
+    if toks
+        .get(at)
+        .is_some_and(|t| t.is_keyword("TEMP") || t.is_keyword("TEMPORARY"))
+    {
+        at += 1;
+    }
+    if !toks.get(at)?.is_keyword("TRIGGER") {
+        return None;
+    }
+    at += 1;
+    if ["IF", "NOT", "EXISTS"]
+        .iter()
+        .enumerate()
+        .all(|(i, word)| toks.get(at + i).is_some_and(|t| t.is_keyword(word)))
+    {
+        at += 3;
+    }
+    if is_punct(&toks, at + 1, ".") {
+        at += 2;
+    }
+    let name = toks.get(at).filter(|t| t.kind != TokenKind::Punct)?;
+    let (table, _) = on_table(&toks[at + 1..])?;
+    Some((name.text.clone(), table))
+}
+
 /// Whether `sql` names `ident` as a bare word or quoted identifier.
 pub(crate) fn mentions_identifier(sql: &str, ident: &str) -> bool {
     tokens(sql).iter().any(|t| t.names(ident))
@@ -550,6 +593,25 @@ mod tests {
         }
         assert!(create_table_name_span("CREATE VIEW v AS SELECT 1").is_none());
         assert!(create_table_name_span("CREATE /* c */ TABLE t (a)").is_none());
+    }
+
+    #[test]
+    fn trigger_target_reads_every_spelling() {
+        for sql in [
+            "CREATE TRIGGER stamp AFTER INSERT ON t BEGIN SELECT 1; END",
+            "create temp trigger if not exists main.\"stamp\" before update of a on main.[t] \
+             begin select 1; end",
+            "CREATE TEMPORARY TRIGGER `stamp` INSTEAD OF DELETE ON \"t\" BEGIN SELECT 1; END",
+        ] {
+            assert_eq!(
+                trigger_target(sql),
+                Some(("stamp".to_string(), "t".to_string())),
+                "{sql}"
+            );
+        }
+        for sql in ["SELECT 1", "CREATE TABLE t (a)", "CREATE TRIGGER"] {
+            assert_eq!(trigger_target(sql), None, "{sql}");
+        }
     }
 
     #[test]

@@ -1,9 +1,9 @@
 use crate::executor::Executor;
 use crate::ledger;
-use crate::migration::{Column, ForeignKeyDef, IndexColumn, MigrateError, Migration, Op};
+use crate::migration::{Check, Column, ForeignKeyDef, IndexColumn, MigrateError, Migration, Op};
 use crate::rebuild::{TableChange, add_needs_rebuild, family, op_rebuild, rebuild_statements};
 use crate::snapshot::{Direction, snapshot_before};
-use crate::sql_ddl::quote_ident as ident;
+use crate::sql_ddl::{quote_ident as ident, trigger_target};
 
 /// What an `up` run applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +57,25 @@ pub(crate) fn apply(
     prelude: &[String],
     record: String,
 ) -> Result<(), MigrateError> {
+    for (operation, op) in ops.iter().enumerate() {
+        if let Op::CreateTrigger(trigger) = op {
+            let statement = trigger_target(&trigger.sql);
+            let agrees = statement.as_ref().is_some_and(|(name, table)| {
+                name.eq_ignore_ascii_case(&trigger.name)
+                    && table.eq_ignore_ascii_case(&trigger.table)
+            });
+            if !agrees {
+                return Err(MigrateError::TriggerMismatch {
+                    version,
+                    operation,
+                    name: trigger.name.clone(),
+                    table: trigger.table.clone(),
+                    statement,
+                });
+            }
+        }
+    }
+
     let schema = if ops.iter().any(|op| match op {
         Op::DropColumn { .. } | Op::AddForeignKey(_) | Op::DropForeignKey { .. } => true,
         Op::AddColumn { column, .. } => add_needs_rebuild(column),
@@ -198,11 +217,22 @@ pub(crate) fn create_index(
     let keys: Vec<String> = columns
         .iter()
         .map(|column| {
-            let (key, desc) = match column {
-                IndexColumn::Name(name) => (ident(name), false),
-                IndexColumn::Column { name, desc } => (ident(name), *desc),
-                IndexColumn::Expr { expr, desc } => (expr.clone(), *desc),
+            let (mut key, desc, collate) = match column {
+                IndexColumn::Name(name) => (ident(name), false, None),
+                IndexColumn::Column {
+                    name,
+                    desc,
+                    collate,
+                } => (ident(name), *desc, collate.as_ref()),
+                IndexColumn::Expr {
+                    expr,
+                    desc,
+                    collate,
+                } => (expr.clone(), *desc, collate.as_ref()),
             };
+            if let Some(collation) = collate {
+                key.push_str(&format!(" COLLATE {collation}"));
+            }
             if desc { format!("{key} DESC") } else { key }
         })
         .collect();
@@ -265,6 +295,7 @@ fn render(op: &Op) -> String {
         Op::CreateTrigger(trigger) => trigger.sql.clone(),
         Op::DropTrigger { definition } => format!("DROP TRIGGER {}", ident(&definition.name)),
         Op::RawSql { up, .. } => up.clone(),
+        _ => unreachable!("every operation migratr-format defines is rendered above"),
     }
 }
 
@@ -272,7 +303,7 @@ fn create_table(
     table: &str,
     columns: &[Column],
     without_rowid: bool,
-    checks: &[String],
+    checks: &[Check],
     unique: &[Vec<String>],
 ) -> String {
     let mut parts: Vec<String> = columns.iter().map(column_def).collect();
@@ -285,7 +316,10 @@ fn create_table(
             ident_list(key.iter().map(|c| c.name.as_str()))
         ));
     }
-    parts.extend(checks.iter().map(|check| format!("CHECK ({check})")));
+    parts.extend(checks.iter().map(|check| match check {
+        Check::Expr(expr) => format!("CHECK ({expr})"),
+        Check::Named { name, expr } => format!("CONSTRAINT {} CHECK ({expr})", ident(name)),
+    }));
     parts.extend(
         unique
             .iter()
@@ -406,13 +440,46 @@ mod tests {
             "t",
             &[id, col("a", "INTEGER"), col("b", "TEXT")],
             false,
-            &["a > 0".into(), "length(b) < 9".into()],
+            &[
+                Check::Expr("a > 0".into()),
+                Check::Named {
+                    name: "short".into(),
+                    expr: "length(b) < 9".into(),
+                },
+            ],
             &[vec!["a".into(), "b".into()], vec!["b".into()]],
         );
         assert_eq!(
             sql,
             "CREATE TABLE \"t\" (\"id\" INTEGER, \"a\" INTEGER, \"b\" TEXT, PRIMARY KEY (\"id\"), \
-             CHECK (a > 0), CHECK (length(b) < 9), UNIQUE (\"a\", \"b\"), UNIQUE (\"b\"))"
+             CHECK (a > 0), CONSTRAINT \"short\" CHECK (length(b) < 9), UNIQUE (\"a\", \"b\"), \
+             UNIQUE (\"b\"))"
+        );
+    }
+
+    #[test]
+    fn create_index_writes_collate_before_desc() {
+        let sql = create_index(
+            "i",
+            "t",
+            &[
+                IndexColumn::Column {
+                    name: "a".into(),
+                    desc: true,
+                    collate: Some("NOCASE".into()),
+                },
+                IndexColumn::Expr {
+                    expr: "lower(b)".into(),
+                    desc: false,
+                    collate: Some("RTRIM".into()),
+                },
+            ],
+            false,
+            None,
+        );
+        assert_eq!(
+            sql,
+            "CREATE INDEX \"i\" ON \"t\" (\"a\" COLLATE NOCASE DESC, lower(b) COLLATE RTRIM)"
         );
     }
 
