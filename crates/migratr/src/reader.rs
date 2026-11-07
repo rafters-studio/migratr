@@ -6,6 +6,7 @@ use serde_json::Value;
 use crate::executor::{
     ColumnInfo, ForeignKeyInfo, LedgerRow, SchemaObject, SchemaSnapshot, TableInfo,
 };
+use crate::sql_ddl::quote_literal;
 
 const OBJECTS: &str = "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY rowid";
 const LEDGER_EXISTS: &str =
@@ -109,6 +110,34 @@ pub fn read_schema_through<R: SqlReader>(
         });
     }
     Ok(SchemaSnapshot { objects, tables })
+}
+
+/// Each of `tables` that has rows a foreign key refuses, by name, with the number of those rows.
+/// SQLite reports one row per violated key, so a row that breaks two keys is counted once by its
+/// rowid; a WITHOUT ROWID table has no rowid and counts one per violated key.
+pub fn foreign_key_violations_through<R: SqlReader>(
+    reader: &mut R,
+    tables: &[&str],
+) -> Result<Vec<(String, u64)>, R::Error> {
+    let mut found = Vec::new();
+    for table in tables {
+        let sql = format!(
+            "SELECT count(DISTINCT \"rowid\") + count(*) FILTER (WHERE \"rowid\" IS NULL) \
+             FROM pragma_foreign_key_check({})",
+            quote_literal(table)
+        );
+        let rows = reader.rows(&sql)?;
+        let row = rows
+            .first()
+            .ok_or_else(|| reader.malformed("no row from a count"))?;
+        let count = u64::try_from(number(reader, row, 0)?)
+            .map_err(|_| reader.malformed("a negative count"))?;
+        if count > 0 {
+            found.push(((*table).to_string(), count));
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 /// Every row of the ledger, ordered by version. Empty when the ledger table does not exist.

@@ -4,15 +4,16 @@
 //! The new table's CREATE statement is the stored one with the change edited into its text,
 //! so everything else the author declared (types or their absence, collations, CHECK and
 //! foreign-key clauses, generated columns, AUTOINCREMENT, `WITHOUT ROWID`) carries over
-//! unchanged. The statements run inside the migration's transaction with foreign_keys
-//! suspended by the executor; the caller ends the migration with [`fk_check`].
+//! unchanged. The statements run inside the migration's transaction with foreign_keys left as
+//! they are and no TEMP object, so they run the same on a local file and on a place, such as
+//! D1, that refuses TEMP objects and cannot turn foreign keys off.
 
 use crate::executor::{SchemaObject, SchemaSnapshot, TableInfo};
 use crate::migration::{Column, MigrateError, Migration, Op};
 use crate::sql_ddl::{
     TableBody, TokenKind, create_table_name_span, has_keyword, index_names_column,
     leading_identifier, mentions_identifier, names_own_column, quote_ident, quote_literal,
-    table_body, tokens,
+    rename_references, table_body, tokens,
 };
 
 /// A change to one table that the rebuild makes.
@@ -154,7 +155,7 @@ fn needs_rebuild(
             .iter()
             .any(|k| has_keyword(own, k));
     let named_elsewhere = parsed.item_naming(index, column).is_some();
-    let indexed = Dependents::of(schema, table)
+    let indexed = Dependents::of(schema, &[table])
         .indexes
         .iter()
         .filter(|o| {
@@ -271,22 +272,22 @@ fn uses_columns_by_position(object: &SchemaObject, table: &str) -> bool {
     positional_insert || view_over_star
 }
 
-/// The objects a rebuild of a table drops and recreates.
+/// The objects a rebuild of some tables drops and recreates.
 struct Dependents<'a> {
-    /// Explicit indexes on the table.
+    /// Explicit indexes on the tables.
     indexes: Vec<&'a SchemaObject>,
-    /// Views naming the table, or naming such a view, in sqlite_master order.
+    /// Views naming one of the tables, or naming such a view, in sqlite_master order.
     views: Vec<&'a SchemaObject>,
-    /// Triggers on the table or one of those views, or whose SQL names any of them, in
+    /// Triggers on one of the tables or views, or whose SQL names any of them, in
     /// sqlite_master order.
     triggers: Vec<&'a SchemaObject>,
 }
 
 impl<'a> Dependents<'a> {
-    /// Renaming the rebuilt table into place fails while any view or trigger names a table
+    /// Renaming a rebuilt table into place fails while any view or trigger names a table
     /// or view that is missing at that moment, so every one of them is dropped first.
-    fn of(schema: &'a SchemaSnapshot, table: &str) -> Self {
-        let mut dropped: Vec<&str> = vec![table];
+    fn of(schema: &'a SchemaSnapshot, tables: &[&str]) -> Self {
+        let mut dropped: Vec<&str> = tables.to_vec();
         loop {
             let more: Vec<&str> = schema
                 .objects
@@ -305,7 +306,9 @@ impl<'a> Dependents<'a> {
         let of_kind = |kind: &'static str| schema.objects.iter().filter(move |o| o.kind == kind);
         Dependents {
             indexes: of_kind("index")
-                .filter(|o| o.sql.is_some() && o.tbl_name.eq_ignore_ascii_case(table))
+                .filter(|o| {
+                    o.sql.is_some() && tables.iter().any(|t| o.tbl_name.eq_ignore_ascii_case(t))
+                })
                 .collect(),
             views: of_kind("view").filter(|o| is_dropped(&o.name)).collect(),
             triggers: of_kind("trigger")
@@ -319,18 +322,78 @@ impl<'a> Dependents<'a> {
     }
 }
 
-/// The statements that rebuild `table` with `change` applied, in order:
+/// `table` and, after it, each other table with a foreign key that references it: the family a
+/// rebuild of `table` rebuilds, since SQLite refuses to drop a table that a kept table
+/// references while foreign keys are on.
+pub(crate) fn family(schema: &SchemaSnapshot, table: &str) -> Vec<String> {
+    let name = schema
+        .tables
+        .iter()
+        .find(|t| t.name.eq_ignore_ascii_case(table))
+        .map_or(table, |t| t.name.as_str());
+    std::iter::once(name.to_string())
+        .chain(
+            schema
+                .tables
+                .iter()
+                .filter(|t| !t.name.eq_ignore_ascii_case(name))
+                .filter(|t| {
+                    t.foreign_keys
+                        .iter()
+                        .any(|fk| fk.table.eq_ignore_ascii_case(name))
+                })
+                .map(|t| t.name.clone()),
+        )
+        .collect()
+}
+
+/// The column list that copies a table's rows into its new table, rowids included; `dropped`
+/// is the index of a column that does not go across.
+fn copied_columns(parsed: &ParsedTable, dropped: Option<usize>) -> String {
+    // Generated columns compute their own values and cannot be inserted into.
+    let mut copied: Vec<String> = parsed
+        .info
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| Some(*i) != dropped && c.hidden == 0)
+        .map(|(_, c)| quote_ident(&c.name))
+        .collect();
+    let without_rowid = has_keyword(&parsed.sql[parsed.body.close + 1..], "ROWID");
+    let rowid = ["rowid", "oid", "_rowid_"].into_iter().find(|alias| {
+        !parsed
+            .info
+            .columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(alias))
+    });
+    if let (false, Some(rowid)) = (without_rowid, rowid) {
+        copied.insert(0, rowid.to_string());
+    }
+    copied.join(", ")
+}
+
+/// The statements that rebuild `table` with `change` applied, together with each table that
+/// references it (its [`family`]), in order:
 ///
-/// 1. drop the triggers and views that name the table, directly or through another view
-/// 2. create the new table under a free name and copy the rows, rowids included
-/// 3. carry the table's sqlite_sequence value to the new table
-/// 4. drop the old table, which drops its indexes and triggers, and rename the new one
-/// 5. recreate the indexes, then the views, then the triggers
+/// 1. drop the triggers and views that name a table of the family, directly or through
+///    another view
+/// 2. create each new table under a free name, the table's own first, every foreign key to a
+///    table of the family naming that table's new name
+/// 3. copy the rows, rowids included, the table's own first, and carry each sqlite_sequence
+///    value to its new table
+/// 4. drop the old referencing tables, then the old table, which drops their indexes and
+///    triggers
+/// 5. rename the new tables, the table's own first, so SQLite rewrites the references to the
+///    final names
+/// 6. recreate the indexes, then the views, then the triggers
 ///
-/// Triggers are recreated after the copy, so they never fire on copied rows.
+/// Triggers are recreated after the copy, so they never fire on copied rows. No statement
+/// creates a TEMP object or sets foreign_keys: with foreign keys on, the copy refuses a row
+/// they refuse.
 ///
-/// Refused before any statement with `UnparseableTable` when the table's stored CREATE
-/// statement cannot be split into column definitions that match the table's columns, or
+/// Refused before any statement with `UnparseableTable` when the stored CREATE statement of a
+/// table of the family cannot be split into column definitions that match its columns, or
 /// when the table or the changed column is absent from `schema`; and with `ColumnInUse`
 /// when another column's definition, a table constraint, a foreign key of any table that
 /// names the column as its parent key, or a recreated index, view or trigger names the
@@ -343,7 +406,7 @@ pub(crate) fn rebuild_statements(
 ) -> Result<Vec<String>, MigrateError> {
     let parsed = parse(schema, table)?;
     let table_name = &parsed.object.name;
-    let dependents = Dependents::of(schema, table_name);
+    let dependents = Dependents::of(schema, &[table_name]);
 
     let (edited, dropped) = match change {
         TableChange::DropColumn { column } => {
@@ -392,80 +455,107 @@ pub(crate) fn rebuild_statements(
         TableChange::AddColumn { definition } => (parsed.with_column(definition), None),
     };
 
-    let name_span =
-        create_table_name_span(parsed.sql).ok_or_else(|| MigrateError::UnparseableTable {
-            table: table.to_string(),
-        })?;
-    let taken: Vec<&str> = schema.objects.iter().map(|o| o.name.as_str()).collect();
-    let new_name = free_name(&taken, "_migratr_rebuild");
-    let new_create = format!(
-        "{}{}{}",
-        &edited[..name_span.start],
-        quote_ident(&new_name),
-        &edited[name_span.end..],
+    let family_names = family(schema, table_name);
+    let children = family_names[1..]
+        .iter()
+        .map(|child| parse(schema, child))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Each table of the family: its stored CREATE statement as edited, and its copied columns.
+    let mut members: Vec<(&ParsedTable, String, String)> =
+        vec![(&parsed, edited, copied_columns(&parsed, dropped))];
+    members.extend(
+        children
+            .iter()
+            .map(|c| (c, c.sql.to_string(), copied_columns(c, None))),
     );
 
-    // Generated columns compute their own values and cannot be inserted into.
-    let mut copied: Vec<String> = parsed
-        .info
-        .columns
-        .iter()
-        .enumerate()
-        .filter(|(i, c)| Some(*i) != dropped && c.hidden == 0)
-        .map(|(_, c)| quote_ident(&c.name))
-        .collect();
-    let without_rowid = has_keyword(&parsed.sql[parsed.body.close + 1..], "ROWID");
-    let rowid = ["rowid", "oid", "_rowid_"].into_iter().find(|alias| {
-        !parsed
-            .info
-            .columns
-            .iter()
-            .any(|c| c.name.eq_ignore_ascii_case(alias))
-    });
-    if let (false, Some(rowid)) = (without_rowid, rowid) {
-        copied.insert(0, rowid.to_string());
+    let mut taken: Vec<String> = schema.objects.iter().map(|o| o.name.clone()).collect();
+    let mut new_names: Vec<String> = Vec::with_capacity(members.len());
+    for _ in &members {
+        let refs: Vec<&str> = taken.iter().map(String::as_str).collect();
+        let name = free_name(&refs, "_migratr_rebuild");
+        taken.push(name.clone());
+        new_names.push(name);
     }
-    let copied = copied.join(", ");
+    let renames: Vec<(&str, &str)> = members
+        .iter()
+        .zip(&new_names)
+        .map(|((m, _, _), new)| (m.object.name.as_str(), new.as_str()))
+        .collect();
 
-    let quoted_table = quote_ident(table_name);
-    let quoted_new = quote_ident(&new_name);
+    let mut creates = Vec::with_capacity(members.len());
+    for ((member, sql, _), new_name) in members.iter().zip(&new_names) {
+        let name_span =
+            create_table_name_span(member.sql).ok_or_else(|| MigrateError::UnparseableTable {
+                table: member.object.name.clone(),
+            })?;
+        let renamed = format!(
+            "{}{}{}",
+            &sql[..name_span.start],
+            quote_ident(new_name),
+            &sql[name_span.end..],
+        );
+        creates.push(rename_references(&renamed, &renames));
+    }
+
+    let family_refs: Vec<&str> = family_names.iter().map(String::as_str).collect();
+    let family_dependents = Dependents::of(schema, &family_refs);
+    let in_family = |name: &str| family_refs.iter().any(|f| f.eq_ignore_ascii_case(name));
     let survives_drops = |trigger: &&&SchemaObject| {
-        !trigger.tbl_name.eq_ignore_ascii_case(table_name)
-            && !dependents
+        !in_family(&trigger.tbl_name)
+            && !family_dependents
                 .views
                 .iter()
                 .any(|v| v.name.eq_ignore_ascii_case(&trigger.tbl_name))
     };
-    let mut statements: Vec<String> = dependents
+    let mut statements: Vec<String> = family_dependents
         .triggers
         .iter()
         .filter(survives_drops)
         .map(|t| format!("DROP TRIGGER {}", quote_ident(&t.name)))
         .collect();
     statements.extend(
-        dependents
+        family_dependents
             .views
             .iter()
             .map(|v| format!("DROP VIEW {}", quote_ident(&v.name))),
     );
-    statements.push(new_create.clone());
-    statements.push(format!(
-        "INSERT INTO {quoted_new} ({copied}) SELECT {copied} FROM {quoted_table}"
-    ));
-    if has_keyword(&new_create, "AUTOINCREMENT") {
+    statements.extend(creates.iter().cloned());
+    for (((member, _, copied), new_name), create) in members.iter().zip(&new_names).zip(&creates) {
+        let old = &member.object.name;
         statements.push(format!(
-            "DELETE FROM sqlite_sequence WHERE name = {}",
-            quote_literal(&new_name)
+            "INSERT INTO {} ({copied}) SELECT {copied} FROM {}",
+            quote_ident(new_name),
+            quote_ident(old)
         ));
-        statements.push(format!(
-            "INSERT INTO sqlite_sequence (name, seq) SELECT {}, seq FROM sqlite_sequence WHERE name = {}",
-            quote_literal(&new_name),
-            quote_literal(table_name)
-        ));
+        if has_keyword(create, "AUTOINCREMENT") {
+            statements.push(format!(
+                "DELETE FROM sqlite_sequence WHERE name = {}",
+                quote_literal(new_name)
+            ));
+            statements.push(format!(
+                "INSERT INTO sqlite_sequence (name, seq) SELECT {}, seq FROM sqlite_sequence WHERE name = {}",
+                quote_literal(new_name),
+                quote_literal(old)
+            ));
+        }
     }
-    statements.push(format!("DROP TABLE {quoted_table}"));
-    statements.push(format!("ALTER TABLE {quoted_new} RENAME TO {quoted_table}"));
-    statements.extend(dependents.all().filter_map(|o| o.sql.clone()));
+    statements.extend(
+        members
+            .iter()
+            .skip(1)
+            .chain(members.iter().take(1))
+            .map(|(m, _, _)| format!("DROP TABLE {}", quote_ident(&m.object.name))),
+    );
+    statements.extend(members.iter().zip(&new_names).map(|((m, _, _), new_name)| {
+        format!(
+            "ALTER TABLE {} RENAME TO {}",
+            quote_ident(new_name),
+            quote_ident(&m.object.name)
+        )
+    }));
+    statements.extend(family_dependents.all().filter_map(|o| o.sql.clone()));
     Ok(statements)
 }
 
@@ -479,28 +569,6 @@ fn free_name(taken: &[&str], base: &str) -> String {
         .map(|n| format!("{base}_{n}"))
         .find(|name| !is_taken(name))
         .unwrap_or_else(|| base.to_string())
-}
-
-/// The message prefix of [`fk_check`]'s failure; the number of violating rows in a table
-/// follows it, then ` in ` and the table: the first one, by name, that has any.
-pub(crate) const FK_VIOLATION_MESSAGE: &str = "migratr: foreign key violations: ";
-
-/// One statement that aborts with [`FK_VIOLATION_MESSAGE`] when the database has any
-/// foreign-key violation. SQLite reports one pragma row per violated key, so a row that
-/// breaks two keys is counted once by its rowid; a WITHOUT ROWID table has no rowid to
-/// tell its rows apart and counts one per violated key. RAISE works only in a trigger, so the count goes into a temporary
-/// table whose trigger raises; both are dropped again before the statement ends.
-pub(crate) fn fk_check() -> String {
-    let message = quote_literal(FK_VIOLATION_MESSAGE);
-    format!(
-        "CREATE TEMP TABLE _migratr_fk_raise (n INTEGER, tbl TEXT); \
-         CREATE TEMP TRIGGER _migratr_fk_raise_trigger BEFORE INSERT ON _migratr_fk_raise \
-           WHEN NEW.n > 0 BEGIN SELECT RAISE(ABORT, {message} || NEW.n || ' in ' || NEW.tbl); END; \
-         INSERT INTO _migratr_fk_raise SELECT count(DISTINCT \"rowid\") + count(*) FILTER (WHERE \"rowid\" IS NULL), \"table\" \
-           FROM pragma_foreign_key_check \
-           WHERE \"table\" = (SELECT min(\"table\") FROM pragma_foreign_key_check); \
-         DROP TABLE _migratr_fk_raise"
-    )
 }
 
 #[cfg(all(test, feature = "rusqlite"))]
@@ -691,68 +759,6 @@ mod tests {
     }
 
     #[test]
-    fn the_foreign_key_check_counts_every_violating_row() {
-        let mut ex = executor(
-            "CREATE TABLE p (id INTEGER PRIMARY KEY);
-             CREATE TABLE c (pid INTEGER REFERENCES p (id));
-             CREATE TABLE w (k TEXT PRIMARY KEY, pid INTEGER REFERENCES p (id)) WITHOUT ROWID;
-             PRAGMA foreign_keys = OFF;
-             INSERT INTO p VALUES (1);
-             INSERT INTO c VALUES (1);",
-        );
-        ex.run_atomic(&[fk_check()], true).expect("no violations");
-
-        let statements = [
-            "INSERT INTO w VALUES ('a', 8), ('b', 8), ('c', 9)".to_string(),
-            fk_check(),
-        ];
-        let err = ex
-            .run_atomic(&statements, true)
-            .expect_err("violations abort");
-        assert_eq!(err.index, Some(1));
-        let message = err.source.to_string();
-        assert!(
-            message.contains(&format!("{FK_VIOLATION_MESSAGE}3 in w")),
-            "{message}"
-        );
-        assert_eq!(query_i64(&ex, "SELECT count(*) FROM w"), 0);
-
-        // A row that breaks two keys is one row.
-        let statements = [
-            "CREATE TABLE two (a INTEGER REFERENCES p (id), b INTEGER REFERENCES p (id))"
-                .to_string(),
-            "INSERT INTO two VALUES (5, 6)".to_string(),
-            fk_check(),
-        ];
-        let message = ex
-            .run_atomic(&statements, true)
-            .expect_err("violations abort")
-            .source
-            .to_string();
-        assert!(
-            message.contains(&format!("{FK_VIOLATION_MESSAGE}1 in two")),
-            "{message}"
-        );
-
-        // With violations in two tables, the count is the first table's own.
-        let statements = [
-            "INSERT INTO w VALUES ('a', 8), ('b', 8), ('c', 9)".to_string(),
-            "INSERT INTO c VALUES (5)".to_string(),
-            fk_check(),
-        ];
-        let message = ex
-            .run_atomic(&statements, true)
-            .expect_err("violations abort")
-            .source
-            .to_string();
-        assert!(
-            message.contains(&format!("{FK_VIOLATION_MESSAGE}1 in c")),
-            "{message}"
-        );
-        assert_eq!(query_i64(&ex, "SELECT count(*) FROM sqlite_temp_master"), 0);
-    }
-
-    #[test]
     fn an_index_names_only_its_columns_and_where_clause() {
         let mut ex = executor(
             "CREATE TABLE t (id INTEGER PRIMARY KEY, t TEXT, idx TEXT, a TEXT, b TEXT);
@@ -867,7 +873,11 @@ mod tests {
         );
         let schema = ex.read_schema().expect("schema");
         let mut touched: Vec<&str> = std::iter::once("t")
-            .chain(Dependents::of(&schema, "t").all().map(|o| o.name.as_str()))
+            .chain(
+                Dependents::of(&schema, &["t"])
+                    .all()
+                    .map(|o| o.name.as_str()),
+            )
             .collect();
         touched.sort();
         assert_eq!(touched, ["on_other", "t", "v1", "v2", "via_view"]);

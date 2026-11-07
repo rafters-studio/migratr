@@ -261,10 +261,10 @@ fn a_failure_at_any_rebuild_statement_changes_nothing_and_restores_foreign_keys(
                 break;
             }
         }
-        // The ledger create, the view drop, create, copy, drop,
-        // rename, one index, one view, three triggers, the foreign-key check, and the ledger
-        // insert.
-        assert_eq!(fail_at, 13);
+        // The ledger create, the view drop, then for authors and its child books: two
+        // creates, two copies, two drops and two renames; one index, one view, three
+        // triggers, and the ledger insert.
+        assert_eq!(fail_at, 16);
     }
 }
 
@@ -276,17 +276,55 @@ const PARENTS_AND_KIDS: &str = "
 ";
 
 #[test]
-fn an_orphaning_insert_in_the_same_migration_is_refused_and_leaves_the_database_unchanged() {
+fn an_orphaning_insert_in_the_same_migration_is_refused_by_the_foreign_key_and_changes_nothing() {
+    let mut ex = seeded(PARENTS_AND_KIDS);
+    let before = dump(ex.connection());
+    let (_dir, migrations) = migration(&format!(
+        r#"{}, {{"op": "raw_sql", "up": "INSERT INTO kids VALUES (7), (8)"}}"#,
+        drop_column("parents", "code")
+    ));
+
+    let err = up(&mut ex, &migrations, None).expect_err("refused");
+
+    assert!(
+        matches!(
+            err,
+            MigrateError::Apply {
+                operation: Some(1),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(dump(ex.connection()), before);
+    assert!(foreign_keys(ex.connection()));
+}
+
+/// Leaves orphans in `kids`, which needs foreign keys off to insert them.
+fn orphan(ex: &RusqliteExecutor, rows: &str) {
+    ex.connection()
+        .execute_batch(&format!(
+            "PRAGMA foreign_keys = OFF; INSERT INTO kids VALUES {rows}; PRAGMA foreign_keys = ON;"
+        ))
+        .expect("orphans");
+}
+
+#[test]
+fn violations_that_existed_before_the_migration_refuse_it_before_any_change_with_the_exact_count() {
     for prior in [true, false] {
-        let mut ex = seeded(PARENTS_AND_KIDS);
-        ex.connection()
+        let inner = seeded(PARENTS_AND_KIDS);
+        orphan(&inner, "(7), (8)");
+        inner
+            .connection()
             .pragma_update(None, "foreign_keys", prior)
             .expect("set fk");
-        let before = dump(ex.connection());
-        let (_dir, migrations) = migration(&format!(
-            r#"{}, {{"op": "raw_sql", "up": "INSERT INTO kids VALUES (7), (8)"}}"#,
-            drop_column("parents", "code")
-        ));
+        let mut ex = Recorded {
+            inner,
+            sent: Vec::new(),
+            snapshots: 0,
+        };
+        let before = dump(ex.inner.connection());
+        let (_dir, migrations) = migration(&drop_column("parents", "code"));
 
         let err = up(&mut ex, &migrations, None).expect_err("violations");
 
@@ -297,44 +335,25 @@ fn an_orphaning_insert_in_the_same_migration_is_refused_and_leaves_the_database_
             ),
             "{err:?}"
         );
-        assert_eq!(dump(ex.connection()), before);
-        assert_eq!(foreign_keys(ex.connection()), prior);
+        assert!(err.to_string().contains("kids") && err.to_string().contains('2'));
+        assert!(
+            ex.sent.is_empty() && ex.snapshots == 0,
+            "asked for a change"
+        );
+        assert_eq!(dump(ex.inner.connection()), before);
+        assert_eq!(foreign_keys(ex.inner.connection()), prior);
     }
 }
 
 #[test]
-fn violations_that_existed_before_the_migration_refuse_it_with_the_exact_count() {
-    let mut ex = seeded(PARENTS_AND_KIDS);
-    ex.connection()
-        .execute_batch("PRAGMA foreign_keys = OFF; INSERT INTO kids VALUES (7), (8); PRAGMA foreign_keys = ON;")
-        .expect("orphans");
-    let before = dump(ex.connection());
-    let (_dir, migrations) = migration(&drop_column("parents", "code"));
-
-    let err = up(&mut ex, &migrations, None).expect_err("violations");
-
-    assert!(
-        matches!(
-            err,
-            MigrateError::ForeignKeyViolation { ref table, rows: 2 } if table == "kids"
-        ),
-        "{err:?}"
-    );
-    assert_eq!(dump(ex.connection()), before);
-    assert!(foreign_keys(ex.connection()));
-}
-
-#[test]
-fn several_new_orphans_in_a_without_rowid_child_are_all_counted() {
+fn orphans_in_a_without_rowid_child_are_counted_one_per_row() {
     let mut ex = seeded(
         "CREATE TABLE parents (id INTEGER PRIMARY KEY, code TEXT UNIQUE);
          CREATE TABLE kids (k TEXT PRIMARY KEY, parent_id INTEGER REFERENCES parents (id)) WITHOUT ROWID;
          INSERT INTO parents VALUES (1, 'a');",
     );
-    let (_dir, migrations) = migration(&format!(
-        r#"{}, {{"op": "raw_sql", "up": "INSERT INTO kids VALUES ('a', 7), ('b', 7), ('c', 8)"}}"#,
-        drop_column("parents", "code")
-    ));
+    orphan(&ex, "('a', 7), ('b', 7), ('c', 8)");
+    let (_dir, migrations) = migration(&drop_column("parents", "code"));
 
     let err = up(&mut ex, &migrations, None).expect_err("violations");
 
@@ -345,7 +364,234 @@ fn several_new_orphans_in_a_without_rowid_child_are_all_counted() {
         ),
         "{err:?}"
     );
-    assert_eq!(query_i64(ex.connection(), "SELECT count(*) FROM kids"), 0);
+    assert_eq!(query_i64(ex.connection(), "SELECT count(*) FROM kids"), 3);
+}
+
+/// The table and column each foreign key of `table` names, by table.
+fn references(conn: &Connection, table: &str) -> Vec<(String, String)> {
+    conn.prepare(&format!(
+        "SELECT \"table\", \"to\" FROM pragma_foreign_key_list('{table}') ORDER BY 1"
+    ))
+    .expect("prepare")
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+    .expect("query")
+    .collect::<Result<_, _>>()
+    .expect("references")
+}
+
+const FAMILY: &str = "
+    CREATE TABLE orders (id INTEGER PRIMARY KEY, code TEXT UNIQUE, previous INTEGER REFERENCES orders (id));
+    CREATE TABLE products (id INTEGER PRIMARY KEY);
+    CREATE TABLE order_details (
+      order_id INTEGER NOT NULL REFERENCES orders (id) ON DELETE CASCADE,
+      product_id INTEGER REFERENCES products (id),
+      qty INTEGER
+    );
+    CREATE INDEX order_details_order ON order_details (order_id);
+    INSERT INTO products VALUES (1), (2);
+    INSERT INTO orders VALUES (1, 'a', NULL), (2, 'b', 1), (3, 'c', 2);
+    INSERT INTO order_details VALUES (1, 1, 5), (2, 2, 6), (3, 1, 7), (3, 2, 8);
+";
+
+#[test]
+fn a_referenced_table_rebuilds_with_its_family() {
+    for prior in [true, false] {
+        let mut ex = seeded(FAMILY);
+        ex.connection()
+            .pragma_update(None, "foreign_keys", prior)
+            .expect("set fk");
+        let (_dir, migrations) = migration(&drop_column("orders", "code"));
+
+        up(&mut ex, &migrations, None).expect("up");
+
+        let conn = ex.connection();
+        assert_eq!(columns(conn, "orders"), ["id", "previous"]);
+        assert_eq!(query_i64(conn, "SELECT count(*) FROM orders"), 3);
+        assert_eq!(query_i64(conn, "SELECT count(*) FROM order_details"), 4);
+        assert_eq!(
+            references(conn, "order_details"),
+            [
+                ("orders".to_string(), "id".to_string()),
+                ("products".to_string(), "id".to_string())
+            ]
+        );
+        assert_eq!(
+            references(conn, "orders"),
+            [("orders".to_string(), "id".to_string())]
+        );
+        assert_eq!(
+            query_i64(
+                conn,
+                "SELECT count(*) FROM sqlite_master WHERE name LIKE '%migratr_rebuild%'"
+            ),
+            0
+        );
+        assert_eq!(
+            query_i64(conn, "SELECT count(*) FROM pragma_foreign_key_check"),
+            0
+        );
+        assert!(names(conn).contains(&"order_details_order".to_string()));
+        assert_eq!(foreign_keys(conn), prior);
+
+        // The child's key works against the final table.
+        conn.execute_batch("PRAGMA foreign_keys = ON; DELETE FROM orders WHERE id = 3;")
+            .expect("cascade");
+        assert_eq!(query_i64(conn, "SELECT count(*) FROM order_details"), 2);
+        assert!(
+            conn.execute("INSERT INTO order_details VALUES (9, 1, 1)", [])
+                .is_err()
+        );
+    }
+}
+
+/// An executor that behaves as D1 does toward a rebuild: it refuses to turn foreign keys off,
+/// any TEMP object and any `PRAGMA foreign_keys`, runs with foreign keys on, and records the
+/// statements it receives.
+struct D1Like {
+    inner: RusqliteExecutor,
+    sent: Vec<String>,
+}
+
+impl Executor for D1Like {
+    type Error = rusqlite::Error;
+
+    fn read_schema(&mut self) -> Result<SchemaSnapshot, Self::Error> {
+        self.inner.read_schema()
+    }
+
+    fn read_ledger(&mut self) -> Result<Vec<LedgerRow>, Self::Error> {
+        self.inner.read_ledger()
+    }
+
+    fn run_atomic(
+        &mut self,
+        statements: &[String],
+        suspend_foreign_keys: bool,
+    ) -> Result<(), AtomicError<Self::Error>> {
+        let refused = |what: &str| {
+            AtomicError::outside_statements(rusqlite::Error::InvalidParameterName(what.into()))
+        };
+        if suspend_foreign_keys {
+            return Err(refused("foreign keys cannot be turned off"));
+        }
+        for statement in statements {
+            let upper = statement.to_ascii_uppercase();
+            if upper.contains("TEMP ") || upper.contains("TEMPORARY ") {
+                return Err(refused(statement));
+            }
+            if upper.contains("PRAGMA") && upper.contains("FOREIGN_KEYS") {
+                return Err(refused(statement));
+            }
+        }
+        self.sent.extend_from_slice(statements);
+        self.inner.run_atomic(statements, false)
+    }
+
+    fn snapshot(&mut self, _file_name: &str) -> Result<Option<std::path::PathBuf>, Self::Error> {
+        Ok(None)
+    }
+}
+
+/// Records the statements and snapshot requests a plain executor receives.
+struct Recorded {
+    inner: RusqliteExecutor,
+    sent: Vec<String>,
+    snapshots: usize,
+}
+
+impl Executor for Recorded {
+    type Error = rusqlite::Error;
+
+    fn read_schema(&mut self) -> Result<SchemaSnapshot, Self::Error> {
+        self.inner.read_schema()
+    }
+
+    fn read_ledger(&mut self) -> Result<Vec<LedgerRow>, Self::Error> {
+        self.inner.read_ledger()
+    }
+
+    fn foreign_key_violations(
+        &mut self,
+        tables: &[&str],
+    ) -> Result<Option<Vec<(String, u64)>>, Self::Error> {
+        self.inner.foreign_key_violations(tables)
+    }
+
+    fn run_atomic(
+        &mut self,
+        statements: &[String],
+        suspend_foreign_keys: bool,
+    ) -> Result<(), AtomicError<Self::Error>> {
+        self.sent.extend_from_slice(statements);
+        self.inner.run_atomic(statements, suspend_foreign_keys)
+    }
+
+    fn snapshot(&mut self, file_name: &str) -> Result<Option<std::path::PathBuf>, Self::Error> {
+        self.snapshots += 1;
+        self.inner.snapshot(file_name)
+    }
+}
+
+#[test]
+fn the_same_rebuild_statements_run_on_a_file_and_on_a_place_like_d1() {
+    for (schema, table, column) in [
+        (LIBRARY, "authors", "code"),
+        (FAMILY, "orders", "code"),
+        (GRAPH, "t", "gone"),
+    ] {
+        let dir = TempDir::new().expect("tempdir");
+        let conn = Connection::open(dir.path().join("local.db")).expect("open file");
+        conn.execute_batch(schema).expect("seed");
+        let mut file = Recorded {
+            inner: RusqliteExecutor::new(conn),
+            sent: Vec::new(),
+            snapshots: 0,
+        };
+        let mut place = D1Like {
+            inner: seeded(schema),
+            sent: Vec::new(),
+        };
+        let (_m, migrations) = migration(&drop_column(table, column));
+
+        up(&mut file, &migrations, None).expect("file");
+        up(&mut place, &migrations, None).expect("place");
+
+        assert_eq!(file.sent, place.sent, "{table}");
+        // The ledger rows differ only in when they were applied.
+        let state = |conn: &Connection| -> Vec<String> {
+            dump(conn)
+                .into_iter()
+                .filter(|line| !line.starts_with("Integer(20260101000001)"))
+                .collect()
+        };
+        assert_eq!(
+            state(file.inner.connection()),
+            state(place.inner.connection()),
+            "{table}"
+        );
+    }
+}
+
+#[test]
+fn a_place_refuses_rows_a_foreign_key_refuses_at_the_copy_and_nothing_changes() {
+    let mut place = D1Like {
+        inner: seeded(FAMILY),
+        sent: Vec::new(),
+    };
+    place
+        .inner
+        .connection()
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF; INSERT INTO order_details VALUES (9, 1, 1); PRAGMA foreign_keys = ON;",
+        )
+        .expect("orphan");
+    let before = dump(place.inner.connection());
+    let (_dir, migrations) = migration(&drop_column("orders", "code"));
+
+    let err = up(&mut place, &migrations, None).expect_err("refused");
+
+    assert!(matches!(err, MigrateError::Apply { .. }), "{err:?}");
+    assert_eq!(dump(place.inner.connection()), before);
 }
 
 #[test]

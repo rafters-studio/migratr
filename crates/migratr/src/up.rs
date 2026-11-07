@@ -1,9 +1,7 @@
 use crate::executor::Executor;
 use crate::ledger;
 use crate::migration::{Column, MigrateError, Migration, Op};
-use crate::rebuild::{
-    FK_VIOLATION_MESSAGE, TableChange, add_needs_rebuild, fk_check, op_rebuild, rebuild_statements,
-};
+use crate::rebuild::{TableChange, add_needs_rebuild, family, op_rebuild, rebuild_statements};
 use crate::snapshot::{Direction, snapshot_before};
 use crate::sql_ddl::quote_ident as ident;
 
@@ -74,7 +72,7 @@ pub(crate) fn apply(
 
     // Each operation's statements, with the operation they came from.
     let mut body: Vec<(String, usize)> = Vec::new();
-    let mut has_rebuild = false;
+    let mut rebuilt: Vec<String> = Vec::new();
     for (i, op) in ops.iter().enumerate() {
         let rebuild = match &schema {
             Some(schema) => op_rebuild(schema, ops, i)?,
@@ -100,7 +98,7 @@ pub(crate) fn apply(
                     definition: rebuilt_column_def(column),
                 }
             };
-            has_rebuild = true;
+            rebuilt = family(schema, table);
             body.extend(
                 rebuild_statements(schema, table, &change)?
                     .into_iter()
@@ -111,48 +109,37 @@ pub(crate) fn apply(
         body.push((render(op), i));
     }
 
-    // A migration with a rebuild runs with foreign keys suspended, so the whole database is
-    // checked before the ledger row, as SQLite's own procedure does.
+    // A rebuild copies every row of its family with foreign keys as they are, so rows a
+    // foreign key refuses are counted first, before any change.
+    if !rebuilt.is_empty() {
+        let tables: Vec<&str> = rebuilt.iter().map(String::as_str).collect();
+        let violations = exec
+            .foreign_key_violations(&tables)
+            .map_err(|e| MigrateError::Executor(Box::new(e)))?;
+        if let Some((table, rows)) = violations.and_then(|v| v.into_iter().next()) {
+            return Err(MigrateError::ForeignKeyViolation { table, rows });
+        }
+    }
+
     let mut statements = prelude.to_vec();
     let mut origins: Vec<Option<usize>> = vec![None; prelude.len()];
     for (statement, operation) in body {
         statements.push(statement);
         origins.push(Some(operation));
     }
-    let fk_check_at = has_rebuild.then_some(statements.len());
-    if has_rebuild {
-        statements.push(fk_check());
-        origins.push(None);
-    }
     statements.push(record);
     origins.push(None);
 
     snapshot_before(exec, ops, version, direction)?;
-    exec.run_atomic(&statements, has_rebuild)
-        .map_err(|failure| {
-            let violation = failure
+    exec.run_atomic(&statements, false)
+        .map_err(|failure| MigrateError::Apply {
+            version,
+            statement: failure.index.and_then(|i| statements.get(i)).cloned(),
+            operation: failure
                 .index
-                .filter(|&i| Some(i) == fk_check_at)
-                .and_then(|_| foreign_key_violation(&failure.source.to_string()));
-            violation.unwrap_or_else(|| MigrateError::Apply {
-                version,
-                statement: failure.index.and_then(|i| statements.get(i)).cloned(),
-                operation: failure
-                    .index
-                    .and_then(|i| origins.get(i).copied().flatten()),
-                source: Box::new(failure.source),
-            })
+                .and_then(|i| origins.get(i).copied().flatten()),
+            source: Box::new(failure.source),
         })
-}
-
-/// The `ForeignKeyViolation` that an executor's [`fk_check`] failure message reports.
-fn foreign_key_violation(message: &str) -> Option<MigrateError> {
-    let report = message.split(FK_VIOLATION_MESSAGE).nth(1)?;
-    let (rows, table) = report.split_once(" in ")?;
-    Some(MigrateError::ForeignKeyViolation {
-        table: table.trim().to_string(),
-        rows: rows.parse().ok()?,
-    })
 }
 
 /// The SQL statement for one operation.

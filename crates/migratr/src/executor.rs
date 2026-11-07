@@ -93,6 +93,18 @@ pub trait Executor {
     /// Empty when the ledger table does not exist.
     fn read_ledger(&mut self) -> Result<Vec<LedgerRow>, Self::Error>;
 
+    /// Each of `tables` that has rows a foreign key refuses, by name, with the number of those
+    /// rows, as [`foreign_key_violations_through`](crate::foreign_key_violations_through)
+    /// reads them. `None`, the default, when the executor does not count them; a rebuild's
+    /// own copy then refuses such rows inside its atomic run.
+    fn foreign_key_violations(
+        &mut self,
+        tables: &[&str],
+    ) -> Result<Option<Vec<(String, u64)>>, Self::Error> {
+        let _ = tables;
+        Ok(None)
+    }
+
     /// Run all statements in one transaction; all apply or none do. A failure reports the index
     /// of the statement that failed.
     /// With `suspend_foreign_keys`, foreign_keys is turned off before the
@@ -122,7 +134,9 @@ mod rusqlite_executor {
     use serde_json::Value;
 
     use super::{AtomicError, Executor, LedgerRow, SchemaSnapshot};
-    use crate::reader::{SqlReader, read_ledger_through, read_schema_through};
+    use crate::reader::{
+        SqlReader, foreign_key_violations_through, read_ledger_through, read_schema_through,
+    };
 
     /// An [`Executor`] over a rusqlite connection.
     pub struct RusqliteExecutor {
@@ -184,6 +198,13 @@ mod rusqlite_executor {
 
         fn read_ledger(&mut self) -> Result<Vec<LedgerRow>, Self::Error> {
             read_ledger_through(&mut Reader(&self.conn))
+        }
+
+        fn foreign_key_violations(
+            &mut self,
+            tables: &[&str],
+        ) -> Result<Option<Vec<(String, u64)>>, Self::Error> {
+            foreign_key_violations_through(&mut Reader(&self.conn), tables).map(Some)
         }
 
         fn run_atomic(
