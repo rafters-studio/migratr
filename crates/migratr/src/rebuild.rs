@@ -432,7 +432,8 @@ fn copied_columns(parsed: &ParsedTable, dropped: Option<usize>) -> String {
 /// when another column's definition, a table constraint, a foreign key of any table that
 /// names the column as its parent key, or a recreated index, view or trigger names the
 /// dropped column. SQLite does not check a view or trigger body when it is created, so the
-/// object would break on first use.
+/// object would break on first use. A dropped foreign key the table does not have is refused
+/// with `NoSuchForeignKey`.
 pub(crate) fn rebuild_statements(
     schema: &SchemaSnapshot,
     table: &str,
