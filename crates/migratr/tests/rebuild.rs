@@ -1261,3 +1261,62 @@ fn dropping_a_foreign_key_the_table_does_not_have_is_refused_and_nothing_changes
     );
     assert_eq!(dump(ex.connection()), before);
 }
+
+#[test]
+fn a_table_made_with_checks_unique_and_a_trigger_keeps_all_three_after_a_rebuild() {
+    let dir = TempDir::new().expect("tempdir");
+    let file = |name: &str, ops: &str| {
+        fs::write(dir.path().join(name), format!(r#"{{"up": [{ops}]}}"#)).expect("write");
+    };
+    file(
+        "20260101000001_tables.json",
+        r#"{"op": "create_table", "table": "teams", "columns": [
+             {"name": "id", "type": "INTEGER", "primary_key": 1}]},
+           {"op": "create_table", "table": "seats", "columns": [
+             {"name": "id", "type": "INTEGER", "primary_key": 1},
+             {"name": "team", "type": "INTEGER"},
+             {"name": "num", "type": "INTEGER"}],
+            "checks": ["num > 0"], "unique": [["team", "num"]]},
+           {"op": "create_table", "table": "log", "columns": [{"name": "seat", "type": "INTEGER"}]},
+           {"op": "create_trigger", "name": "seats_log", "table": "seats",
+            "sql": "CREATE TRIGGER seats_log AFTER INSERT ON seats BEGIN INSERT INTO log VALUES (new.id); END"}"#,
+    );
+    let mut ex = seeded("");
+    up(&mut ex, &load_dir(dir.path()).expect("load"), None).expect("make the table");
+    ex.connection()
+        .execute_batch("INSERT INTO teams VALUES (1); INSERT INTO seats VALUES (1, 1, 1);")
+        .expect("rows");
+
+    file(
+        "20260101000002_key.json",
+        &add_foreign_key("seats", "team", "teams"),
+    );
+    let migrations = load_dir(dir.path()).expect("load");
+    let schema = ex.read_schema().expect("schema");
+    assert_eq!(
+        rebuild_tables(&schema, &migrations[1]).expect("tables"),
+        ["seats"]
+    );
+    up(&mut ex, &migrations, None).expect("rebuild");
+
+    let conn = ex.connection();
+    let sql = table_sql(conn, "seats");
+    assert!(
+        sql.contains("CHECK (num > 0)") && sql.contains("UNIQUE (\"team\", \"num\")"),
+        "{sql}"
+    );
+    assert!(
+        conn.execute("INSERT INTO seats VALUES (2, 1, 0)", [])
+            .is_err(),
+        "a row breaking the check was accepted"
+    );
+    assert!(
+        conn.execute("INSERT INTO seats VALUES (3, 1, 1)", [])
+            .is_err(),
+        "a row repeating the unique pair was accepted"
+    );
+    let logged = query_i64(conn, "SELECT count(*) FROM log");
+    conn.execute("INSERT INTO seats VALUES (4, 1, 2)", [])
+        .expect("a valid row");
+    assert_eq!(query_i64(conn, "SELECT count(*) FROM log"), logged + 1);
+}

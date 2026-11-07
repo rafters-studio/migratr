@@ -226,7 +226,9 @@ fn render(op: &Op) -> String {
             table,
             columns,
             without_rowid,
-        } => create_table(table, columns, *without_rowid),
+            checks,
+            unique,
+        } => create_table(table, columns, *without_rowid, checks, unique),
         Op::DropTable { table, .. } => format!("DROP TABLE {}", ident(table)),
         Op::RenameTable { from, to } => {
             format!("ALTER TABLE {} RENAME TO {}", ident(from), ident(to))
@@ -260,11 +262,19 @@ fn render(op: &Op) -> String {
         Op::AddForeignKey(_) | Op::DropForeignKey { .. } => {
             unreachable!("a foreign key is added or dropped only by the rebuild")
         }
+        Op::CreateTrigger(trigger) => trigger.sql.clone(),
+        Op::DropTrigger { definition } => format!("DROP TRIGGER {}", ident(&definition.name)),
         Op::RawSql { up, .. } => up.clone(),
     }
 }
 
-fn create_table(table: &str, columns: &[Column], without_rowid: bool) -> String {
+fn create_table(
+    table: &str,
+    columns: &[Column],
+    without_rowid: bool,
+    checks: &[String],
+    unique: &[Vec<String>],
+) -> String {
     let mut parts: Vec<String> = columns.iter().map(column_def).collect();
 
     let mut key: Vec<&Column> = columns.iter().filter(|c| c.primary_key.is_some()).collect();
@@ -275,6 +285,12 @@ fn create_table(table: &str, columns: &[Column], without_rowid: bool) -> String 
             ident_list(key.iter().map(|c| c.name.as_str()))
         ));
     }
+    parts.extend(checks.iter().map(|check| format!("CHECK ({check})")));
+    parts.extend(
+        unique
+            .iter()
+            .map(|names| format!("UNIQUE ({})", ident_list(names.iter().map(String::as_str)))),
+    );
 
     format!(
         "CREATE TABLE {} ({}){}",
@@ -374,11 +390,29 @@ mod tests {
         b.primary_key = Some(1);
         b.not_null = true;
         b.collation = Some("NOCASE".into());
-        let sql = create_table("t", &[a, b], true);
+        let sql = create_table("t", &[a, b], true, &[], &[]);
         assert_eq!(
             sql,
             "CREATE TABLE \"t\" (\"a\" INTEGER, \"b\" TEXT COLLATE NOCASE NOT NULL, \
              PRIMARY KEY (\"b\", \"a\")) WITHOUT ROWID"
+        );
+    }
+
+    #[test]
+    fn create_table_renders_checks_then_unique_each_in_order() {
+        let mut id = col("id", "INTEGER");
+        id.primary_key = Some(1);
+        let sql = create_table(
+            "t",
+            &[id, col("a", "INTEGER"), col("b", "TEXT")],
+            false,
+            &["a > 0".into(), "length(b) < 9".into()],
+            &[vec!["a".into(), "b".into()], vec!["b".into()]],
+        );
+        assert_eq!(
+            sql,
+            "CREATE TABLE \"t\" (\"id\" INTEGER, \"a\" INTEGER, \"b\" TEXT, PRIMARY KEY (\"id\"), \
+             CHECK (a > 0), CHECK (length(b) < 9), UNIQUE (\"a\", \"b\"), UNIQUE (\"b\"))"
         );
     }
 

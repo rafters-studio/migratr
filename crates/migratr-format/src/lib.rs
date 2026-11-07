@@ -169,6 +169,16 @@ pub struct IndexDef {
     pub where_clause: Option<String>,
 }
 
+/// A trigger with everything needed to recreate it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TriggerDef {
+    pub name: String,
+    pub table: String,
+    /// The CREATE TRIGGER statement, verbatim.
+    pub sql: String,
+}
+
 /// One schema operation.
 ///
 /// Serde represents it externally tagged (`{"add_column": {...}}`); a migration file
@@ -181,6 +191,12 @@ pub enum Op {
         columns: Vec<Column>,
         #[serde(default)]
         without_rowid: bool,
+        /// Table-level CHECK expressions, each verbatim.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        checks: Vec<String>,
+        /// Table-level UNIQUE constraints, each a list of columns.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        unique: Vec<Vec<String>>,
     },
     DropTable {
         table: String,
@@ -219,6 +235,10 @@ pub enum Op {
     AddForeignKey(ForeignKeyDef),
     DropForeignKey {
         definition: ForeignKeyDef,
+    },
+    CreateTrigger(TriggerDef),
+    DropTrigger {
+        definition: TriggerDef,
     },
     RawSql {
         up: String,

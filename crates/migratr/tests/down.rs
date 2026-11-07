@@ -498,3 +498,65 @@ fn partial_expression_and_desc_indexes_are_made_and_each_down_drops_it() {
     down(&mut ex, &migrations, 1).expect("down");
     assert_eq!(state(ex.connection()), before);
 }
+
+const AUDITED: &str = r#"{"op": "create_table", "table": "items", "columns": [
+    {"name": "id", "type": "INTEGER", "primary_key": 1}]},
+    {"op": "create_table", "table": "audit", "columns": [{"name": "item", "type": "INTEGER"}]}"#;
+
+const TRIGGER_SQL: &str =
+    "CREATE TRIGGER items_audit AFTER INSERT ON items BEGIN INSERT INTO audit VALUES (new.id); END";
+
+fn trigger_sql(conn: &Connection) -> Option<String> {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'items_audit'",
+        [],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+/// Inserts an item and returns how many audit rows that insert added.
+fn audited(conn: &Connection, id: i64) -> i64 {
+    let count = |conn: &Connection| -> i64 {
+        conn.query_row("SELECT count(*) FROM audit", [], |r| r.get(0))
+            .expect("count")
+    };
+    let before = count(conn);
+    conn.execute("INSERT INTO items VALUES (?1)", [id])
+        .expect("insert");
+    count(conn) - before
+}
+
+#[test]
+fn a_created_trigger_is_verbatim_and_fires_and_a_dropped_one_comes_back_on_down() {
+    let dir = TempDir::new().expect("tempdir");
+    write(dir.path(), "20260101000001_tables.json", AUDITED);
+    let fields = format!(r#""name": "items_audit", "table": "items", "sql": "{TRIGGER_SQL}""#);
+    write(
+        dir.path(),
+        "20260101000002_trigger.json",
+        &format!(r#"{{"op": "create_trigger", {fields}}}"#),
+    );
+    let mut ex = executor();
+    up(&mut ex, &load(&dir), None).expect("up");
+    assert_eq!(trigger_sql(ex.connection()).as_deref(), Some(TRIGGER_SQL));
+    assert_eq!(audited(ex.connection(), 1), 1);
+
+    down(&mut ex, &load(&dir), 1).expect("down drops it");
+    assert_eq!(trigger_sql(ex.connection()), None);
+    assert_eq!(audited(ex.connection(), 2), 0);
+
+    up(&mut ex, &load(&dir), None).expect("up again");
+    write(
+        dir.path(),
+        "20260101000003_drop.json",
+        &format!(r#"{{"op": "drop_trigger", "definition": {{{fields}}}}}"#),
+    );
+    up(&mut ex, &load(&dir), None).expect("drop_trigger");
+    assert_eq!(trigger_sql(ex.connection()), None);
+    assert_eq!(audited(ex.connection(), 3), 0);
+
+    down(&mut ex, &load(&dir), 1).expect("down makes it again");
+    assert_eq!(trigger_sql(ex.connection()).as_deref(), Some(TRIGGER_SQL));
+    assert_eq!(audited(ex.connection(), 4), 1);
+}

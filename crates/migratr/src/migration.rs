@@ -5,7 +5,7 @@ use thiserror::Error;
 
 pub use crate::format::{
     Column, ForeignKey, ForeignKeyDef, GeneratedColumn, IndexColumn, IndexDef, Migration, Op,
-    ParentKey, TableDef, split_file_name,
+    ParentKey, TableDef, TriggerDef, split_file_name,
 };
 use crate::format::{FormatError, parse_all};
 
@@ -342,6 +342,43 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn table_constraints_and_trigger_operations_parse() {
+        let trigger = TriggerDef {
+            name: "stamp".into(),
+            table: "t".into(),
+            sql: "CREATE TRIGGER stamp AFTER INSERT ON t BEGIN SELECT 1; END".into(),
+        };
+        let m = parse(
+            FILE,
+            r#"{"up": [
+              {"op": "create_table", "table": "t", "columns": [{"name": "a", "type": "INTEGER"}],
+               "checks": ["a > 0"], "unique": [["a", "b"]]},
+              {"op": "create_trigger", "name": "stamp", "table": "t",
+               "sql": "CREATE TRIGGER stamp AFTER INSERT ON t BEGIN SELECT 1; END"},
+              {"op": "drop_trigger", "definition": {"name": "stamp", "table": "t",
+               "sql": "CREATE TRIGGER stamp AFTER INSERT ON t BEGIN SELECT 1; END"}}
+            ]}"#,
+        )
+        .expect("parse");
+        assert!(matches!(&m.up[0], Op::CreateTable { checks, unique, .. }
+            if checks == &["a > 0"] && unique == &[vec!["a".to_string(), "b".to_string()]]));
+        assert_eq!(m.up[1], Op::CreateTrigger(trigger.clone()));
+        assert_eq!(
+            m.up[2],
+            Op::DropTrigger {
+                definition: trigger
+            }
+        );
+
+        let (path, message) = parse_err(r#"{"up": [{"op": "drop_trigger"}]}"#);
+        assert!(message.contains("drop_trigger"), "{path}: {message}");
+        let (path, _) = parse_err(
+            r#"{"up": [{"op": "create_trigger", "name": "s", "table": "t", "sql": "x", "bogus": 1}]}"#,
+        );
+        assert_eq!(path, "up[0].bogus");
     }
 
     #[test]
