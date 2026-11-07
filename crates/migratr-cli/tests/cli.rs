@@ -365,3 +365,32 @@ fn version_number(path: &Path) -> u64 {
         .and_then(|v| v.parse().ok())
         .expect("version in file name")
 }
+
+#[test]
+fn plan_refuses_an_added_foreign_key_over_a_missing_parent_as_up_does() {
+    let p = Project::new();
+    let write = |name: &str, text: &str| fs::write(p.dir().join(name), text).expect("migration");
+    write(
+        "20260101000000_create_tables.json",
+        r#"{"up": [
+          {"op": "create_table", "table": "customers", "columns": [{"name": "id", "type": "TEXT", "primary_key": 1}]},
+          {"op": "create_table", "table": "orders", "columns": [{"name": "id", "type": "TEXT", "primary_key": 1},
+            {"name": "customer_id", "type": "TEXT"}]},
+          {"op": "raw_sql", "up": "INSERT INTO orders VALUES ('o1', 'nobody')", "down": "DELETE FROM orders"}]}"#,
+    );
+    assert_eq!(p.run(&["up"]).code, 0);
+    write(
+        "20260101000001_add_foreign_key.json",
+        r#"{"up": [{"op": "add_foreign_key", "table": "orders", "columns": ["customer_id"],
+          "references": {"table": "customers", "columns": ["id"]}}]}"#,
+    );
+    let plan = p.run(&["--json", "plan"]);
+    let up = p.run(&["--json", "up"]);
+    assert_ne!(plan.code, 0, "plan passed what up refuses");
+    assert_eq!(up.json()["code"], "foreign_key_violation");
+    assert_eq!(
+        plan.json()["code"],
+        up.json()["code"],
+        "plan refused differently from up"
+    );
+}
