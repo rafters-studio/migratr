@@ -25,11 +25,13 @@ pub use executor::{
 };
 pub use ledger::record_applied;
 pub use migration::{
-    Column, ForeignKey, GeneratedColumn, IndexDef, MigrateError, Migration, Op, TableDef, load_dir,
+    Column, ForeignKey, ForeignKeyDef, GeneratedColumn, IndexColumn, IndexDef, MigrateError,
+    Migration, Op, ParentKey, TableDef, load_dir,
 };
 pub use migratr_macros::embed;
 pub use reader::{
-    SqlReader, foreign_key_violations_through, read_ledger_through, read_schema_through,
+    SqlReader, foreign_key_violations_through, missing_parents_through, read_ledger_through,
+    read_schema_through,
 };
 pub use rebuild::rebuild_tables;
 pub use scaffold::scaffold;

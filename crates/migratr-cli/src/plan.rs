@@ -1,4 +1,6 @@
-use migratr::{AtomicError, Executor, LedgerRow, Migration, SchemaSnapshot, down, up};
+use migratr::{
+    AtomicError, Executor, ForeignKeyDef, LedgerRow, Migration, SchemaSnapshot, down, up,
+};
 use rusqlite::Connection;
 use rusqlite::backup::Backup;
 use serde_json::{Value, json};
@@ -37,6 +39,10 @@ impl<E: Executor> Executor for Recorder<E> {
         tables: &[&str],
     ) -> Result<Option<Vec<(String, u64)>>, Self::Error> {
         self.inner.foreign_key_violations(tables)
+    }
+
+    fn missing_parents(&mut self, key: &ForeignKeyDef) -> Result<Option<u64>, Self::Error> {
+        self.inner.missing_parents(key)
     }
 
     fn run_atomic(

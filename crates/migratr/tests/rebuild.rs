@@ -1091,3 +1091,173 @@ fn an_index_the_migration_dropped_first_does_not_count() {
     );
     assert!(reported(REPORTED_SCHEMA, &ops).is_empty());
 }
+
+const SHOP: &str = "
+    CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, note TEXT);
+    CREATE INDEX orders_customer ON orders (customer_id);
+    INSERT INTO customers VALUES (1, 'ann'), (2, 'bob');
+    INSERT INTO orders VALUES (10, 1, 'x'), (11, 2, 'y'), (12, NULL, 'z');
+";
+
+fn add_foreign_key(table: &str, column: &str, parent: &str) -> String {
+    format!(
+        r#"{{"op": "add_foreign_key", "table": "{table}", "columns": ["{column}"],
+            "references": {{"table": "{parent}", "columns": ["id"]}}, "on_delete": "CASCADE"}}"#
+    )
+}
+
+fn table_sql(conn: &Connection, table: &str) -> String {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |r| r.get(0),
+    )
+    .expect("table sql")
+}
+
+#[test]
+fn an_added_foreign_key_is_in_the_create_statement_keeps_rows_and_indexes_and_is_enforced() {
+    let mut ex = seeded(SHOP);
+    let (_dir, migrations) = migration(&add_foreign_key("orders", "customer_id", "customers"));
+    let schema = ex.read_schema().expect("schema");
+    assert_eq!(
+        rebuild_tables(&schema, &migrations[0]).expect("tables"),
+        ["orders"]
+    );
+
+    up(&mut ex, &migrations, None).expect("up");
+
+    let conn = ex.connection();
+    assert_eq!(
+        table_sql(conn, "orders"),
+        "CREATE TABLE \"orders\" (id INTEGER PRIMARY KEY, customer_id INTEGER, note TEXT, \
+         FOREIGN KEY (\"customer_id\") REFERENCES \"customers\" (\"id\") ON DELETE CASCADE)"
+    );
+    assert_eq!(query_i64(conn, "SELECT count(*) FROM orders"), 3);
+    assert_eq!(
+        query_i64(
+            conn,
+            "SELECT count(*) FROM sqlite_master WHERE name = 'orders_customer'"
+        ),
+        1
+    );
+    assert!(
+        conn.execute("INSERT INTO orders VALUES (13, 99, 'w')", [])
+            .is_err(),
+        "a row naming a missing parent was accepted"
+    );
+}
+
+#[test]
+fn an_added_foreign_key_over_rows_naming_a_missing_parent_is_refused_with_their_count() {
+    for prior in [true, false] {
+        let mut ex = seeded(SHOP);
+        ex.connection()
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO orders VALUES (13, 99, 'w'), (14, 98, 'v');",
+            )
+            .expect("orphans");
+        ex.connection()
+            .pragma_update(None, "foreign_keys", prior)
+            .expect("set fk");
+        let before = dump(ex.connection());
+        let (_dir, migrations) = migration(&add_foreign_key("orders", "customer_id", "customers"));
+
+        let err = up(&mut ex, &migrations, None).expect_err("refused");
+
+        assert!(
+            matches!(
+                err,
+                MigrateError::ForeignKeyViolation { ref table, rows: 2 } if table == "orders"
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("orders") && err.to_string().contains('2'));
+        assert_eq!(dump(ex.connection()), before);
+    }
+}
+
+#[test]
+fn an_added_foreign_key_to_its_own_table_adds_the_self_reference_and_keeps_every_row() {
+    let mut ex = seeded(
+        "CREATE TABLE employees (id INTEGER PRIMARY KEY, reports_to INTEGER);
+         INSERT INTO employees VALUES (1, NULL), (2, 1), (3, 2);",
+    );
+    let (_dir, migrations) = migration(&add_foreign_key("employees", "reports_to", "employees"));
+
+    up(&mut ex, &migrations, None).expect("up");
+
+    let conn = ex.connection();
+    let sql = table_sql(conn, "employees");
+    assert!(
+        sql.ends_with("REFERENCES \"employees\" (\"id\") ON DELETE CASCADE)")
+            && !sql.contains("_migratr"),
+        "{sql}"
+    );
+    assert_eq!(
+        references(conn, "employees"),
+        [("employees".into(), "id".into())]
+    );
+    assert_eq!(query_i64(conn, "SELECT count(*) FROM employees"), 3);
+    assert!(
+        conn.execute("INSERT INTO employees VALUES (4, 99)", [])
+            .is_err()
+    );
+}
+
+fn drop_foreign_key(table: &str, column: &str, parent: &str) -> String {
+    format!(
+        r#"{{"op": "drop_foreign_key", "definition": {{"table": "{table}", "columns": ["{column}"],
+            "references": {{"table": "{parent}", "columns": ["id"]}}, "on_delete": "CASCADE"}}}}"#
+    )
+}
+
+#[test]
+fn a_dropped_foreign_key_goes_from_either_spelling_keeps_every_row_and_its_down_adds_it_back() {
+    for schema in [
+        "CREATE TABLE authors (id INTEGER PRIMARY KEY);
+         CREATE TABLE books (id INTEGER PRIMARY KEY,
+           author_id INTEGER NOT NULL CONSTRAINT by REFERENCES authors (id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+           title TEXT);",
+        "CREATE TABLE authors (id INTEGER PRIMARY KEY);
+         CREATE TABLE books (id INTEGER PRIMARY KEY, author_id INTEGER NOT NULL, title TEXT,
+           FOREIGN KEY (author_id) REFERENCES authors (id) ON DELETE CASCADE);",
+    ] {
+        let mut ex = seeded(&format!(
+            "{schema} INSERT INTO authors VALUES (1); INSERT INTO books VALUES (1, 1, 'x'), (2, 1, 'y');"
+        ));
+        let (_dir, migrations) = migration(&drop_foreign_key("books", "author_id", "authors"));
+
+        up(&mut ex, &migrations, None).expect("up");
+
+        let conn = ex.connection();
+        assert!(references(conn, "books").is_empty(), "{schema}");
+        let sql = table_sql(conn, "books");
+        assert!(sql.contains("author_id INTEGER NOT NULL") && !sql.contains("REFERENCES"), "{sql}");
+        assert_eq!(query_i64(conn, "SELECT count(*) FROM books"), 2);
+
+        migratr::down(&mut ex, &migrations, 1).expect("down");
+
+        let conn = ex.connection();
+        assert_eq!(references(conn, "books"), [("authors".into(), "id".into())]);
+        assert_eq!(query_i64(conn, "SELECT count(*) FROM books"), 2);
+        assert!(conn.execute("INSERT INTO books VALUES (3, 99, 'z')", []).is_err());
+    }
+}
+
+#[test]
+fn dropping_a_foreign_key_the_table_does_not_have_is_refused_and_nothing_changes() {
+    let mut ex = seeded(SHOP);
+    let before = dump(ex.connection());
+    let (_dir, migrations) = migration(&drop_foreign_key("orders", "customer_id", "customers"));
+
+    let err = up(&mut ex, &migrations, None).expect_err("refused");
+
+    assert!(
+        matches!(err, MigrateError::NoSuchForeignKey { ref table, .. } if table == "orders"),
+        "{err:?}"
+    );
+    assert_eq!(dump(ex.connection()), before);
+}

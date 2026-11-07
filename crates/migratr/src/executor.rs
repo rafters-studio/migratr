@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::migration::ForeignKeyDef;
+
 /// One row of `sqlite_master`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaObject {
@@ -105,6 +107,15 @@ pub trait Executor {
         Ok(None)
     }
 
+    /// The number of rows of `key`'s table whose key columns are all non-NULL and name no row
+    /// of its parent, as [`missing_parents_through`](crate::missing_parents_through) counts
+    /// them. `None`, the default, when the executor does not count them; the rebuild that adds
+    /// the key then refuses such rows inside its atomic run.
+    fn missing_parents(&mut self, key: &ForeignKeyDef) -> Result<Option<u64>, Self::Error> {
+        let _ = key;
+        Ok(None)
+    }
+
     /// Run all statements in one transaction; all apply or none do. A failure reports the index
     /// of the statement that failed.
     /// With `suspend_foreign_keys`, foreign_keys is turned off before the
@@ -134,8 +145,10 @@ mod rusqlite_executor {
     use serde_json::Value;
 
     use super::{AtomicError, Executor, LedgerRow, SchemaSnapshot};
+    use crate::migration::ForeignKeyDef;
     use crate::reader::{
-        SqlReader, foreign_key_violations_through, read_ledger_through, read_schema_through,
+        SqlReader, foreign_key_violations_through, missing_parents_through, read_ledger_through,
+        read_schema_through,
     };
 
     /// An [`Executor`] over a rusqlite connection.
@@ -205,6 +218,10 @@ mod rusqlite_executor {
             tables: &[&str],
         ) -> Result<Option<Vec<(String, u64)>>, Self::Error> {
             foreign_key_violations_through(&mut Reader(&self.conn), tables).map(Some)
+        }
+
+        fn missing_parents(&mut self, key: &ForeignKeyDef) -> Result<Option<u64>, Self::Error> {
+            missing_parents_through(&mut Reader(&self.conn), key).map(Some)
         }
 
         fn run_atomic(

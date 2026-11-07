@@ -430,3 +430,71 @@ fn a_reversal_that_would_rebuild_after_another_operation_refuses_before_anything
     );
     assert_eq!(dump(ex.connection()), before);
 }
+
+/// Each key of `index` as (column name or NULL for an expression, desc), from PRAGMA index_xinfo.
+fn index_keys(conn: &Connection, index: &str) -> Vec<(Option<String>, bool)> {
+    conn.prepare(&format!(
+        "SELECT name, \"desc\" FROM pragma_index_xinfo('{index}') WHERE key = 1 ORDER BY seqno"
+    ))
+    .expect("prepare")
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+    .expect("query")
+    .collect::<Result<_, _>>()
+    .expect("keys")
+}
+
+#[test]
+fn partial_expression_and_desc_indexes_are_made_and_each_down_drops_it() {
+    let dir = TempDir::new().expect("tempdir");
+    write(dir.path(), "20260101000001_users.json", CREATE_USERS);
+    write(
+        dir.path(),
+        "20260101000002_indexes.json",
+        r#"{"op": "create_index", "name": "users_partial", "table": "users",
+             "columns": ["email"], "where": "email IS NOT NULL"},
+           {"op": "create_index", "name": "users_lower", "table": "users", "unique": true,
+             "columns": [{"expr": "lower(email)"}]},
+           {"op": "create_index", "name": "users_desc", "table": "users",
+             "columns": [{"name": "email", "desc": true}, "id"]}"#,
+    );
+    let migrations = load(&dir);
+    let mut ex = executor();
+    up(&mut ex, &migrations, Some(20260101000001)).expect("users");
+    let before = state(ex.connection());
+
+    up(&mut ex, &migrations, None).expect("indexes");
+
+    let conn = ex.connection();
+    let partial: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'users_partial'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("partial");
+    assert!(partial.ends_with("WHERE email IS NOT NULL"), "{partial}");
+    let is_partial: i64 = conn
+        .query_row(
+            "SELECT partial FROM pragma_index_list('users') WHERE name = 'users_partial'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("index_list");
+    assert_eq!(is_partial, 1);
+    assert_eq!(index_keys(conn, "users_lower"), [(None, false)]);
+    conn.execute("INSERT INTO users (email) VALUES ('A')", [])
+        .expect("first");
+    assert!(
+        conn.execute("INSERT INTO users (email) VALUES ('a')", [])
+            .is_err(),
+        "the expression index is not enforced"
+    );
+    conn.execute("DELETE FROM users", []).expect("clear");
+    assert_eq!(
+        index_keys(conn, "users_desc"),
+        [(Some("email".into()), true), (Some("id".into()), false)]
+    );
+
+    down(&mut ex, &migrations, 1).expect("down");
+    assert_eq!(state(ex.connection()), before);
+}

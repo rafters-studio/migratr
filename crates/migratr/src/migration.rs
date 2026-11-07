@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub use crate::format::{
-    Column, ForeignKey, GeneratedColumn, IndexDef, Migration, Op, TableDef, split_file_name,
+    Column, ForeignKey, ForeignKeyDef, GeneratedColumn, IndexColumn, IndexDef, Migration, Op,
+    ParentKey, TableDef, split_file_name,
 };
 use crate::format::{FormatError, parse_all};
 
@@ -54,6 +55,13 @@ pub enum MigrateError {
 
     #[error("table {table}: found {rows} rows violating foreign keys")]
     ForeignKeyViolation { table: String, rows: u64 },
+
+    #[error("table {table} has no foreign key ({}) referencing {parent}", columns.join(", "))]
+    NoSuchForeignKey {
+        table: String,
+        columns: Vec<String>,
+        parent: String,
+    },
 
     #[error("cannot drop column {column} from table {table}: {object} uses it")]
     ColumnInUse {
@@ -289,6 +297,92 @@ mod tests {
 
         let changed = ALL_OPS.replace("SELECT 3", "SELECT 4");
         assert_ne!(a.checksum, parse(FILE, &changed).expect("parse").checksum);
+    }
+
+    #[test]
+    fn foreign_key_operations_and_index_keys_parse() {
+        let m = parse(
+            FILE,
+            r#"{"up": [
+              {"op": "add_foreign_key", "table": "orders", "columns": ["customer_id"],
+               "references": {"table": "customers", "columns": ["id"]}, "on_delete": "CASCADE"},
+              {"op": "drop_foreign_key", "definition": {"table": "orders", "columns": ["customer_id"],
+               "references": {"table": "customers", "columns": ["id"]}, "on_update": "RESTRICT"}},
+              {"op": "create_index", "name": "i", "table": "t", "where": "a > 0",
+               "columns": ["a", {"name": "b", "desc": true}, {"expr": "lower(c)"}]}
+            ]}"#,
+        )
+        .expect("parse");
+        assert!(
+            matches!(&m.up[0], Op::AddForeignKey(k) if k.on_delete.as_deref() == Some("CASCADE"))
+        );
+        assert!(
+            matches!(&m.up[1], Op::DropForeignKey { definition } if definition.on_delete.is_none())
+        );
+        let Op::CreateIndex {
+            columns,
+            where_clause,
+            ..
+        } = &m.up[2]
+        else {
+            panic!("expected create_index");
+        };
+        assert_eq!(where_clause.as_deref(), Some("a > 0"));
+        assert_eq!(
+            columns,
+            &[
+                IndexColumn::Name("a".into()),
+                IndexColumn::Column {
+                    name: "b".into(),
+                    desc: true
+                },
+                IndexColumn::Expr {
+                    expr: "lower(c)".into(),
+                    desc: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_malformed_index_key_or_foreign_key_is_refused_at_its_path() {
+        for (contents, expected_path, expected_text) in [
+            (
+                r#"{"up": [{"op": "create_index", "name": "i", "table": "t",
+                    "columns": [{"name": "a", "bogus": 1}]}]}"#,
+                "up[0].columns[0].bogus",
+                "bogus",
+            ),
+            (
+                r#"{"up": [{"op": "create_index", "name": "i", "table": "t",
+                    "columns": [{"name": "a", "expr": "b"}]}]}"#,
+                "up[0].columns[0]",
+                "exactly one",
+            ),
+            (
+                r#"{"up": [{"op": "add_foreign_key", "table": "t", "columns": ["a"],
+                    "references": {"table": "p", "columns": ["id"], "bogus": 1}}]}"#,
+                "up[0].references.bogus",
+                "bogus",
+            ),
+        ] {
+            let (path, message) = parse_err(contents);
+            assert_eq!(path, expected_path, "{message}");
+            assert!(
+                message.contains(expected_text) || path.contains(expected_text),
+                "{message}"
+            );
+        }
+    }
+
+    /// Files written before an operation gained a field keep the checksum they were applied
+    /// with.
+    #[test]
+    fn checksums_of_existing_files_do_not_change() {
+        assert_eq!(
+            parse(FILE, ALL_OPS).expect("parse").checksum,
+            "ef66b78261181b6018c75e645851b5057791ff7b5d4268c4b8da36e6015587d0"
+        );
     }
 
     #[test]

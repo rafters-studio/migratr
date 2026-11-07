@@ -1,6 +1,6 @@
 use crate::executor::Executor;
 use crate::ledger;
-use crate::migration::{Column, MigrateError, Migration, Op};
+use crate::migration::{Column, ForeignKeyDef, IndexColumn, MigrateError, Migration, Op};
 use crate::rebuild::{TableChange, add_needs_rebuild, family, op_rebuild, rebuild_statements};
 use crate::snapshot::{Direction, snapshot_before};
 use crate::sql_ddl::quote_ident as ident;
@@ -58,7 +58,7 @@ pub(crate) fn apply(
     record: String,
 ) -> Result<(), MigrateError> {
     let schema = if ops.iter().any(|op| match op {
-        Op::DropColumn { .. } => true,
+        Op::DropColumn { .. } | Op::AddForeignKey(_) | Op::DropForeignKey { .. } => true,
         Op::AddColumn { column, .. } => add_needs_rebuild(column),
         _ => false,
     }) {
@@ -78,26 +78,19 @@ pub(crate) fn apply(
             Some(schema) => op_rebuild(schema, ops, i)?,
             None => None,
         };
-        if let (Some(schema), Some((table, column))) = (&schema, rebuild) {
+        if let (Some(schema), Some((table, column)), Some(change)) =
+            (&schema, rebuild, table_change(op))
+        {
             // The rebuild works from the schema read before the migration, which is
             // current only for the first operation.
             if i > 0 {
                 return Err(MigrateError::RebuildNotFirst {
                     version,
                     table: table.clone(),
-                    column: column.name.clone(),
+                    column,
                     operation: i,
                 });
             }
-            let change = if matches!(op, Op::DropColumn { .. }) {
-                TableChange::DropColumn {
-                    column: column.name.clone(),
-                }
-            } else {
-                TableChange::AddColumn {
-                    definition: rebuilt_column_def(column),
-                }
-            };
             rebuilt = family(schema, table);
             body.extend(
                 rebuild_statements(schema, table, &change)?
@@ -120,6 +113,21 @@ pub(crate) fn apply(
             return Err(MigrateError::ForeignKeyViolation { table, rows });
         }
     }
+    // An added foreign key's own rows are its check: rows naming a missing parent are counted
+    // before any change.
+    for op in ops {
+        if let Op::AddForeignKey(key) = op {
+            let missing = exec
+                .missing_parents(key)
+                .map_err(|e| MigrateError::Executor(Box::new(e)))?;
+            if let Some(rows) = missing.filter(|rows| *rows > 0) {
+                return Err(MigrateError::ForeignKeyViolation {
+                    table: key.table.clone(),
+                    rows,
+                });
+            }
+        }
+    }
 
     let mut statements = prelude.to_vec();
     let mut origins: Vec<Option<usize>> = vec![None; prelude.len()];
@@ -140,6 +148,75 @@ pub(crate) fn apply(
                 .and_then(|i| origins.get(i).copied().flatten()),
             source: Box::new(failure.source),
         })
+}
+
+/// The change a rebuild makes for `op`, for an operation a rebuild can make.
+fn table_change(op: &Op) -> Option<TableChange> {
+    Some(match op {
+        Op::DropColumn { column, .. } => TableChange::DropColumn {
+            column: column.name.clone(),
+        },
+        Op::AddColumn { column, .. } => TableChange::AddColumn {
+            definition: rebuilt_column_def(column),
+        },
+        Op::AddForeignKey(key) => TableChange::AddConstraint {
+            definition: foreign_key_item(key),
+        },
+        Op::DropForeignKey { definition } => TableChange::DropForeignKey {
+            columns: definition.columns.clone(),
+            parent: definition.references.table.clone(),
+        },
+        _ => return None,
+    })
+}
+
+/// The table-level `FOREIGN KEY` item for `key`.
+fn foreign_key_item(key: &ForeignKeyDef) -> String {
+    let mut sql = format!(
+        "FOREIGN KEY ({}) REFERENCES {} ({})",
+        ident_list(key.columns.iter().map(String::as_str)),
+        ident(&key.references.table),
+        ident_list(key.references.columns.iter().map(String::as_str)),
+    );
+    if let Some(action) = &key.on_delete {
+        sql.push_str(&format!(" ON DELETE {action}"));
+    }
+    if let Some(action) = &key.on_update {
+        sql.push_str(&format!(" ON UPDATE {action}"));
+    }
+    sql
+}
+
+/// The CREATE INDEX statement for an index, partial clause included.
+pub(crate) fn create_index(
+    name: &str,
+    table: &str,
+    columns: &[IndexColumn],
+    unique: bool,
+    where_clause: Option<&str>,
+) -> String {
+    let keys: Vec<String> = columns
+        .iter()
+        .map(|column| {
+            let (key, desc) = match column {
+                IndexColumn::Name(name) => (ident(name), false),
+                IndexColumn::Column { name, desc } => (ident(name), *desc),
+                IndexColumn::Expr { expr, desc } => (expr.clone(), *desc),
+            };
+            if desc { format!("{key} DESC") } else { key }
+        })
+        .collect();
+    let mut sql = format!(
+        "CREATE {}INDEX {} ON {} ({})",
+        if unique { "UNIQUE " } else { "" },
+        ident(name),
+        ident(table),
+        keys.join(", "),
+    );
+    if let Some(clause) = where_clause {
+        sql.push_str(&format!(" WHERE {clause}"));
+    }
+    sql
 }
 
 /// The SQL statement for one operation.
@@ -177,14 +254,12 @@ fn render(op: &Op) -> String {
             table,
             columns,
             unique,
-        } => format!(
-            "CREATE {}INDEX {} ON {} ({})",
-            if *unique { "UNIQUE " } else { "" },
-            ident(name),
-            ident(table),
-            ident_list(columns.iter().map(String::as_str)),
-        ),
+            where_clause,
+        } => create_index(name, table, columns, *unique, where_clause.as_deref()),
         Op::DropIndex { definition } => format!("DROP INDEX {}", ident(&definition.name)),
+        Op::AddForeignKey(_) | Op::DropForeignKey { .. } => {
+            unreachable!("a foreign key is added or dropped only by the rebuild")
+        }
         Op::RawSql { up, .. } => up.clone(),
     }
 }
