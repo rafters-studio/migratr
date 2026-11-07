@@ -197,6 +197,10 @@ fn inverse(op: &Op) -> Option<Op> {
             definition: key.clone(),
         },
         Op::DropForeignKey { definition } => Op::AddForeignKey(definition.clone()),
+        Op::CreateTrigger(trigger) => Op::DropTrigger {
+            definition: trigger.clone(),
+        },
+        Op::DropTrigger { definition } => Op::CreateTrigger(definition.clone()),
         Op::RawSql { down, .. } => Op::RawSql {
             up: down.clone()?,
             down: None,

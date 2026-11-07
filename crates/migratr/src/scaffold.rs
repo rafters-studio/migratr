@@ -10,7 +10,7 @@ use serde_json::{Map, Value, json};
 
 use crate::migration::{
     Column, ForeignKey, GeneratedColumn, IndexColumn, IndexDef, MigrateError, Op, TableDef,
-    split_file_name,
+    TriggerDef, split_file_name,
 };
 use crate::schema_file::{self, SchemaFile, SchemaFileObject};
 use crate::sql_ddl::{Token, TokenKind, has_keyword, table_body, tokens};
@@ -19,7 +19,7 @@ use crate::sql_ddl::{Token, TokenKind, has_keyword, table_body, tokens};
 ///
 /// The name picks the operation: `create_<table>` and `add_<column>_to_<table>` build columns
 /// from `specs` (`name[:type][:modifier...]`, with modifiers `pk`, `notnull`, `unique` and
-/// `default=<expr>`); `drop_<table or index>` and `remove_<column>_from_<table>` copy the
+/// `default=<expr>`); `drop_<table, index or trigger>` and `remove_<column>_from_<table>` copy the
 /// dropped object's definition from `dir`'s schema.json. Any other name gets an empty `up`.
 pub fn scaffold(dir: &Path, name: &str, specs: &[String]) -> Result<PathBuf, MigrateError> {
     let ops = operations(dir, name, specs)?;
@@ -81,6 +81,8 @@ fn operations(dir: &Path, name: &str, specs: &[String]) -> Result<Vec<Op>, Migra
             table: table.to_string(),
             columns,
             without_rowid: false,
+            checks: Vec::new(),
+            unique: Vec::new(),
         }]);
     }
 
@@ -147,9 +149,20 @@ fn operations(dir: &Path, name: &str, specs: &[String]) -> Result<Vec<Op>, Migra
             },
         }]);
     }
-    let object = find(&schema, "index", target).ok_or_else(|| unknown("table or index", target))?;
-    let definition = index_def(object).ok_or_else(|| unreadable(object))?;
-    Ok(vec![Op::DropIndex { definition }])
+    if let Some(object) = find(&schema, "index", target) {
+        let definition = index_def(object).ok_or_else(|| unreadable(object))?;
+        return Ok(vec![Op::DropIndex { definition }]);
+    }
+    let object = find(&schema, "trigger", target)
+        .ok_or_else(|| unknown("table, index or trigger", target))?;
+    let (table, _) = on_table(&tokens(&object.sql)).ok_or_else(|| unreadable(object))?;
+    Ok(vec![Op::DropTrigger {
+        definition: TriggerDef {
+            name: object.name.clone(),
+            table,
+            sql: object.sql.clone(),
+        },
+    }])
 }
 
 fn find<'a>(schema: &'a SchemaFile, kind: &str, name: &str) -> Option<&'a SchemaFileObject> {
@@ -553,18 +566,22 @@ fn default_value(item: &str, toks: &[Token], at: usize) -> Option<(String, usize
     Some((item[start..end].to_string(), next))
 }
 
+/// The table named after the first `ON` of a stored CREATE INDEX or CREATE TRIGGER, without
+/// its schema, and the index of its token.
+fn on_table(toks: &[Token]) -> Option<(String, usize)> {
+    let mut at = toks.iter().position(|t| t.is_keyword("ON"))? + 1;
+    if toks.get(at + 1).is_some_and(|t| t.text == ".") {
+        at += 2;
+    }
+    Some((toks.get(at)?.text.clone(), at))
+}
+
 /// An index's definition from its stored CREATE INDEX. `None` when a key is anything but a
 /// plain column name, since the definition holds column names only.
 fn index_def(object: &SchemaFileObject) -> Option<IndexDef> {
     let sql = object.sql.as_str();
     let toks = tokens(sql);
-    let on = toks.iter().position(|t| t.is_keyword("ON"))?;
-    let mut at = on + 1;
-    let mut table = toks.get(at)?.text.clone();
-    if toks.get(at + 1).is_some_and(|t| t.text == ".") {
-        at += 2;
-        table = toks.get(at)?.text.clone();
-    }
+    let (table, at) = on_table(&toks)?;
     let (inner, next) = group(&toks, at + 1, sql)?;
     let columns = sql[inner]
         .split(',')

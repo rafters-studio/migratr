@@ -73,7 +73,11 @@ pub(crate) fn is_destructive(ops: &[Op]) -> bool {
     ops.iter().any(|op| {
         matches!(
             op,
-            Op::DropTable { .. } | Op::DropColumn { .. } | Op::DropIndex { .. } | Op::RawSql { .. }
+            Op::DropTable { .. }
+                | Op::DropColumn { .. }
+                | Op::DropIndex { .. }
+                | Op::DropTrigger { .. }
+                | Op::RawSql { .. }
         )
     })
 }

@@ -344,3 +344,48 @@ fn failure_at_every_statement_position_leaves_the_database_untouched() {
         assert!(ex.inner.read_ledger().expect("ledger").is_empty());
     }
 }
+
+#[test]
+fn a_create_table_with_checks_and_unique_writes_and_enforces_each() {
+    let dir = TempDir::new().expect("tempdir");
+    write(
+        dir.path(),
+        "20260101000001_seats.json",
+        r#"{"op": "create_table", "table": "seats", "columns": [
+            {"name": "id", "type": "INTEGER", "primary_key": 1},
+            {"name": "row", "type": "TEXT"},
+            {"name": "num", "type": "INTEGER"}],
+           "checks": ["num > 0", "length(row) = 1"], "unique": [["row", "num"]]}"#,
+    );
+    let mut ex = executor();
+    up(&mut ex, &load_dir(dir.path()).expect("load"), None).expect("up");
+
+    let conn = ex.connection();
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'seats'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("sql");
+    assert_eq!(
+        sql,
+        "CREATE TABLE \"seats\" (\"id\" INTEGER, \"row\" TEXT, \"num\" INTEGER, \
+         PRIMARY KEY (\"id\"), CHECK (num > 0), CHECK (length(row) = 1), UNIQUE (\"row\", \"num\"))"
+    );
+    conn.execute("INSERT INTO seats (row, num) VALUES ('A', 1)", [])
+        .expect("a valid row");
+    for (row, why) in [
+        ("('A', 0)", "a row breaking the first check"),
+        ("('AB', 2)", "a row breaking the second check"),
+        ("('A', 1)", "a row repeating the unique pair"),
+    ] {
+        let err = conn
+            .execute(&format!("INSERT INTO seats (row, num) VALUES {row}"), [])
+            .expect_err(why);
+        assert!(
+            err.to_string().contains("constraint failed"),
+            "{why}: {err}"
+        );
+    }
+}

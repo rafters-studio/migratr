@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::Path;
 
-use migratr::{Executor, RusqliteExecutor, down, load_dir, scaffold, up, write_schema};
+use migratr::{
+    Executor, Op, RusqliteExecutor, TriggerDef, down, load_dir, scaffold, up, write_schema,
+};
 use rusqlite::Connection;
 use tempfile::TempDir;
 
@@ -110,4 +112,58 @@ fn a_drop_scaffolded_from_schema_json_reverses_with_the_table_intact() {
     let restored = schema_json(dir.path());
     assert!(restored.contains("email"));
     assert!(restored.contains("NOCASE"));
+}
+
+#[test]
+fn schema_json_records_checks_unique_and_triggers_and_a_dropped_trigger_scaffolds_its_definition() {
+    const TRIGGER: &str =
+        "CREATE TRIGGER seats_log AFTER INSERT ON seats BEGIN INSERT INTO log VALUES (new.id); END";
+    let dir = TempDir::new().expect("tempdir");
+    write_migration(
+        dir.path(),
+        "20200101000000_seats.json",
+        &format!(
+            r#"{{"op": "create_table", "table": "seats", "columns": [
+                {{"name": "id", "type": "INTEGER", "primary_key": 1}},
+                {{"name": "num", "type": "INTEGER"}}],
+               "checks": ["num > 0"], "unique": [["id", "num"]]}},
+               {{"op": "create_table", "table": "log", "columns": [{{"name": "seat", "type": "INTEGER"}}]}},
+               {{"op": "create_trigger", "name": "seats_log", "table": "seats", "sql": "{TRIGGER}"}}"#
+        ),
+    );
+    let mut ex = executor();
+    migrate_up(&mut ex, dir.path());
+
+    let file: serde_json::Value = serde_json::from_str(&schema_json(dir.path())).expect("json");
+    let objects = file["objects"].as_array().expect("objects");
+    let sql_of = |kind: &str, name: &str| {
+        objects
+            .iter()
+            .find(|o| o["type"] == kind && o["name"] == name)
+            .and_then(|o| o["sql"].as_str())
+            .map(str::to_string)
+    };
+    let table = sql_of("table", "seats").expect("seats in schema.json");
+    assert!(
+        table.contains("CHECK (num > 0)") && table.contains("UNIQUE (\"id\", \"num\")"),
+        "{table}"
+    );
+    assert_eq!(sql_of("trigger", "seats_log").as_deref(), Some(TRIGGER));
+
+    scaffold(dir.path(), "drop_seats_log", &[]).expect("scaffold drop");
+    let migrations = load_dir(dir.path()).expect("load");
+    assert_eq!(
+        migrations[1].up,
+        [Op::DropTrigger {
+            definition: TriggerDef {
+                name: "seats_log".into(),
+                table: "seats".into(),
+                sql: TRIGGER.into(),
+            }
+        }]
+    );
+    up(&mut ex, &migrations, None).expect("drop the trigger");
+    down(&mut ex, &migrations, 1).expect("make it again");
+    write_schema(&mut ex, dir.path()).expect("write");
+    assert!(schema_json(dir.path()).contains(TRIGGER));
 }
