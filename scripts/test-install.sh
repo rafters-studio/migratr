@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALLER="${ROOT}/install.sh"
 PIN="v0.1.1"
-WORK="$(mktemp -d)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX")"
 trap 'rm -rf "${WORK}"' EXIT
 
 fails=0
