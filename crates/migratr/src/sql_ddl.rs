@@ -271,6 +271,27 @@ pub(crate) fn has_keyword(sql: &str, keyword: &str) -> bool {
     tokens(sql).iter().any(|t| t.is_keyword(keyword))
 }
 
+/// `sql` with each table a `REFERENCES` clause names that is the first of a pair in `renames`
+/// naming the pair's second instead.
+pub(crate) fn rename_references(sql: &str, renames: &[(&str, &str)]) -> String {
+    let toks = tokens(sql);
+    let mut out = String::with_capacity(sql.len());
+    let mut at = 0;
+    for pair in toks.windows(2) {
+        let (keyword, name) = (&pair[0], &pair[1]);
+        if !keyword.is_keyword("REFERENCES") {
+            continue;
+        }
+        if let Some((_, to)) = renames.iter().find(|(from, _)| name.names(from)) {
+            out.push_str(&sql[at..name.span.start]);
+            out.push_str(&quote_ident(to));
+            at = name.span.end;
+        }
+    }
+    out.push_str(&sql[at..]);
+    out
+}
+
 /// The byte range of the table name in a `CREATE [TEMP] TABLE [IF NOT EXISTS] [schema.]name`
 /// statement, including any `schema.` qualifier and quoting.
 pub(crate) fn create_table_name_span(create_sql: &str) -> Option<Range<usize>> {

@@ -28,7 +28,9 @@ pub use migration::{
     Column, ForeignKey, GeneratedColumn, IndexDef, MigrateError, Migration, Op, TableDef, load_dir,
 };
 pub use migratr_macros::embed;
-pub use reader::{SqlReader, read_ledger_through, read_schema_through};
+pub use reader::{
+    SqlReader, foreign_key_violations_through, read_ledger_through, read_schema_through,
+};
 pub use rebuild::rebuild_tables;
 pub use scaffold::scaffold;
 pub use schema_file::write_schema;

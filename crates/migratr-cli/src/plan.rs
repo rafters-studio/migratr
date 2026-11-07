@@ -32,6 +32,13 @@ impl<E: Executor> Executor for Recorder<E> {
         self.inner.read_ledger()
     }
 
+    fn foreign_key_violations(
+        &mut self,
+        tables: &[&str],
+    ) -> Result<Option<Vec<(String, u64)>>, Self::Error> {
+        self.inner.foreign_key_violations(tables)
+    }
+
     fn run_atomic(
         &mut self,
         statements: &[String],
