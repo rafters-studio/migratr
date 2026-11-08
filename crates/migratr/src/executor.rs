@@ -40,6 +40,12 @@ pub struct LedgerRow {
     pub version: u64,
     pub name: String,
     pub checksum: String,
+    /// The hash of the statements the migration ran, `None` for a row written before the
+    /// ledger held it or by `record_applied`.
+    pub up_hash: Option<String>,
+    /// The hash of the statements that revert the migration, `None` when it is irreversible or
+    /// the row has no hashes.
+    pub down_hash: Option<String>,
 }
 
 /// One row of `PRAGMA table_xinfo`.
@@ -374,12 +380,16 @@ mod rusqlite_executor {
                     LedgerRow {
                         version: 1,
                         name: "a".into(),
-                        checksum: "ca".into()
+                        checksum: "ca".into(),
+                        up_hash: None,
+                        down_hash: None,
                     },
                     LedgerRow {
                         version: 2,
                         name: "b".into(),
-                        checksum: "cb".into()
+                        checksum: "cb".into(),
+                        up_hash: None,
+                        down_hash: None,
                     },
                 ]
             );

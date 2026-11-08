@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 struct Project {
@@ -202,6 +203,85 @@ fn plan_prints_the_sql_up_runs_and_changes_nothing() {
         schema.contains(&stored),
         "up stored different SQL than plan printed:\n{create}\n{schema}"
     );
+}
+
+/// The SHA-256 of a plan step's statements without the ledger's own, joined with a newline.
+fn operations_hash(step: &Value) -> String {
+    let operations: Vec<&str> = step["statements"]
+        .as_array()
+        .expect("statements")
+        .iter()
+        .map(|s| s.as_str().expect("statement"))
+        .filter(|s| !s.contains("_migratr_migrations"))
+        .collect();
+    format!("{:x}", Sha256::digest(operations.join("\n")))
+}
+
+#[test]
+fn up_records_the_hash_of_the_statements_plan_printed() {
+    let p = Project::new();
+    p.new_migration(&["create_users", "id:integer:pk"]);
+    p.new_migration(&["add_email_to_users", "email:text"]);
+
+    let plan = p.run(&["--json", "plan"]).json();
+    assert_eq!(p.run(&["up"]).code, 0);
+
+    let conn = rusqlite::Connection::open(p.db()).expect("open");
+    let steps = plan["steps"].as_array().expect("steps");
+    assert_eq!(steps.len(), 2);
+    for step in steps {
+        let version = step["version"].as_i64().expect("version");
+        let recorded: String = conn
+            .query_row(
+                "SELECT up_hash FROM _migratr_migrations WHERE version = ?1",
+                [version],
+                |row| row.get(0),
+            )
+            .expect("up_hash");
+        assert_eq!(recorded, operations_hash(step), "{step}");
+    }
+}
+
+#[test]
+fn up_records_the_hash_of_the_rebuild_plan_down_prints_right_after() {
+    let p = Project::new();
+    let column = |name: &str| format!(r#"{{"name": "{name}", "type": "INTEGER"}}"#);
+    fs::write(
+        p.dir().join("20260101000001_tables.json"),
+        format!(
+            r#"{{"up": [
+              {{"op": "create_table", "table": "orgs", "columns": [{{"name": "id", "type": "INTEGER", "primary_key": 1}}]}},
+              {{"op": "create_table", "table": "users", "columns": [{{"name": "id", "type": "INTEGER", "primary_key": 1}}, {}]}}
+            ]}}"#,
+            column("org_id")
+        ),
+    )
+    .expect("write tables");
+    fs::write(
+        p.dir().join("20260101000002_users_org.json"),
+        r#"{"up": [{"op": "add_foreign_key", "table": "users", "columns": ["org_id"],
+            "references": {"table": "orgs", "columns": ["id"]}}]}"#,
+    )
+    .expect("write foreign key");
+
+    assert_eq!(p.run(&["up"]).code, 0);
+    let plan = p.run(&["--json", "plan", "down"]).json();
+    let step = &plan["steps"][0];
+    assert_eq!(step["version"], 20_260_101_000_002_u64);
+    assert!(
+        step["statements"].as_array().is_some_and(|s| s.len() > 2),
+        "{step}"
+    );
+
+    let conn = rusqlite::Connection::open(p.db()).expect("open");
+    let recorded: String = conn
+        .query_row(
+            "SELECT down_hash FROM _migratr_migrations WHERE version = 20260101000002",
+            [],
+            |row| row.get(0),
+        )
+        .expect("down_hash");
+    assert_eq!(recorded, operations_hash(step));
 }
 
 #[test]

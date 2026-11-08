@@ -10,9 +10,11 @@ use crate::migration::ForeignKeyDef;
 use crate::sql_ddl::quote_literal;
 
 const OBJECTS: &str = "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY rowid";
-const LEDGER_EXISTS: &str =
-    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_migratr_migrations'";
+const LEDGER_SQL: &str =
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '_migratr_migrations'";
 const LEDGER: &str = "SELECT version, name, checksum FROM _migratr_migrations ORDER BY version";
+const LEDGER_WITH_HASHES: &str = "SELECT version, name, checksum, up_hash, down_hash \
+    FROM _migratr_migrations ORDER BY version";
 
 /// What can run a statement and answer with its rows, each value as JSON.
 pub trait SqlReader {
@@ -177,16 +179,27 @@ pub fn missing_parents_through<R: SqlReader>(
 
 /// Every row of the ledger, ordered by version. Empty when the ledger table does not exist.
 pub fn read_ledger_through<R: SqlReader>(reader: &mut R) -> Result<Vec<LedgerRow>, R::Error> {
-    if reader.rows(LEDGER_EXISTS)?.is_empty() {
+    let Some(definition) = reader.rows(LEDGER_SQL)?.into_iter().next() else {
         return Ok(Vec::new());
-    }
+    };
+    // A ledger written before the hash columns is read without them.
+    let hashes = maybe_text(reader, &definition, 0)?.is_some_and(|sql| sql.contains("up_hash"));
     let mut ledger = Vec::new();
-    for row in reader.rows(LEDGER)? {
+    for row in reader.rows(if hashes { LEDGER_WITH_HASHES } else { LEDGER })? {
+        let hash = |at| {
+            if hashes {
+                maybe_text(reader, &row, at)
+            } else {
+                Ok(None)
+            }
+        };
         ledger.push(LedgerRow {
             version: u64::try_from(number(reader, &row, 0)?)
                 .map_err(|_| reader.malformed("a negative ledger version"))?,
             name: text(reader, &row, 1)?,
             checksum: text(reader, &row, 2)?,
+            up_hash: hash(3)?,
+            down_hash: hash(4)?,
         });
     }
     Ok(ledger)

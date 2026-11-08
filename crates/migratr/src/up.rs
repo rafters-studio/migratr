@@ -1,4 +1,4 @@
-use crate::executor::Executor;
+use crate::executor::{Executor, SchemaSnapshot};
 use crate::ledger;
 use crate::migration::{Check, Column, ForeignKeyDef, IndexColumn, MigrateError, Migration, Op};
 use crate::rebuild::{TableChange, add_needs_rebuild, family, op_rebuild, rebuild_statements};
@@ -32,19 +32,152 @@ pub fn up(
         .collect();
     pending.sort_by_key(|m| m.version);
 
+    let schema = exec
+        .read_schema()
+        .map_err(|e| MigrateError::Executor(Box::new(e)))?;
+    let hashes = rehearse(&schema, &pending, migrations);
+    let mut upgrade = ledger::upgrade(&schema);
+    if pending.is_empty() {
+        ledger::run_upgrade(exec, &upgrade)?;
+    }
+
     let mut applied = Vec::with_capacity(pending.len());
-    for migration in pending {
+    for (migration, hashes) in pending.into_iter().zip(hashes) {
+        let mut prelude = vec![ledger::CREATE_LEDGER.to_string()];
+        prelude.append(&mut upgrade);
         apply(
             exec,
             migration.version,
             Direction::Up,
             &migration.up,
-            &[ledger::CREATE_LEDGER.to_string()],
-            ledger::insert_row(migration),
+            &prelude,
+            ledger::insert_row(migration, &hashes),
         )?;
         applied.push(migration.version);
     }
     Ok(UpReport { applied })
+}
+
+/// Each of `pending`'s hashes, worked out the way `migratr plan` works out statements: on an
+/// in-memory copy of `schema`, each migration's up in turn, then the down that reverts it.
+/// Unknown hashes are `None`: all of them when the copy cannot be made, and those from a
+/// migration whose up fails on the copy onward.
+#[cfg(feature = "rusqlite")]
+fn rehearse(
+    schema: &SchemaSnapshot,
+    pending: &[&Migration],
+    migrations: &[Migration],
+) -> Vec<ledger::Hashes> {
+    let mut hashes = Vec::with_capacity(pending.len());
+    if pending.is_empty() {
+        return hashes;
+    }
+    if let Some(copy) = schema_copy(schema) {
+        let mut copy = Capture {
+            inner: crate::executor::RusqliteExecutor::new(copy),
+            run: true,
+            last: Vec::new(),
+        };
+        for migration in pending {
+            copy.run = true;
+            // The copy starts without a ledger, so the up's only ledger statements are the
+            // CREATE before its operations and the INSERT after them.
+            let up_ran = apply(
+                &mut copy,
+                migration.version,
+                Direction::Up,
+                &migration.up,
+                &[ledger::CREATE_LEDGER.to_string()],
+                ledger::insert_row(migration, &ledger::Hashes::default()),
+            );
+            if up_ran.is_err() {
+                break;
+            }
+            let up = copy
+                .last
+                .get(1..copy.last.len().saturating_sub(1))
+                .map(ledger::hash);
+            copy.run = false;
+            // The down's only ledger statement is the DELETE after its operations.
+            let down = crate::down::down(&mut copy, migrations, 1)
+                .ok()
+                .and_then(|_| copy.last.split_last().map(|(_, ops)| ledger::hash(ops)));
+            hashes.push(ledger::Hashes { up, down });
+        }
+    }
+    hashes.resize(pending.len(), ledger::Hashes::default());
+    hashes
+}
+
+/// Without rusqlite there is no in-memory copy, so no hash is known.
+#[cfg(not(feature = "rusqlite"))]
+fn rehearse(
+    _schema: &SchemaSnapshot,
+    pending: &[&Migration],
+    _migrations: &[Migration],
+) -> Vec<ledger::Hashes> {
+    vec![ledger::Hashes::default(); pending.len()]
+}
+
+/// An in-memory database holding `schema`'s objects, without the ledger or SQLite's own. An
+/// object the copy already holds, such as a virtual table's shadow table, is left as made.
+#[cfg(feature = "rusqlite")]
+fn schema_copy(schema: &SchemaSnapshot) -> Option<rusqlite::Connection> {
+    let copy = rusqlite::Connection::open_in_memory().ok()?;
+    for object in &schema.objects {
+        if object.tbl_name == "_migratr_migrations" || object.name.starts_with("sqlite_") {
+            continue;
+        }
+        let made = copy
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = ?1",
+                [&object.name],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()?;
+        if let (0, Some(sql)) = (made, &object.sql) {
+            copy.execute_batch(sql).ok()?;
+        }
+    }
+    Some(copy)
+}
+
+/// An executor over the copy that keeps the statements of the last atomic run, running them
+/// only when `run` is set.
+#[cfg(feature = "rusqlite")]
+struct Capture {
+    inner: crate::executor::RusqliteExecutor,
+    run: bool,
+    last: Vec<String>,
+}
+
+#[cfg(feature = "rusqlite")]
+impl Executor for Capture {
+    type Error = rusqlite::Error;
+
+    fn read_schema(&mut self) -> Result<SchemaSnapshot, Self::Error> {
+        self.inner.read_schema()
+    }
+
+    fn read_ledger(&mut self) -> Result<Vec<crate::executor::LedgerRow>, Self::Error> {
+        self.inner.read_ledger()
+    }
+
+    fn run_atomic(
+        &mut self,
+        statements: &[String],
+        suspend_foreign_keys: bool,
+    ) -> Result<(), crate::executor::AtomicError<Self::Error>> {
+        if self.run {
+            self.inner.run_atomic(statements, suspend_foreign_keys)?;
+        }
+        self.last = statements.to_vec();
+        Ok(())
+    }
+
+    fn snapshot(&mut self, _file_name: &str) -> Result<Option<std::path::PathBuf>, Self::Error> {
+        Ok(None)
+    }
 }
 
 /// Runs `ops` for migration `version` in one atomic run: the `prelude` statements, the

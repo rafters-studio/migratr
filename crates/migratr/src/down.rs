@@ -79,13 +79,21 @@ pub fn down(
         }
     }
 
+    let schema = exec
+        .read_schema()
+        .map_err(|e| MigrateError::Executor(Box::new(e)))?;
+    let mut upgrade = ledger::upgrade(&schema);
+    if plan.is_empty() {
+        ledger::run_upgrade(exec, &upgrade)?;
+    }
+
     for (version, ops) in &plan {
         apply(
             exec,
             *version,
             Direction::Down,
             ops,
-            &[],
+            &std::mem::take(&mut upgrade),
             ledger::delete_row(*version),
         )
         .map_err(|e| in_file_order(e, ops.len()))?;

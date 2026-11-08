@@ -5,6 +5,7 @@ use migratr::{
     Executor, LedgerRow, MigrateError, RusqliteExecutor, SchemaSnapshot, UpReport, load_dir, up,
 };
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 mod common;
@@ -79,12 +80,17 @@ fn ledger_rows_carry_name_checksum_and_time() {
     let mut ex = executor();
     up(&mut ex, &migrations, None).expect("up");
 
+    let ledger = ex.read_ledger().expect("ledger");
+    let hashes = (ledger[0].up_hash.clone(), ledger[0].down_hash.clone());
+    assert!(hashes.0.is_some() && hashes.1.is_some(), "{ledger:?}");
     assert_eq!(
-        ex.read_ledger().expect("ledger"),
+        ledger,
         vec![LedgerRow {
             version: 20260101000001,
             name: "one".into(),
             checksum: migrations[0].checksum.clone(),
+            up_hash: hashes.0,
+            down_hash: hashes.1,
         }]
     );
     let applied_at: String = ex
@@ -284,16 +290,26 @@ fn failure_at_every_statement_position_leaves_the_database_untouched() {
     let statement_count = migrations[0].up.len() + 2;
 
     // The exact statement at each position: ledger create, six operations, ledger insert.
+    let operations = [
+        r#"CREATE TABLE "extra" ("id" INTEGER, PRIMARY KEY ("id"))"#,
+        r#"ALTER TABLE "base" ADD COLUMN "note" TEXT"#,
+        "UPDATE base SET v = v + 1",
+        r#"CREATE INDEX "base_v" ON "base" ("v")"#,
+        r#"ALTER TABLE "base" RENAME TO "renamed""#,
+        r#"DROP TABLE "extra""#,
+    ];
+    // The raw_sql has no down, so the migration has no down hash.
+    let up_hash = format!("{:x}", Sha256::digest(operations.join("\n")));
     let expected: [String; 8] = [
-        "CREATE TABLE IF NOT EXISTS _migratr_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL)".to_string(),
-        r#"CREATE TABLE "extra" ("id" INTEGER, PRIMARY KEY ("id"))"#.to_string(),
-        r#"ALTER TABLE "base" ADD COLUMN "note" TEXT"#.to_string(),
-        "UPDATE base SET v = v + 1".to_string(),
-        r#"CREATE INDEX "base_v" ON "base" ("v")"#.to_string(),
-        r#"ALTER TABLE "base" RENAME TO "renamed""#.to_string(),
-        r#"DROP TABLE "extra""#.to_string(),
+        "CREATE TABLE IF NOT EXISTS _migratr_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL, up_hash TEXT, down_hash TEXT)".to_string(),
+        operations[0].to_string(),
+        operations[1].to_string(),
+        operations[2].to_string(),
+        operations[3].to_string(),
+        operations[4].to_string(),
+        operations[5].to_string(),
         format!(
-            "INSERT INTO _migratr_migrations (version, name, checksum, applied_at) VALUES (20260101000001, 'multi', '{}', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            "INSERT INTO _migratr_migrations (version, name, checksum, applied_at, up_hash, down_hash) VALUES (20260101000001, 'multi', '{}', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), '{up_hash}', NULL)",
             migrations[0].checksum
         ),
     ];
