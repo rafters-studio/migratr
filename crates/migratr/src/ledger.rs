@@ -5,7 +5,7 @@ use crate::executor::{Executor, LedgerRow, SchemaSnapshot};
 use crate::migration::{MigrateError, Migration};
 use crate::sql_ddl::quote_literal;
 
-const LEDGER: &str = "_migratr_migrations";
+pub(crate) const LEDGER: &str = "_migratr_migrations";
 
 /// Creates the ledger when it is absent. Every migration's atomic run starts with it, so the
 /// table appears together with the first applied migration and rolls back with it.

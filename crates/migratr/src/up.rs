@@ -125,7 +125,7 @@ fn rehearse(
 fn schema_copy(schema: &SchemaSnapshot) -> Option<rusqlite::Connection> {
     let copy = rusqlite::Connection::open_in_memory().ok()?;
     for object in &schema.objects {
-        if object.tbl_name == "_migratr_migrations" || object.name.starts_with("sqlite_") {
+        if object.tbl_name == ledger::LEDGER || object.name.starts_with("sqlite_") {
             continue;
         }
         let made = copy
