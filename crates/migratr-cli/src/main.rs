@@ -1,18 +1,22 @@
 mod error;
 mod plan;
+mod settings;
 mod status;
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use migratr::{
-    RusqliteExecutor, down, latest_snapshot, load_dir, restore, scaffold, up, write_schema,
+    Executor, Migration, RusqliteExecutor, down, latest_snapshot, load_dir, restore, scaffold, up,
+    write_schema,
 };
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Map, Value, json};
 
 use crate::error::CliError;
+use crate::settings::{Loud, QUIET_NOTE, Settings};
 
 const COMMANDS: [&str; 6] = ["new", "up", "down", "status", "plan", "restore"];
 
@@ -30,6 +34,10 @@ struct Cli {
     /// Write one JSON document describing the outcome to stdout.
     #[arg(long, global = true)]
     json: bool,
+
+    /// The settings file to read instead of the nearest migratr.jsonc.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -137,7 +145,17 @@ fn main() -> ExitCode {
     };
 
     let name = command_name(&cli.command);
-    match run(&cli) {
+    // Settings are read before anything else, so a refused file changes nothing.
+    let settings = match settings::load(cli.config.as_deref()) {
+        Ok(settings) => settings,
+        Err(error) => return fail(&cli, name, &error),
+    };
+    if settings.loud {
+        for line in settings.describe() {
+            eprintln!("{line}");
+        }
+    }
+    let code = match run(&cli, &settings) {
         Ok(outcome) => {
             if cli.json {
                 println!("{}", ok_document(name, outcome.fields));
@@ -146,17 +164,24 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Err(error) => {
-            if cli.json {
-                println!("{}", error_document(Some(name), &error));
-            } else {
-                eprintln!("error [{}]: {error}", error.code());
-            }
-            match error {
-                CliError::Usage(_) => ExitCode::from(2),
-                _ => ExitCode::FAILURE,
-            }
-        }
+        Err(error) => fail(&cli, name, &error),
+    };
+    if settings.loud {
+        eprintln!("{QUIET_NOTE}");
+    }
+    code
+}
+
+/// Reports `error` and returns its exit code.
+fn fail(cli: &Cli, name: &str, error: &CliError) -> ExitCode {
+    if cli.json {
+        println!("{}", error_document(Some(name), error));
+    } else {
+        eprintln!("error [{}]: {error}", error.code());
+    }
+    match error {
+        CliError::Usage(_) => ExitCode::from(2),
+        _ => ExitCode::FAILURE,
     }
 }
 
@@ -190,7 +215,7 @@ fn error_document(command: Option<&str>, error: &CliError) -> Value {
     })
 }
 
-fn run(cli: &Cli) -> Result<Outcome, CliError> {
+fn run(cli: &Cli, settings: &Settings) -> Result<Outcome, CliError> {
     match &cli.command {
         Command::New { name, specs } => {
             let path = scaffold(&cli.dir, name, specs)?;
@@ -202,7 +227,17 @@ fn run(cli: &Cli) -> Result<Outcome, CliError> {
         Command::Up { to } => {
             let db = db_path(cli)?;
             let migrations = load_dir(&cli.dir)?;
-            let mut exec = RusqliteExecutor::new(Connection::open(db)?);
+            let mut exec = loud(settings, Connection::open(db)?);
+            if settings.loud {
+                let ledger = exec.read_ledger()?;
+                let mut pending: Vec<&Migration> = migrations
+                    .iter()
+                    .filter(|m| !ledger.iter().any(|r| r.version == m.version))
+                    .filter(|m| to.is_none_or(|limit| m.version <= limit))
+                    .collect();
+                pending.sort_by_key(|m| m.version);
+                exec.upcoming = pending.into_iter().map(label).collect();
+            }
             let report = up(&mut exec, &migrations, *to)?;
             write_schema(&mut exec, &cli.dir)?;
             Ok(Outcome {
@@ -217,7 +252,18 @@ fn run(cli: &Cli) -> Result<Outcome, CliError> {
         Command::Down { steps } => {
             let db = db_path(cli)?;
             let migrations = load_dir(&cli.dir)?;
-            let mut exec = RusqliteExecutor::new(Connection::open(db)?);
+            let mut exec = loud(settings, Connection::open(db)?);
+            if settings.loud {
+                let mut versions: Vec<u64> =
+                    exec.read_ledger()?.iter().map(|r| r.version).collect();
+                versions.sort_unstable_by(|a, b| b.cmp(a));
+                versions.truncate(*steps);
+                exec.upcoming = versions
+                    .iter()
+                    .filter_map(|v| migrations.iter().find(|m| m.version == *v))
+                    .map(label)
+                    .collect();
+            }
             let report = down(&mut exec, &migrations, *steps)?;
             write_schema(&mut exec, &cli.dir)?;
             let snapshot = latest_snapshot(db)?;
@@ -270,6 +316,19 @@ fn run(cli: &Cli) -> Result<Outcome, CliError> {
             })
         }
     }
+}
+
+/// An executor over `conn` that prints each migration and statement when loud is on.
+fn loud(settings: &Settings, conn: Connection) -> Loud<RusqliteExecutor> {
+    Loud {
+        inner: RusqliteExecutor::new(conn),
+        loud: settings.loud,
+        upcoming: VecDeque::new(),
+    }
+}
+
+fn label(migration: &Migration) -> String {
+    format!("{}_{}", migration.version, migration.name)
 }
 
 fn db_path(cli: &Cli) -> Result<&Path, CliError> {
