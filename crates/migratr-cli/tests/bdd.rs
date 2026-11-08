@@ -8,6 +8,7 @@ use std::process::Command;
 
 use rstest_bdd_macros::{given, scenarios, then, when};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 struct World {
@@ -23,6 +24,8 @@ struct World {
     planned: (String, Vec<String>),
     /// Every path under the root, before the step under test.
     before: Vec<PathBuf>,
+    /// The version of the migration a step made.
+    version: Option<i64>,
 }
 
 #[rstest::fixture]
@@ -38,6 +41,7 @@ fn world() -> World {
         config: None,
         planned: (String::new(), Vec::new()),
         before: Vec::new(),
+        version: None,
     }
 }
 
@@ -244,6 +248,31 @@ fn pending_without_settings(world: &mut World) {
     one_pending(world);
 }
 
+#[given("a pending migration that adds a column")]
+fn pending_add_column(world: &mut World) {
+    assert!(
+        migratr(world, &["new", "create_users", "id:integer:pk"])
+            .status
+            .success()
+    );
+    assert!(migratr(world, &["up"]).status.success());
+    let made = migratr(world, &["new", "add_email_to_users", "email:text"]);
+    assert!(made.status.success());
+    let doc: Value = serde_json::from_slice(&made.stdout).expect("new document");
+    let path = doc["path"].as_str().expect("path");
+    let file = Path::new(path)
+        .file_name()
+        .expect("file name")
+        .to_string_lossy();
+    let version = file
+        .split('_')
+        .next()
+        .expect("version")
+        .parse()
+        .expect("number");
+    world.version = Some(version);
+}
+
 #[when("the agent runs migratr up")]
 fn runs_up(world: &mut World) {
     world.before = tree(world.root.path());
@@ -323,6 +352,36 @@ fn exits_two(world: &mut World) {
 fn nothing_changed(world: &mut World) {
     assert!(!world.root.path().join("app.db").exists());
     assert_eq!(tree(world.root.path()), world.before);
+}
+
+#[then(
+    "its ledger row's down hash equals the SHA-256 of what migratr plan down printed for it right after"
+)]
+fn down_hash_matches_plan_down(world: &mut World) {
+    assert_eq!(world.exit, Some(0), "{}", world.stdout);
+    let version = world.version.expect("a migration was made");
+    let planned = migratr(world, &["plan", "down"]);
+    let doc: Value = serde_json::from_slice(&planned.stdout).expect("plan document");
+    let step = &doc["steps"][0];
+    assert_eq!(step["version"].as_i64(), Some(version), "{doc}");
+    let operations: Vec<&str> = step["statements"]
+        .as_array()
+        .expect("statements")
+        .iter()
+        .map(|s| s.as_str().expect("statement"))
+        .filter(|s| !s.contains("_migratr_migrations"))
+        .collect();
+    let printed = format!("{:x}", Sha256::digest(operations.join("\n")));
+
+    let conn = rusqlite::Connection::open(world.root.path().join("app.db")).expect("open");
+    let recorded: String = conn
+        .query_row(
+            "SELECT down_hash FROM _migratr_migrations WHERE version = ?1",
+            [version],
+            |row| row.get(0),
+        )
+        .expect("down_hash");
+    assert_eq!(recorded, printed);
 }
 
 scenarios!("tests", fixtures = [world: World]);

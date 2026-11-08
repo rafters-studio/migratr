@@ -1,6 +1,11 @@
-use crate::executor::{Executor, LedgerRow};
+#[cfg(feature = "rusqlite")]
+use sha2::{Digest, Sha256};
+
+use crate::executor::{Executor, LedgerRow, SchemaSnapshot};
 use crate::migration::{MigrateError, Migration};
 use crate::sql_ddl::quote_literal;
+
+pub(crate) const LEDGER: &str = "_migratr_migrations";
 
 /// Creates the ledger when it is absent. Every migration's atomic run starts with it, so the
 /// table appears together with the first applied migration and rolls back with it.
@@ -8,17 +13,52 @@ pub(crate) const CREATE_LEDGER: &str = "CREATE TABLE IF NOT EXISTS _migratr_migr
     version INTEGER PRIMARY KEY, \
     name TEXT NOT NULL, \
     checksum TEXT NOT NULL, \
-    applied_at TEXT NOT NULL)";
+    applied_at TEXT NOT NULL, \
+    up_hash TEXT, \
+    down_hash TEXT)";
+
+/// The hashes of the statements a migration runs up and the statements that revert it. `None`
+/// when they are not known, as for a row `record_applied` writes or an irreversible down.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Hashes {
+    pub(crate) up: Option<String>,
+    pub(crate) down: Option<String>,
+}
+
+/// SHA-256 in lowercase hex of `statements` joined with a newline, with no trailing newline.
+#[cfg(feature = "rusqlite")]
+pub(crate) fn hash(statements: &[String]) -> String {
+    format!("{:x}", Sha256::digest(statements.join("\n")))
+}
+
+/// The statements that give a ledger written before the hash columns those columns, keeping
+/// its rows; none when `schema` has no ledger or its ledger has them.
+pub(crate) fn upgrade(schema: &SchemaSnapshot) -> Vec<String> {
+    let Some(table) = schema.tables.iter().find(|t| t.name == LEDGER) else {
+        return Vec::new();
+    };
+    ["up_hash", "down_hash"]
+        .into_iter()
+        .filter(|column| !table.columns.iter().any(|c| c.name == *column))
+        .map(|column| format!("ALTER TABLE {LEDGER} ADD COLUMN {column} TEXT"))
+        .collect()
+}
+
+fn text_or_null(value: Option<&str>) -> String {
+    value.map_or_else(|| "NULL".to_string(), quote_literal)
+}
 
 /// The statement that records `migration` as applied. SQLite stamps the time, so the ledger
 /// row and the migration's statements share one transaction and one clock.
-pub(crate) fn insert_row(migration: &Migration) -> String {
+pub(crate) fn insert_row(migration: &Migration, hashes: &Hashes) -> String {
     format!(
-        "INSERT INTO _migratr_migrations (version, name, checksum, applied_at) \
-         VALUES ({}, {}, {}, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        "INSERT INTO _migratr_migrations (version, name, checksum, applied_at, up_hash, down_hash) \
+         VALUES ({}, {}, {}, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), {}, {})",
         migration.version,
         quote_literal(&migration.name),
         quote_literal(&migration.checksum),
+        text_or_null(hashes.up.as_deref()),
+        text_or_null(hashes.down.as_deref()),
     )
 }
 
@@ -29,9 +69,15 @@ pub(crate) fn delete_row(version: u64) -> String {
 
 /// Records `migration` as applied without running its operations, creating the ledger when it
 /// is absent. For a database that already has the migration's shape. The ledger and the row
-/// land in one atomic run. A version the ledger already holds is refused with `Apply`.
+/// land in one atomic run. A version the ledger already holds is refused with `Apply`. The row's
+/// hashes are NULL, since nothing ran.
 pub fn record_applied(exec: &mut impl Executor, migration: &Migration) -> Result<(), MigrateError> {
-    let statements = [CREATE_LEDGER.to_string(), insert_row(migration)];
+    let schema = exec
+        .read_schema()
+        .map_err(|e| MigrateError::Executor(Box::new(e)))?;
+    let mut statements = vec![CREATE_LEDGER.to_string()];
+    statements.extend(upgrade(&schema));
+    statements.push(insert_row(migration, &Hashes::default()));
     exec.run_atomic(&statements, false)
         .map_err(|failure| MigrateError::Apply {
             version: migration.version,
@@ -39,6 +85,18 @@ pub fn record_applied(exec: &mut impl Executor, migration: &Migration) -> Result
             operation: None,
             source: Box::new(failure.source),
         })
+}
+
+/// Runs `upgrade` on its own, for a run with no migration to carry it.
+pub(crate) fn run_upgrade(
+    exec: &mut impl Executor,
+    upgrade: &[String],
+) -> Result<(), MigrateError> {
+    if upgrade.is_empty() {
+        return Ok(());
+    }
+    exec.run_atomic(upgrade, false)
+        .map_err(|failure| MigrateError::Executor(Box::new(failure.source)))
 }
 
 /// Checks every ledger row against the migration file of the same version.
@@ -78,6 +136,8 @@ mod tests {
             version,
             name: name.into(),
             checksum: checksum.into(),
+            up_hash: None,
+            down_hash: None,
         }
     }
 
@@ -107,7 +167,20 @@ mod tests {
 
     #[test]
     fn insert_quotes_text_values() {
-        let sql = insert_row(&migration(5, "it's", "ab"));
+        let hashes = Hashes {
+            up: Some("u".into()),
+            down: None,
+        };
+        let sql = insert_row(&migration(5, "it's", "ab"), &hashes);
         assert!(sql.contains("VALUES (5, 'it''s', 'ab', strftime("), "{sql}");
+        assert!(sql.ends_with(", 'u', NULL)"), "{sql}");
+    }
+
+    #[cfg(feature = "rusqlite")]
+    #[test]
+    fn hash_joins_statements_with_a_newline_and_no_trailing_newline() {
+        let joined = format!("{:x}", Sha256::digest("A;\nB;"));
+        assert_eq!(hash(&["A;".into(), "B;".into()]), joined);
+        assert_eq!(joined.len(), 64);
     }
 }
