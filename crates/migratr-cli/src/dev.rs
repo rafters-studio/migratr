@@ -58,7 +58,7 @@ pub fn dev(db: &Path, dir: &Path, settings: &Settings) -> Result<Outcome, CliErr
         .cloned()
         .unwrap_or_default();
     let recorded = recorded_fingerprint(&local_ledger);
-    if let Some(recorded) = &recorded
+    if let Some((recorded, _)) = &recorded
         && *recorded != fingerprint
     {
         return Err(CliError::ShapeChanged(format!(
@@ -72,9 +72,19 @@ pub fn dev(db: &Path, dir: &Path, settings: &Settings) -> Result<Outcome, CliErr
         .any(|o| o.kind == "table" && o.name == LEDGER_TABLE);
     let (ledger, adopted) = if place_has_ledger {
         (read["ledger"].as_array().cloned().unwrap_or_default(), None)
-    } else if recorded.is_some() {
-        // Discovered by an earlier dev: its migration rows are carried, not adopted again.
-        (local_ledger, None)
+    } else if let Some((_, versions)) = &recorded {
+        // Discovered by an earlier dev: the migration rows the place held then are carried, not
+        // adopted again. A migration applied locally since is not the place's and reads as
+        // pending again.
+        let carried = local_ledger
+            .into_iter()
+            .filter(|row| {
+                row["version"]
+                    .as_u64()
+                    .is_some_and(|v| versions.contains(&v))
+            })
+            .collect();
+        (carried, None)
     } else {
         match adopt(dir, &objects)? {
             Some(rows) => {
@@ -126,13 +136,29 @@ fn place(settings: &Settings) -> Result<&str, CliError> {
     })
 }
 
-/// The fingerprint an earlier dev recorded in the ledger `rows`, as the read form gives them.
-fn recorded_fingerprint(rows: &[Value]) -> Option<String> {
+/// The fingerprint an earlier dev recorded in the ledger `rows`, as the read form gives them,
+/// with the versions of the migrations the place held when it was recorded.
+fn recorded_fingerprint(rows: &[Value]) -> Option<(String, Vec<u64>)> {
     let row = rows
         .iter()
         .find(|r| r["version"].as_u64() == Some(Note::Fingerprint.version()))?;
     let note: Value = serde_json::from_str(row["checksum"].as_str()?).ok()?;
-    note["fingerprint"].as_str().map(str::to_string)
+    let versions = note["migrations"]
+        .as_array()
+        .map(|vs| vs.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default();
+    note["fingerprint"]
+        .as_str()
+        .map(|f| (f.to_string(), versions))
+}
+
+/// The versions of the migration rows in `ledger`, leaving out notes.
+fn migration_versions(ledger: &[Value]) -> Vec<u64> {
+    ledger
+        .iter()
+        .filter_map(|row| row["version"].as_u64())
+        .filter(|v| Note::ALL.iter().all(|n| n.version() != *v))
+        .collect()
 }
 
 /// Adopts a place with tables and no ledger: the place's schema, replayed in memory, is compared
@@ -217,7 +243,11 @@ fn make(
         record_note(
             &mut exec,
             Note::Fingerprint,
-            &json!({ "fingerprint": fingerprint }).to_string(),
+            &json!({
+                "fingerprint": fingerprint,
+                "migrations": migration_versions(ledger),
+            })
+            .to_string(),
         )?;
         copy_ledger(exec.connection(), ledger)?;
         replay(exec.connection(), objects, |kind| {
