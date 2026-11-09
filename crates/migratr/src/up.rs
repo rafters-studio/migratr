@@ -121,10 +121,25 @@ fn rehearse(
 
 /// An in-memory database holding `schema`'s objects, without the ledger or SQLite's own. An
 /// object the copy already holds, such as a virtual table's shadow table, is left as made.
+/// Virtual tables are made first: each makes its own shadow tables, which a database written
+/// by VACUUM INTO, such as dev's rewind point, lists before it.
 #[cfg(feature = "rusqlite")]
 fn schema_copy(schema: &SchemaSnapshot) -> Option<rusqlite::Connection> {
     let copy = rusqlite::Connection::open_in_memory().ok()?;
-    for object in &schema.objects {
+    let is_virtual = |object: &&crate::executor::SchemaObject| {
+        object.kind == "table"
+            && object.sql.as_deref().is_some_and(|sql| {
+                let mut words = sql.split_whitespace();
+                words
+                    .next()
+                    .is_some_and(|w| w.eq_ignore_ascii_case("CREATE"))
+                    && words
+                        .next()
+                        .is_some_and(|w| w.eq_ignore_ascii_case("VIRTUAL"))
+            })
+    };
+    let (virtual_tables, rest): (Vec<_>, Vec<_>) = schema.objects.iter().partition(is_virtual);
+    for object in virtual_tables.into_iter().chain(rest) {
         if object.tbl_name == ledger::LEDGER || object.name.starts_with("sqlite_") {
             continue;
         }

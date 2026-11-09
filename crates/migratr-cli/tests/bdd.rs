@@ -2200,4 +2200,22 @@ fn dev_brings_a_table_with_a_generated_virtual_column() {
     );
 }
 
+/// FR-MIGRATR-024, migratr#100: up --smuggl ships a local migration to a place holding a
+/// full-text table, whose shadow tables are the virtual table's own.
+#[test]
+fn up_smuggl_ships_to_a_place_with_a_full_text_table() {
+    let mut world = world();
+    dev_against(
+        &mut world,
+        &format!(
+            "{NOTES_PLACE} CREATE VIRTUAL TABLE docs USING fts5(body); \
+             INSERT INTO docs (body) VALUES ('first note'), ('second note');"
+        ),
+    );
+    add_tag(&world);
+    runs_up_smuggl(&mut world);
+    place_holds_migration(&mut world);
+    fingerprints_equal(&mut world);
+}
+
 scenarios!("tests", fixtures = [world: World]);

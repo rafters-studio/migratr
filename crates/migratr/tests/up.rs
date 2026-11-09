@@ -507,3 +507,48 @@ fn a_create_trigger_naming_another_trigger_or_table_is_refused_and_nothing_runs(
         assert!(table_names(&mut ex).is_empty(), "nothing ran");
     }
 }
+
+/// migratr#100: a database written by VACUUM INTO, such as dev's rewind point, lists a
+/// full-text table's shadow tables before the table; up still works out its hashes.
+#[test]
+fn up_records_hashes_on_a_vacuumed_database_with_a_full_text_table() {
+    let dir = TempDir::new().expect("tempdir");
+    let source = Connection::open_in_memory().expect("open");
+    source
+        .execute_batch(
+            "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT); \
+             CREATE VIRTUAL TABLE docs USING fts5(body); \
+             INSERT INTO docs (body) VALUES ('first note');",
+        )
+        .expect("place");
+    let vacuumed = dir.path().join("vacuumed.db");
+    source
+        .execute("VACUUM INTO ?1", [vacuumed.to_str().expect("utf-8")])
+        .expect("vacuum");
+    let order: Vec<String> = Connection::open(&vacuumed)
+        .expect("open vacuumed")
+        .prepare("SELECT name FROM sqlite_master WHERE name LIKE 'docs%' ORDER BY rowid")
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("names");
+    assert_eq!(order.last().map(String::as_str), Some("docs"), "{order:?}");
+
+    let migrations = dir.path().join("migrations");
+    fs::create_dir(&migrations).expect("migrations dir");
+    write(
+        &migrations,
+        "20260201000000_add_tag.json",
+        r#"{"op": "add_column", "table": "notes", "column": {"name": "tag", "type": "TEXT"}}"#,
+    );
+    let mut ex = RusqliteExecutor::new(Connection::open(&vacuumed).expect("open"));
+    up(&mut ex, &load_dir(&migrations).expect("load"), None).expect("up");
+    let ledger = ex.read_ledger().expect("ledger");
+    let up_hash = format!(
+        "{:x}",
+        Sha256::digest("ALTER TABLE \"notes\" ADD COLUMN \"tag\" TEXT")
+    );
+    assert_eq!(ledger[0].up_hash.as_deref(), Some(up_hash.as_str()));
+    assert!(ledger[0].down_hash.is_some());
+}
