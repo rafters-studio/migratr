@@ -521,15 +521,17 @@ impl Smugglr {
         Err(self.missing("has no exec"))
     }
 
-    /// `smugglr exec local place --version v --up --expect fingerprint`, the statements `batch`
-    /// on stdin: smugglr runs them on the place only when their hash is the one the local ledger
-    /// recorded for `version` and the place's fingerprint is `expect`. Returns the place's
-    /// fingerprint after them.
+    /// `smugglr exec local place --version v --up|--down --expect fingerprint`, as `way` is "up"
+    /// or "down", the statements `batch` on stdin: smugglr runs them on the place only when their
+    /// hash is the one recorded for `version` (an up's in the local ledger, a down's in the
+    /// place's) and the place's fingerprint is `expect`. Returns the place's fingerprint after
+    /// them.
     pub(crate) fn exec(
         &self,
         local: &OsStr,
         place: &OsStr,
         version: u64,
+        way: &str,
         expect: &str,
         batch: &[String],
     ) -> Result<String, CliError> {
@@ -543,7 +545,7 @@ impl Smugglr {
             .args([
                 "--version",
                 &version.to_string(),
-                "--up",
+                &format!("--{way}"),
                 "--expect",
                 expect,
             ])
@@ -592,6 +594,33 @@ impl Smugglr {
     /// `smugglr sync local place --discover`: its report, which changes nothing. Exit 3 is a
     /// report too: a sync would stop.
     fn discover(&self, local: &OsStr, place: &OsStr, json: bool) -> Result<Outcome, CliError> {
+        let (_, report) = self.report(local, place, json)?;
+        let value = if json {
+            serde_json::from_str(&report).ok()
+        } else {
+            Some(Value::Null)
+        };
+        match value {
+            Some(value) => Ok(Outcome {
+                fields: json!({ "discover": value }),
+                text: report,
+            }),
+            None => Err(CliError::Smugglr(format!(
+                "smugglr sync {} {} --discover --json gave no JSON: {report}",
+                Path::new(local).display(),
+                Path::new(place).display(),
+            ))),
+        }
+    }
+
+    /// `smugglr sync local place --discover`, with `--json` when `json`: whether a sync would
+    /// stop (its exit 3), and its report. Nothing changes on either side.
+    pub(crate) fn report(
+        &self,
+        local: &OsStr,
+        place: &OsStr,
+        json: bool,
+    ) -> Result<(bool, String), CliError> {
         let mut command = Command::new(&self.bin);
         command.arg("sync").arg(local).arg(place).arg("--discover");
         if json {
@@ -603,16 +632,8 @@ impl Smugglr {
         let report = String::from_utf8_lossy(&output.stdout)
             .trim_end()
             .to_string();
-        let parsed = if json {
-            serde_json::from_str(&report).ok()
-        } else {
-            Some(Value::Null)
-        };
-        match (output.status.code(), parsed) {
-            (Some(0 | 3), Some(value)) => Ok(Outcome {
-                fields: json!({ "discover": value }),
-                text: report,
-            }),
+        match output.status.code() {
+            Some(code @ (0 | 3)) => Ok((code == 3, report)),
             _ => Err(CliError::Smugglr(format!(
                 "smugglr sync {} {} --discover: {}{}",
                 Path::new(local).display(),

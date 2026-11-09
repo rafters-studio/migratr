@@ -22,6 +22,14 @@ use crate::settings::{Loud, QUIET_NOTE, Settings};
 
 const COMMANDS: [&str; 7] = ["new", "up", "down", "status", "plan", "restore", "dev"];
 
+/// The exit codes of up and down, as their help names them.
+const SHIP_EXIT_CODES: &str = "Exit codes:
+  0  done; with --discover, the run could go ahead
+  1  failed; with --smuggl nothing was removed and the local database is as it was or back
+     at the rewind point, so the same run can be tried again
+  2  usage error, such as a missing --db or no smuggl in migratr.jsonc
+  3  with --discover, the run would stop; nothing changed anywhere";
+
 #[derive(Parser)]
 #[command(name = "migratr", version, about = "Schema migrations for SQLite")]
 struct Cli {
@@ -54,6 +62,7 @@ enum Command {
         specs: Vec<String>,
     },
     /// Apply pending migrations.
+    #[command(after_help = SHIP_EXIT_CODES)]
     Up {
         /// Stop after this version.
         #[arg(long)]
@@ -62,8 +71,13 @@ enum Command {
         /// recorded.
         #[arg(long)]
         smuggl: bool,
+        /// With --smuggl: print smugglr's --discover report of the place, the migrations the run
+        /// would send and what they would destroy, and change nothing.
+        #[arg(long, requires = "smuggl")]
+        discover: bool,
     },
     /// Reverse the newest applied migrations.
+    #[command(after_help = SHIP_EXIT_CODES)]
     Down {
         #[arg(long, default_value_t = 1)]
         steps: usize,
@@ -71,6 +85,10 @@ enum Command {
         /// recorded.
         #[arg(long)]
         smuggl: bool,
+        /// With --smuggl: print smugglr's --discover report of the place, the migrations the run
+        /// would send and what they would destroy, and change nothing.
+        #[arg(long, requires = "smuggl")]
+        discover: bool,
     },
     /// List every migration as applied or pending.
     Status,
@@ -174,12 +192,18 @@ fn main() -> ExitCode {
     }
     let code = match run(&cli, &settings) {
         Ok(outcome) => {
+            // A --discover that finds the run would stop is a report, and exits 3.
+            let stops = outcome.fields["would_stop"] == true;
             if cli.json {
                 println!("{}", ok_document(name, outcome.fields));
             } else {
                 println!("{}", outcome.text);
             }
-            ExitCode::SUCCESS
+            if stops {
+                ExitCode::from(3)
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Err(error) => fail(&cli, name, &error),
     };
@@ -242,11 +266,19 @@ fn run(cli: &Cli, settings: &Settings) -> Result<Outcome, CliError> {
                 text: format!("created {}", path.display()),
             })
         }
-        Command::Up { to, smuggl: true } => {
-            smuggl::up_smuggl(db_path(cli)?, &cli.dir, settings, *to)
-        }
-        Command::Down { smuggl: true, .. } => smuggl::down_smuggl(db_path(cli)?),
-        Command::Up { to, smuggl: false } => {
+        Command::Up {
+            to,
+            smuggl: true,
+            discover,
+        } => ship(cli, settings, Direction::Up { to: *to }, *discover),
+        Command::Down {
+            steps,
+            smuggl: true,
+            discover,
+        } => ship(cli, settings, Direction::Down { steps: *steps }, *discover),
+        Command::Up {
+            to, smuggl: false, ..
+        } => {
             let db = db_path(cli)?;
             let migrations = load_dir(&cli.dir)?;
             let mut exec = loud(settings, Connection::open(db)?);
@@ -274,6 +306,7 @@ fn run(cli: &Cli, settings: &Settings) -> Result<Outcome, CliError> {
         Command::Down {
             steps,
             smuggl: false,
+            ..
         } => {
             let db = db_path(cli)?;
             let migrations = load_dir(&cli.dir)?;
@@ -342,6 +375,21 @@ fn run(cli: &Cli, settings: &Settings) -> Result<Outcome, CliError> {
                 }),
             })
         }
+    }
+}
+
+/// up --smuggl or down --smuggl, or with `discover` its --discover report.
+fn ship(
+    cli: &Cli,
+    settings: &Settings,
+    direction: Direction,
+    discover: bool,
+) -> Result<Outcome, CliError> {
+    let db = db_path(cli)?;
+    if discover {
+        smuggl::discover(db, &cli.dir, settings, direction, cli.json)
+    } else {
+        smuggl::smuggl(db, &cli.dir, settings, direction)
     }
 }
 

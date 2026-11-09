@@ -53,3 +53,28 @@ Feature: up --smuggl and down --smuggl ship migrations to the place through the 
     When the agent runs migratr up --smuggl
     Then parent and child are rebuilt on the place
     And every row of both is there
+
+  @criterion-01a1b3a8-88cf-7231-abe3-ac26f865b721 @module-migratr-cli
+  Scenario: --discover tells you whether it is safe to go up or down
+    Given migratr dev against a place file and a local migration that drops table old holding 3 rows
+    When the agent runs migratr up --smuggl --discover, and then migratr down --smuggl --discover
+    Then each prints the place's --discover report and the migrations it would send with their statements
+    And the up report names table old and 3 rows destroyed
+    And nothing has changed anywhere
+    And each exits 0, or 3 when the run would stop
+
+  @criterion-01a1b8aa-b174-7640-b370-33765226b181 @module-migratr-cli
+  Scenario: down --smuggl reverts the latest migration on the place
+    Given migratr dev, a new local migration, and migratr up --smuggl
+    And migratr dev again
+    When the agent runs migratr down --smuggl
+    Then the place's ledger no longer holds that migration
+    And the place's fingerprint equals the local database's
+
+  @criterion-01a1b8aa-b174-7640-b370-3382a3282b82 @module-migratr-cli
+  Scenario: a shape changed outside migratr stops the ship
+    Given migratr dev against a place file
+    And a column added to the place outside migratr
+    When the agent runs migratr up --smuggl, and then migratr down --smuggl
+    Then nothing has changed anywhere
+    And each says the place's shape changed outside migratr and names --discover
