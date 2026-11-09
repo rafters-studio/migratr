@@ -854,8 +854,8 @@ fn place_fingerprint(world: &World) -> String {
     fingerprint_of(world, world.place.as_ref().expect("a place").as_os_str())
 }
 
-/// The fingerprint smugglr exec's read form gives for the database or place `address`.
-fn fingerprint_of(world: &World, address: &std::ffi::OsStr) -> String {
+/// smugglr exec's read form of the database or place `address`.
+fn read_of(world: &World, address: &std::ffi::OsStr) -> Value {
     let output = Command::new(smugglr_bin())
         .arg("exec")
         .arg(address)
@@ -863,8 +863,12 @@ fn fingerprint_of(world: &World, address: &std::ffi::OsStr) -> String {
         .envs(world.env.iter().cloned())
         .output()
         .expect("run smugglr");
-    let read: Value = serde_json::from_slice(&output.stdout).expect("read form");
-    read["fingerprint"]
+    serde_json::from_slice(&output.stdout).expect("read form")
+}
+
+/// The fingerprint smugglr exec's read form gives for the database or place `address`.
+fn fingerprint_of(world: &World, address: &std::ffi::OsStr) -> String {
+    read_of(world, address)["fingerprint"]
         .as_str()
         .expect("fingerprint")
         .to_string()
@@ -1615,16 +1619,7 @@ fn fingerprint_row_new(world: &mut World) {
 /// The migration versions in the ledger of the database or place `address`, as smugglr exec's
 /// read form gives them, without migratr dev's two notes.
 fn ledger_of(world: &World, address: &std::ffi::OsStr) -> Vec<u64> {
-    let output = Command::new(smugglr_bin())
-        .arg("exec")
-        .arg(address)
-        .arg("--read")
-        .env("XDG_CONFIG_HOME", world.root.path().join("cfg"))
-        .env("HOME", world.root.path().join("home"))
-        .output()
-        .expect("run smugglr");
-    let read: Value = serde_json::from_slice(&output.stdout).expect("JSON");
-    read["ledger"]
+    read_of(world, address)["ledger"]
         .as_array()
         .expect("a ledger")
         .iter()
