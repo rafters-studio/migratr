@@ -75,6 +75,9 @@ pub fn smuggl(
     let there = smugglr.read(OsStr::new(place))?;
     let found = fingerprint(&there);
     let expected = expected(db, &point, &notes, &migrations, direction, &there, &smugglr)?;
+    if let Some(behind) = expected.behind() {
+        return Err(CliError::ShipFailed(format!("{behind}; nothing changed")));
+    }
     if found != expected.fingerprint {
         return Err(CliError::ShapeChanged(format!(
             "the place's shape changed outside migratr: its fingerprint is {found}, and the \
@@ -227,6 +230,7 @@ pub fn discover(
     let there = smugglr.read(OsStr::new(place))?;
     let found = fingerprint(&there);
     let expected = expected(db, &point, &notes, &migrations, direction, &there, &smugglr)?;
+    stops.extend(expected.behind());
     if found != expected.fingerprint {
         stops.push(format!(
             "the place's shape changed outside migratr: its fingerprint is {found}, and the \
@@ -595,6 +599,22 @@ struct Expected {
     catch_up: CatchUp,
     /// The rewind point with the catch-up run on it, when there is one.
     copy: Option<Scratch>,
+    /// For a down, the migrations the place holds and the rewind point does not: a rewind point
+    /// older than the place, from which a down would revert the wrong migration there.
+    ahead: Vec<u64>,
+}
+
+impl Expected {
+    /// Why a down cannot start from this rewind point, when the place is ahead of it.
+    fn behind(&self) -> Option<String> {
+        (!self.ahead.is_empty()).then(|| {
+            format!(
+                "the place holds migration(s){} that the rewind point does not: the rewind point \
+                 is older than the place; run migratr dev again",
+                crate::version_list(&self.ahead)
+            )
+        })
+    }
 }
 
 /// The fingerprint the place, whose read form is `there`, should have before the run: the one
@@ -618,12 +638,21 @@ fn expected(
     .into_iter()
     .map(|row| row.version)
     .collect();
+    let ahead = match direction {
+        Direction::Down { .. } => held
+            .iter()
+            .copied()
+            .filter(|v| !local.contains(v) && migrations.iter().any(|m| m.version == *v))
+            .collect(),
+        Direction::Up { .. } => Vec::new(),
+    };
     let catch_up = CatchUp::of(&local, &held, migrations, direction);
-    if catch_up == CatchUp::Nothing {
+    if catch_up == CatchUp::Nothing || !ahead.is_empty() {
         return Ok(Expected {
             fingerprint: recorded_fingerprint(notes),
-            catch_up,
+            catch_up: CatchUp::Nothing,
             copy: None,
+            ahead,
         });
     }
     let dir = dev::migratr_dir(db).join("caught-up");
@@ -649,6 +678,7 @@ fn expected(
         fingerprint: fingerprint(&smugglr.read(copy.db.as_os_str())?),
         catch_up,
         copy: Some(copy),
+        ahead,
     })
 }
 

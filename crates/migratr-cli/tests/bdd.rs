@@ -1920,4 +1920,69 @@ fn a_down_that_failed_partway_finishes_when_run_again(mut world: World) {
     assert_eq!(place, ledger_of(&world, app_db(&world).as_os_str()));
 }
 
+/// FR-MIGRATR-024, migratr#82: with autoclean off, a down from a rewind point older than the
+/// place stops before anything changes, rather than revert there a migration that is not the
+/// latest, and goes ahead after migratr dev again.
+#[rstest::rstest]
+fn a_down_from_a_rewind_point_behind_the_place_stops(mut world: World) {
+    dev_against(&mut world, NOTES_PLACE);
+    let place = place_file(&world);
+    write_settings(
+        world.root.path(),
+        &serde_json::json!({ "smuggl": place, "loud": false, "autoclean": false }).to_string(),
+    );
+    add_tag(&world);
+    next_second();
+    runs_up_smuggl(&mut world);
+    shipped(&world);
+    next_second();
+    run_dev(&mut world);
+    dev_ready(&world);
+    add_migration(
+        &world,
+        "20260202000000",
+        "index_body",
+        r#"{"up": [{"op": "create_index", "name": "notes_body", "table": "notes", "columns": ["body"]}]}"#,
+    );
+    next_second();
+    runs_up_smuggl(&mut world);
+    shipped(&world);
+    sql(&place, "UPDATE notes SET tag = 'keep';");
+
+    next_second();
+    run_smuggl(
+        &mut world,
+        &[&["down", "--smuggl", "--discover"], &["down", "--smuggl"]],
+    );
+    assert_eq!(world.runs[0].0, Some(3), "{}", world.stdouts[0]);
+    assert!(
+        world.stdouts[0].contains("run migratr dev again"),
+        "{}",
+        world.stdouts[0]
+    );
+    assert_ne!(world.exit, Some(0), "{}", world.stdout);
+    assert!(
+        world.stderr.contains("run migratr dev again") && world.stderr.contains("nothing changed"),
+        "{}",
+        world.stderr
+    );
+    unchanged(&world);
+    assert_eq!(
+        ledger_of(&world, place.as_os_str()),
+        vec![20_260_201_000_000, 20_260_202_000_000]
+    );
+
+    next_second();
+    run_dev(&mut world);
+    dev_ready(&world);
+    next_second();
+    run_smuggl(&mut world, &[&["down", "--smuggl"]]);
+    shipped(&world);
+    assert_eq!(
+        ledger_of(&world, place.as_os_str()),
+        vec![20_260_201_000_000]
+    );
+    assert_eq!(rows(&place, "SELECT tag FROM notes LIMIT 1"), vec!["keep"]);
+}
+
 scenarios!("tests", fixtures = [world: World]);
