@@ -1472,6 +1472,10 @@ fn runs_up_and_down_smuggl(world: &mut World) {
 fn nothing_anywhere(world: &mut World) {
     assert_eq!(world.runs.len(), 2);
     unchanged(world);
+    if world.rewind.is_some() {
+        // The rewind point is still the file dev recorded, so a real run can use it.
+        rewind_sha(world);
+    }
 }
 
 #[then("each says to run migratr dev")]
@@ -1544,13 +1548,24 @@ fn discover_reports(world: &mut World) {
         );
     }
     let up = &world.stdouts[0];
-    assert!(
-        up.lines().any(|l| l
-            == format!("  {SHIPPED}_drop_old DESTRUCTIVE, snapshot {SHIPPED}_up.db")
-            || l.starts_with(&format!("  {SHIPPED}_drop_old"))),
+    let step = up
+        .lines()
+        .position(|l| l.starts_with(&format!("  {SHIPPED}_drop_old")))
+        .unwrap_or_else(|| panic!("no step for {SHIPPED}_drop_old in {up}"));
+    // Only the migration's own statements: smugglr writes the ledger row.
+    assert_eq!(
+        up.lines().nth(step + 1),
+        Some("    DROP TABLE \"old\""),
         "{up}"
     );
-    assert!(up.lines().any(|l| l == "    DROP TABLE \"old\""), "{up}");
+    let sent: Vec<&str> = up
+        .lines()
+        .skip_while(|l| !l.ends_with("would send:"))
+        .collect();
+    assert!(
+        sent.iter().all(|l| !l.contains("_migratr_migrations")),
+        "{up}"
+    );
     // Dev recorded no migration the place held, so down would send none.
     assert!(
         world.stdouts[1].contains("nothing to do"),

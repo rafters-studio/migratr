@@ -262,6 +262,17 @@ pub fn discover(
             }
         }
     };
+    let mut planned = planned;
+    // What exec is sent: each migration's own statements, as smugglr writes the ledger row.
+    for step in planned["steps"].as_array_mut().into_iter().flatten() {
+        let statements: Vec<String> = step["statements"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.as_str().map(str::to_string))
+            .collect();
+        step["statements"] = json!(operations(&statements));
+    }
     let rows = |table: &str| {
         report["target"]["tables"]
             .as_array()
