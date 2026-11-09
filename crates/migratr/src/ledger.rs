@@ -99,6 +99,9 @@ pub enum Note {
 }
 
 impl Note {
+    /// Every kind of note, in version order.
+    pub const ALL: [Note; 2] = [Note::RewindPoint, Note::Fingerprint];
+
     /// The reserved version this kind of note is kept at.
     #[must_use]
     pub const fn version(self) -> u64 {

@@ -96,7 +96,7 @@ fn notes(conn: &Connection) -> rusqlite::Result<Vec<(String, Value)>> {
         return Ok(Vec::new());
     }
     let mut found = Vec::new();
-    for note in [Note::RewindPoint, Note::Fingerprint] {
+    for note in Note::ALL {
         let row: Option<String> = conn
             .query_row(
                 "SELECT checksum FROM _migratr_migrations WHERE version = ?1",

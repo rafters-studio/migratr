@@ -154,7 +154,7 @@ fn copy_ledger(conn: &Connection, ledger: &[Value]) -> rusqlite::Result<()> {
         let note = columns
             .get("version")
             .and_then(Value::as_u64)
-            .is_some_and(|v| v == Note::RewindPoint.version() || v == Note::Fingerprint.version());
+            .is_some_and(|v| Note::ALL.iter().any(|n| n.version() == v));
         if note {
             continue;
         }
