@@ -223,7 +223,67 @@ fn snapshot_dir(db_path: &Path) -> PathBuf {
     parent.join(".migratr").join("snapshots")
 }
 
-/// Whether `name` is `<14 digits>_<digits>_<up|down>.db`, the name `snapshot_before` gives.
+/// Why migratr dev keeps a snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevSnapshot {
+    /// The local database dev is about to replace.
+    Replaced,
+    /// The local database dev made, recorded as the rewind point.
+    RewindPoint,
+}
+
+impl DevSnapshot {
+    fn as_str(self) -> &'static str {
+        match self {
+            DevSnapshot::Replaced => "kept",
+            DevSnapshot::RewindPoint => "dev",
+        }
+    }
+}
+
+/// Copies the database at `db_path`, which no connection may hold open, among its snapshots,
+/// named for the newest migration its ledger holds, and returns the copy's path. A rewind point
+/// sorts after any other snapshot of the same second, and pruning never removes either kind.
+#[cfg(feature = "rusqlite")]
+pub fn snapshot_for_dev(db_path: &Path, kind: DevSnapshot) -> Result<PathBuf, MigrateError> {
+    use crate::executor::RusqliteExecutor;
+
+    let executor = |e: rusqlite::Error| MigrateError::Executor(Box::new(e));
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(executor)?;
+    let version = RusqliteExecutor::new(conn)
+        .read_ledger()
+        .map_err(executor)?
+        .iter()
+        .map(|r| r.version)
+        .max()
+        .unwrap_or(0);
+    let dir = snapshot_dir(db_path);
+    let path = dir.join(format!(
+        "{}_{version}_{}.db",
+        timestamp(SystemTime::now()),
+        kind.as_str()
+    ));
+    let failed = |source: io::Error| MigrateError::SnapshotFailed {
+        path: path.clone(),
+        source: Box::new(source),
+    };
+    fs::create_dir_all(&dir).map_err(failed)?;
+    fs::copy(db_path, &path).map_err(failed)?;
+    Ok(path)
+}
+
+/// The step word of a snapshot file name: up, down, kept or dev.
+fn direction_of(path: &Path) -> &str {
+    path.file_stem()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.rsplit('_').next())
+        .unwrap_or_default()
+}
+
+/// Whether `name` is `<14 digits>_<digits>_<up|down|kept|dev>.db`, the names `snapshot_before`
+/// and `snapshot_for_dev` give.
 fn is_snapshot_name(name: &str) -> bool {
     let all_digits = |s: &str, len: Option<usize>| {
         !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && len.is_none_or(|n| s.len() == n)
@@ -236,13 +296,14 @@ fn is_snapshot_name(name: &str) -> bool {
         (Some(time), Some(version), Some(direction), None) => {
             all_digits(time, Some(14))
                 && all_digits(version, None)
-                && matches!(direction, "up" | "down")
+                && matches!(direction, "up" | "down" | "kept" | "dev")
         }
         _ => false,
     }
 }
 
-/// The snapshot files of a snapshot directory, oldest first. Other files are not migratr's.
+/// The snapshot files of a snapshot directory, oldest first, a rewind point after any other of
+/// the same second. Other files are not migratr's.
 fn list_snapshots(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut found = Vec::new();
     for entry in fs::read_dir(dir)? {
@@ -255,11 +316,22 @@ fn list_snapshots(dir: &Path) -> io::Result<Vec<PathBuf>> {
             found.push(path);
         }
     }
-    found.sort();
+    found.sort_by(|a, b| {
+        let key = |p: &PathBuf| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            (
+                name.split('_').next().unwrap_or_default().to_string(),
+                direction_of(p) == "dev",
+                name.to_string(),
+            )
+        };
+        key(a).cmp(&key(b))
+    });
     Ok(found)
 }
 
-/// Deletes the oldest snapshots so that `keep` remain, `newest` among them.
+/// Deletes the oldest snapshots of steps so that `keep` remain, `newest` among them. The
+/// snapshots migratr dev keeps are not a step's and are never deleted here.
 fn prune(dir: &Path, newest: &Path, keep: usize) -> Result<(), MigrateError> {
     let failed = |path: &Path, source: io::Error| MigrateError::SnapshotFailed {
         path: path.to_path_buf(),
@@ -268,7 +340,7 @@ fn prune(dir: &Path, newest: &Path, keep: usize) -> Result<(), MigrateError> {
     let others: Vec<PathBuf> = list_snapshots(dir)
         .map_err(|e| failed(dir, e))?
         .into_iter()
-        .filter(|p| p != newest)
+        .filter(|p| p != newest && matches!(direction_of(p), "up" | "down"))
         .collect();
     let excess = others.len().saturating_sub(keep.saturating_sub(1));
     for old in &others[..excess] {
@@ -329,6 +401,28 @@ mod tests {
         assert!(!old.exists());
         assert!(newest.exists());
         assert!(live.exists());
+    }
+
+    #[test]
+    fn a_rewind_point_sorts_after_a_snapshot_of_the_same_second_and_is_never_pruned() {
+        let dir = tempfile::TempDir::new().expect("tmp");
+        let kept = dir.path().join("20260101000000_9_kept.db");
+        let rewind = dir.path().join("20260101000000_1_dev.db");
+        let old = dir.path().join("20260101000001_2_up.db");
+        let newest = dir.path().join("20260101000002_3_down.db");
+        for file in [&kept, &rewind, &old, &newest] {
+            fs::write(file, "x").expect("write");
+        }
+
+        let listed = list_snapshots(dir.path()).expect("list");
+        assert_eq!(
+            listed,
+            vec![kept.clone(), rewind.clone(), old.clone(), newest.clone()]
+        );
+
+        prune(dir.path(), &newest, 1).expect("prune");
+        assert!(kept.exists() && rewind.exists() && newest.exists());
+        assert!(!old.exists());
     }
 
     #[test]

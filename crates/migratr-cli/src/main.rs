@@ -1,3 +1,4 @@
+mod dev;
 mod error;
 mod plan;
 mod settings;
@@ -18,7 +19,7 @@ use serde_json::{Map, Value, json};
 use crate::error::CliError;
 use crate::settings::{Loud, QUIET_NOTE, Settings};
 
-const COMMANDS: [&str; 6] = ["new", "up", "down", "status", "plan", "restore"];
+const COMMANDS: [&str; 7] = ["new", "up", "down", "status", "plan", "restore", "dev"];
 
 #[derive(Parser)]
 #[command(name = "migratr", version, about = "Schema migrations for SQLite")]
@@ -82,6 +83,8 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Make the local database from the place smuggl names and record the rewind point.
+    Dev,
 }
 
 #[derive(Subcommand, Clone)]
@@ -193,6 +196,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Status => "status",
         Command::Plan { .. } => "plan",
         Command::Restore { .. } => "restore",
+        Command::Dev => "dev",
     }
 }
 
@@ -302,6 +306,7 @@ fn run(cli: &Cli, settings: &Settings) -> Result<Outcome, CliError> {
                 fields,
             })
         }
+        Command::Dev => dev::dev(db_path(cli)?, settings),
         Command::Restore { snapshot, yes } => {
             let db = db_path(cli)?;
             let report = restore(db, snapshot.as_deref(), *yes)?;

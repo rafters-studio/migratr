@@ -245,7 +245,7 @@ fn diverged_with_snapshot(dir: &TempDir) -> PathBuf {
     ex.connection()
         .execute_batch(
             "CREATE TABLE _migratr_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL);
-             INSERT INTO _migratr_migrations VALUES (1, 'a', 'ca', 't');
+             INSERT INTO _migratr_migrations VALUES (11, 'a', 'ca', 't');
              CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT);
              INSERT INTO users VALUES (1, 'a@x');",
         )
@@ -255,8 +255,8 @@ fn diverged_with_snapshot(dir: &TempDir) -> PathBuf {
         .expect("durable");
     ex.connection()
         .execute_batch(
-            "INSERT INTO _migratr_migrations VALUES (2, 'b', 'cb', 't');
-             INSERT INTO _migratr_migrations VALUES (3, 'c', 'cc', 't');
+            "INSERT INTO _migratr_migrations VALUES (12, 'b', 'cb', 't');
+             INSERT INTO _migratr_migrations VALUES (13, 'c', 'cc', 't');
              DROP TABLE users;",
         )
         .expect("diverge");
@@ -273,8 +273,8 @@ fn restore_without_confirmation_reports_and_changes_nothing() {
     let MigrateError::RestoreNotConfirmed { report } = err else {
         panic!("wrong error: {err}");
     };
-    assert_eq!(report.removed, vec![3, 2]);
-    assert_eq!(report.snapshot_version, Some(1));
+    assert_eq!(report.removed, vec![13, 12]);
+    assert_eq!(report.snapshot_version, Some(11));
     assert!(!report.restored);
     assert!(!has_table(&db, "users"));
 }
@@ -287,7 +287,7 @@ fn restore_with_confirmation_returns_schema_data_and_ledger() {
     let report = restore(&db, None, true).expect("restore");
 
     assert!(report.restored);
-    assert_eq!(report.removed, vec![3, 2]);
+    assert_eq!(report.removed, vec![13, 12]);
     assert_eq!(report.snapshot_time, "20260101000000");
     let mut after = RusqliteExecutor::new(Connection::open(&db).expect("open"));
     let versions: Vec<u64> = after
@@ -296,7 +296,7 @@ fn restore_with_confirmation_returns_schema_data_and_ledger() {
         .iter()
         .map(|r| r.version)
         .collect();
-    assert_eq!(versions, vec![1]);
+    assert_eq!(versions, vec![11]);
     assert_eq!(user_emails(&db), vec!["a@x"]);
 }
 
