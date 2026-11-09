@@ -2218,4 +2218,28 @@ fn up_smuggl_ships_to_a_place_with_a_full_text_table() {
     fingerprints_equal(&mut world);
 }
 
+/// migratr#100: a place written by VACUUM INTO lists a full-text table's shadow tables before
+/// the table; dev still brings the table and its rows.
+#[test]
+fn dev_brings_a_full_text_table_from_a_vacuumed_place() {
+    let mut world = world();
+    let source = world.root.path().join("source.db");
+    sql(
+        &source,
+        "CREATE VIRTUAL TABLE docs USING fts5(body); \
+         INSERT INTO docs (body) VALUES ('first note'), ('second note');",
+    );
+    let place = world.root.path().join("place.db");
+    sql(&source, &format!("VACUUM INTO '{}'", place.display()));
+    let order = rows(
+        &place,
+        "SELECT name FROM sqlite_master WHERE name LIKE 'docs%' ORDER BY rowid",
+    );
+    assert_eq!(order.last().map(String::as_str), Some("docs"), "{order:?}");
+    world.place = Some(place);
+    name_place(&world);
+    run_dev(&mut world);
+    holds_fts5_rows(&mut world);
+}
+
 scenarios!("tests", fixtures = [world: World]);
