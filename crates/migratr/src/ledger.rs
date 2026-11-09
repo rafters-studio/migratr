@@ -87,6 +87,60 @@ pub fn record_applied(exec: &mut impl Executor, migration: &Migration) -> Result
         })
 }
 
+/// A JSON row of the ledger that is not a migration. Each kind sits at a reserved version no
+/// migration takes, since migration versions are timestamps, with its JSON in `checksum` and
+/// both hashes NULL. Every reader of migrations leaves them out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Note {
+    /// The snapshot migratr dev took, as the way back.
+    RewindPoint,
+    /// The place's structural fingerprint, as smugglr exec's read form gives it.
+    Fingerprint,
+}
+
+impl Note {
+    /// Every kind of note, in version order.
+    pub const ALL: [Note; 2] = [Note::RewindPoint, Note::Fingerprint];
+
+    /// The reserved version this kind of note is kept at.
+    #[must_use]
+    pub const fn version(self) -> u64 {
+        match self {
+            Note::RewindPoint => 0,
+            Note::Fingerprint => 1,
+        }
+    }
+
+    /// The name this kind of note is kept under, which is how status lists it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Note::RewindPoint => "rewind_point",
+            Note::Fingerprint => "fingerprint",
+        }
+    }
+}
+
+/// Writes `json` as the ledger's `note`, replacing any earlier one of that kind and creating the
+/// ledger when it is absent, in one atomic run. `applied_at` is the time it was written.
+pub fn record_note(exec: &mut impl Executor, note: Note, json: &str) -> Result<(), MigrateError> {
+    let schema = exec
+        .read_schema()
+        .map_err(|e| MigrateError::Executor(Box::new(e)))?;
+    let mut statements = vec![CREATE_LEDGER.to_string()];
+    statements.extend(upgrade(&schema));
+    statements.push(format!(
+        "INSERT OR REPLACE INTO _migratr_migrations \
+         (version, name, checksum, applied_at, up_hash, down_hash) \
+         VALUES ({}, {}, {}, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NULL, NULL)",
+        note.version(),
+        quote_literal(note.name()),
+        quote_literal(json),
+    ));
+    exec.run_atomic(&statements, false)
+        .map_err(|failure| MigrateError::Executor(Box::new(failure.source)))
+}
+
 /// Runs `upgrade` on its own, for a run with no migration to carry it.
 pub(crate) fn run_upgrade(
     exec: &mut impl Executor,
@@ -174,6 +228,33 @@ mod tests {
         let sql = insert_row(&migration(5, "it's", "ab"), &hashes);
         assert!(sql.contains("VALUES (5, 'it''s', 'ab', strftime("), "{sql}");
         assert!(sql.ends_with(", 'u', NULL)"), "{sql}");
+    }
+
+    #[cfg(feature = "rusqlite")]
+    #[test]
+    fn notes_are_kept_at_their_versions_and_left_out_of_the_migrations() {
+        let mut exec =
+            crate::RusqliteExecutor::new(rusqlite::Connection::open_in_memory().expect("open"));
+        record_note(&mut exec, Note::RewindPoint, r#"{"snapshot":"a"}"#).expect("rewind");
+        record_note(&mut exec, Note::Fingerprint, r#"{"fingerprint":"f"}"#).expect("fingerprint");
+        record_note(&mut exec, Note::Fingerprint, r#"{"fingerprint":"g"}"#).expect("replaced");
+
+        assert!(exec.read_ledger().expect("ledger").is_empty());
+        let rows: Vec<(i64, String, String)> = exec
+            .connection()
+            .prepare("SELECT version, name, checksum FROM _migratr_migrations ORDER BY version")
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+        assert_eq!(
+            rows,
+            vec![
+                (0, "rewind_point".into(), r#"{"snapshot":"a"}"#.into()),
+                (1, "fingerprint".into(), r#"{"fingerprint":"g"}"#.into()),
+            ]
+        );
     }
 
     #[cfg(feature = "rusqlite")]

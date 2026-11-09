@@ -104,7 +104,7 @@ fn a_negative_ledger_version_and_a_wrong_value_are_errors() -> Result<(), Box<dy
         Err("a negative ledger version".to_owned())
     );
     reader.0.execute_batch(
-        "DELETE FROM _migratr_migrations; INSERT INTO _migratr_migrations VALUES (1, NULL, 'b');",
+        "DELETE FROM _migratr_migrations; INSERT INTO _migratr_migrations VALUES (2, NULL, 'b');",
     )?;
     assert_eq!(
         read_ledger_through(&mut reader),

@@ -23,7 +23,7 @@ pub use executor::{
     AtomicError, ColumnInfo, Executor, ForeignKeyInfo, LedgerRow, SchemaObject, SchemaSnapshot,
     TableInfo,
 };
-pub use ledger::record_applied;
+pub use ledger::{Note, record_applied, record_note};
 pub use migration::{
     Check, Column, ForeignKey, ForeignKeyDef, GeneratedColumn, IndexColumn, IndexDef, MigrateError,
     Migration, Op, ParentKey, TableDef, TriggerDef, load_dir,
@@ -36,10 +36,10 @@ pub use reader::{
 pub use rebuild::rebuild_tables;
 pub use scaffold::scaffold;
 pub use schema_file::write_schema;
-pub use snapshot::RestoreReport;
+pub use snapshot::{DevSnapshot, RestoreReport};
 pub use up::{UpReport, up};
 
 #[cfg(feature = "rusqlite")]
 pub use executor::RusqliteExecutor;
 #[cfg(feature = "rusqlite")]
-pub use snapshot::{latest_snapshot, restore};
+pub use snapshot::{latest_snapshot, restore, snapshot_for_dev};

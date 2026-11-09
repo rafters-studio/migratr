@@ -26,6 +26,13 @@ struct World {
     before: Vec<PathBuf>,
     /// The version of the migration a step made.
     version: Option<i64>,
+    /// The place file migratr dev copies.
+    place: Option<PathBuf>,
+    /// Each smugglr a dev step runs with, as SMUGGLR and PATH; the one the tests were given
+    /// when empty.
+    smugglrs: Vec<(String, Option<PathBuf>)>,
+    /// The exit code and stderr of each run of a dev step.
+    runs: Vec<(Option<i32>, String)>,
 }
 
 #[rstest::fixture]
@@ -42,6 +49,9 @@ fn world() -> World {
         planned: (String::new(), Vec::new()),
         before: Vec::new(),
         version: None,
+        place: None,
+        smugglrs: Vec::new(),
+        runs: Vec::new(),
     }
 }
 
@@ -382,6 +392,369 @@ fn down_hash_matches_plan_down(world: &mut World) {
         )
         .expect("down_hash");
     assert_eq!(recorded, printed);
+}
+
+/// The smugglr the tests run: the binary SMUGGLR names, built with exec.
+fn smugglr_bin() -> String {
+    std::env::var("SMUGGLR")
+        .ok()
+        .filter(|bin| !bin.is_empty())
+        .expect("set SMUGGLR to a smugglr with exec to run the dev scenarios")
+}
+
+fn sql(path: &Path, batch: &str) {
+    rusqlite::Connection::open(path)
+        .expect("open")
+        .execute_batch(batch)
+        .expect("batch");
+}
+
+fn rows(path: &Path, query: &str) -> Vec<String> {
+    let conn = rusqlite::Connection::open(path).expect("open");
+    let mut statement = conn.prepare(query).expect("prepare");
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows")
+}
+
+fn app_db(world: &World) -> PathBuf {
+    world.root.path().join("app.db")
+}
+
+fn make_place(world: &mut World, batch: &str) {
+    let place = world.root.path().join("place.db");
+    sql(&place, batch);
+    world.place = Some(place);
+}
+
+fn name_place(world: &World) {
+    let place = world.place.as_ref().expect("a place");
+    let settings = json_settings(place);
+    write_settings(world.root.path(), &settings);
+}
+
+fn json_settings(place: &Path) -> String {
+    serde_json::json!({ "smuggl": place, "loud": false }).to_string()
+}
+
+/// A place with rows and a migratr.jsonc naming it, unless a step has written settings.
+fn ensure_place(world: &mut World) {
+    if world.root.path().join("migratr.jsonc").exists() {
+        return;
+    }
+    if world.place.is_none() {
+        make_place(
+            world,
+            "CREATE TABLE a (id TEXT PRIMARY KEY, v TEXT); INSERT INTO a VALUES ('1', 'x'), ('2', 'y');",
+        );
+    }
+    name_place(world);
+}
+
+fn dev_command(world: &World, smugglr: &str, path: Option<&Path>) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_migratr"));
+    command
+        .arg("--db")
+        .arg(app_db(world))
+        .arg("--dir")
+        .arg(world.root.path().join("migrations"))
+        .arg("dev")
+        .current_dir(&world.cwd)
+        .env("SMUGGLR", smugglr)
+        .env("XDG_CONFIG_HOME", world.root.path().join("cfg"))
+        .env("HOME", world.root.path().join("home"));
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    command
+}
+
+fn run_dev(world: &mut World) {
+    world.before = tree(world.root.path());
+    let smugglrs = if world.smugglrs.is_empty() {
+        vec![(smugglr_bin(), None)]
+    } else {
+        world.smugglrs.clone()
+    };
+    for (smugglr, path) in &smugglrs {
+        let output = dev_command(world, smugglr, path.as_deref())
+            .output()
+            .expect("run migratr dev");
+        record(world, &output);
+        world.runs.push((world.exit, world.stderr.clone()));
+    }
+}
+
+fn dev_ready(world: &World) {
+    assert_eq!(world.exit, Some(0), "{}{}", world.stdout, world.stderr);
+    assert_eq!(
+        world.stdout.trim_end().lines().last(),
+        Some("Dev ready"),
+        "{}",
+        world.stdout
+    );
+}
+
+#[given("a place file with rows in tables a and b, and b in smugglr's ignore list")]
+fn place_with_ignored_table(world: &mut World) {
+    make_place(
+        world,
+        "CREATE TABLE a (id TEXT PRIMARY KEY, v TEXT); CREATE TABLE b (id TEXT PRIMARY KEY, v TEXT);
+         INSERT INTO a VALUES ('1', 'x'), ('2', 'y'); INSERT INTO b VALUES ('3', 'z');",
+    );
+    let config = world.root.path().join("cfg").join("smugglr");
+    std::fs::create_dir_all(&config).expect("config dir");
+    std::fs::write(config.join("config.toml"), "ignore = [\"b\"]\n").expect("config");
+}
+
+#[given("a migratr.jsonc with smuggl naming that place")]
+fn settings_naming_place(world: &mut World) {
+    name_place(world);
+}
+
+#[when("the agent runs migratr dev")]
+fn runs_dev(world: &mut World) {
+    ensure_place(world);
+    run_dev(world);
+}
+
+#[when("the agent runs migratr dev against a place file")]
+fn runs_dev_against_place(world: &mut World) {
+    ensure_place(world);
+    run_dev(world);
+}
+
+#[then("the local database holds a's rows and b's shape with no rows")]
+fn holds_a_and_b_shape(world: &mut World) {
+    assert_eq!(world.exit, Some(0), "{}", world.stderr);
+    let db = app_db(world);
+    assert_eq!(
+        rows(&db, "SELECT id || v FROM a ORDER BY id"),
+        vec!["1x", "2y"]
+    );
+    assert_eq!(rows(&db, "SELECT CAST(count(*) AS TEXT) FROM b"), vec!["0"]);
+    let place = world.place.clone().expect("a place");
+    assert_eq!(
+        rows(&place, "SELECT CAST(count(*) AS TEXT) FROM b"),
+        vec!["1"]
+    );
+}
+
+#[then("the output ends with Dev ready")]
+fn ends_with_dev_ready(world: &mut World) {
+    dev_ready(world);
+}
+
+#[given(
+    "a place file with a trigger that writes a row to an audit table on insert, an index and a view"
+)]
+fn place_with_trigger(world: &mut World) {
+    make_place(
+        world,
+        "CREATE TABLE audit (id TEXT PRIMARY KEY, what TEXT);
+         CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT);
+         CREATE TRIGGER notes_audit AFTER INSERT ON notes
+           BEGIN INSERT INTO audit VALUES (new.id, 'inserted'); END;
+         CREATE INDEX notes_body ON notes (body);
+         CREATE VIEW note_bodies AS SELECT body FROM notes;
+         INSERT INTO notes VALUES ('n1', 'a'), ('n2', 'b');",
+    );
+}
+
+#[then("the local audit table holds exactly the place's audit rows")]
+fn audit_rows_equal(world: &mut World) {
+    dev_ready(world);
+    let query = "SELECT id || ':' || what FROM audit ORDER BY id";
+    let place = world.place.clone().expect("a place");
+    let expected = rows(&place, query);
+    assert_eq!(expected.len(), 2);
+    assert_eq!(rows(&app_db(world), query), expected);
+}
+
+#[then("the local database holds the place's trigger, index and view")]
+fn holds_trigger_index_view(world: &mut World) {
+    let query = "SELECT type || ' ' || name || ' ' || sql FROM sqlite_master \
+                 WHERE type IN ('trigger', 'index', 'view') AND sql IS NOT NULL ORDER BY name";
+    let place = world.place.clone().expect("a place");
+    let expected = rows(&place, query);
+    assert_eq!(expected.len(), 3, "{expected:?}");
+    assert_eq!(rows(&app_db(world), query), expected);
+}
+
+#[given("a local database that already holds rows")]
+fn local_with_rows(world: &mut World) {
+    sql(
+        &app_db(world),
+        "CREATE TABLE old (x TEXT); INSERT INTO old VALUES ('kept');",
+    );
+}
+
+#[then("a snapshot of the old local database exists among migratr's snapshots")]
+fn old_snapshot_exists(world: &mut World) {
+    dev_ready(world);
+    let kept = kept_snapshot(world);
+    assert_eq!(rows(&kept, "SELECT x FROM old"), vec!["kept"]);
+}
+
+fn kept_snapshot(world: &World) -> PathBuf {
+    let dir = world.root.path().join(".migratr").join("snapshots");
+    let kept: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("snapshots")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.to_string_lossy().ends_with("_kept.db"))
+        .collect();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    kept[0].clone()
+}
+
+#[then("the output names it")]
+fn output_names_snapshot(world: &mut World) {
+    let kept = kept_snapshot(world);
+    assert!(
+        world.stdout.contains(&kept.display().to_string()),
+        "{}",
+        world.stdout
+    );
+}
+
+fn rewind_point(world: &World) -> Value {
+    let found = rows(
+        &app_db(world),
+        "SELECT checksum FROM _migratr_migrations WHERE version = 0 AND name = 'rewind_point'",
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    serde_json::from_str(&found[0]).expect("the rewind point is JSON")
+}
+
+#[then("the ledger holds a rewind-point JSON row naming a snapshot and the SHA-256 of its file")]
+fn rewind_row(world: &mut World) {
+    dev_ready(world);
+    let point = rewind_point(world);
+    let snapshot = point["snapshot"].as_str().expect("snapshot");
+    assert!(Path::new(snapshot).is_file(), "{point}");
+    assert_eq!(point["sha256"].as_str().map(str::len), Some(64), "{point}");
+}
+
+#[then("that file's SHA-256 is the one recorded")]
+fn rewind_sha(world: &mut World) {
+    let point = rewind_point(world);
+    let bytes = std::fs::read(point["snapshot"].as_str().expect("snapshot")).expect("read");
+    assert_eq!(
+        point["sha256"].as_str(),
+        Some(format!("{:x}", Sha256::digest(&bytes)).as_str())
+    );
+}
+
+#[then("smugglr sync --dryrun between the snapshot and the local database moves nothing")]
+fn dryrun_moves_nothing(world: &mut World) {
+    let point = rewind_point(world);
+    let output = Command::new(smugglr_bin())
+        .arg("sync")
+        .arg(point["snapshot"].as_str().expect("snapshot"))
+        .arg(app_db(world))
+        .args(["--dryrun", "--json"])
+        .env("XDG_CONFIG_HOME", world.root.path().join("dryrun-cfg"))
+        .output()
+        .expect("run smugglr");
+    assert!(output.status.success(), "{output:?}");
+    let record: Value = serde_json::from_slice(&output.stdout).expect("record");
+    let tables = record["tables"].as_object().expect("tables");
+    assert!(!tables.is_empty(), "{record}");
+    assert!(
+        tables.values().all(|t| t["status"] == "in step"),
+        "{record}"
+    );
+}
+
+#[given("no smugglr on the path, or a smugglr whose exec read form is refused")]
+fn no_smugglr(world: &mut World) {
+    ensure_place(world);
+    let empty = world.root.path().join("empty-path");
+    std::fs::create_dir(&empty).expect("empty dir");
+    // No SMUGGLR and nothing on PATH; then a binary that refuses `exec <db> --read`.
+    world.smugglrs = vec![
+        (String::new(), Some(empty)),
+        (env!("CARGO_BIN_EXE_migratr").to_string(), None),
+    ];
+}
+
+#[then("the output names smugglr 0.6.3 to install")]
+fn names_smugglr_version(world: &mut World) {
+    assert_eq!(world.runs.len(), 2);
+    for (exit, stderr) in &world.runs {
+        assert_eq!(*exit, Some(1), "{stderr}");
+        assert!(stderr.contains("install smugglr 0.6.3"), "{stderr}");
+    }
+}
+
+#[given("a migratr.jsonc with no smuggl")]
+fn settings_without_smuggl(world: &mut World) {
+    write_settings(world.root.path(), "{ \"loud\": false }\n");
+}
+
+#[then("the output names the smuggl setting")]
+fn names_smuggl(world: &mut World) {
+    assert_eq!(world.exit, Some(2), "{}", world.stderr);
+    assert!(world.stderr.contains("\"smuggl\""), "{}", world.stderr);
+}
+
+#[given("a local database after migratr dev against a local place file")]
+fn after_dev(world: &mut World) {
+    ensure_place(world);
+    run_dev(world);
+    dev_ready(world);
+}
+
+#[then("the ledger holds one rewind-point row and one fingerprint row, each holding JSON")]
+fn two_notes(world: &mut World) {
+    let found = rows(
+        &app_db(world),
+        "SELECT version || ' ' || name || ' ' || checksum FROM _migratr_migrations ORDER BY version",
+    );
+    assert_eq!(found.len(), 2, "{found:?}");
+    for (row, prefix) in found.iter().zip(["0 rewind_point ", "1 fingerprint "]) {
+        let json = row.strip_prefix(prefix).expect("kind at its version");
+        let value: Value = serde_json::from_str(json).expect("JSON");
+        assert!(value.is_object(), "{row}");
+    }
+}
+
+#[then("status lists each by its kind")]
+fn status_lists_kinds(world: &mut World) {
+    assert_eq!(world.exit, Some(0), "{}", world.stdout);
+    let doc: Value = serde_json::from_str(&world.stdout).expect("status document");
+    let kinds: Vec<&str> = doc["notes"]
+        .as_array()
+        .expect("notes")
+        .iter()
+        .map(|n| n["kind"].as_str().expect("kind"))
+        .collect();
+    assert_eq!(kinds, vec!["rewind_point", "fingerprint"]);
+}
+
+#[then("status reports no missing file")]
+fn status_no_missing(world: &mut World) {
+    let doc: Value = serde_json::from_str(&world.stdout).expect("status document");
+    assert_eq!(doc["missing"], serde_json::json!([]), "{doc}");
+}
+
+#[then(
+    "migratr up applies a pending migration and migratr down reverts it, neither refusing on those rows"
+)]
+fn up_and_down_run(world: &mut World) {
+    assert!(
+        migratr(world, &["new", "create_widgets", "id:integer:pk"])
+            .status
+            .success()
+    );
+    let up = migratr(world, &["up"]);
+    let doc: Value = serde_json::from_slice(&up.stdout).expect("up document");
+    assert_eq!(doc["applied"].as_array().map(Vec::len), Some(1), "{doc}");
+    let down = migratr(world, &["down"]);
+    let doc: Value = serde_json::from_slice(&down.stdout).expect("down document");
+    assert_eq!(doc["reverted"].as_array().map(Vec::len), Some(1), "{doc}");
 }
 
 scenarios!("tests", fixtures = [world: World]);

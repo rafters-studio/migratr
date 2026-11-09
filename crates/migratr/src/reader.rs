@@ -12,9 +12,11 @@ use crate::sql_ddl::quote_literal;
 const OBJECTS: &str = "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY rowid";
 const LEDGER_SQL: &str =
     "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '_migratr_migrations'";
-const LEDGER: &str = "SELECT version, name, checksum FROM _migratr_migrations ORDER BY version";
+// Versions 0 and 1 hold the ledger's notes (`Note`), which are not migrations.
+const LEDGER: &str = "SELECT version, name, checksum FROM _migratr_migrations \
+    WHERE version NOT IN (0, 1) ORDER BY version";
 const LEDGER_WITH_HASHES: &str = "SELECT version, name, checksum, up_hash, down_hash \
-    FROM _migratr_migrations ORDER BY version";
+    FROM _migratr_migrations WHERE version NOT IN (0, 1) ORDER BY version";
 
 /// What can run a statement and answer with its rows, each value as JSON.
 pub trait SqlReader {
@@ -177,7 +179,8 @@ pub fn missing_parents_through<R: SqlReader>(
     u64::try_from(number(reader, row, 0)?).map_err(|_| reader.malformed("a negative count"))
 }
 
-/// Every row of the ledger, ordered by version. Empty when the ledger table does not exist.
+/// Every migration row of the ledger, ordered by version, leaving out its notes. Empty when the
+/// ledger table does not exist.
 pub fn read_ledger_through<R: SqlReader>(reader: &mut R) -> Result<Vec<LedgerRow>, R::Error> {
     let Some(definition) = reader.rows(LEDGER_SQL)?.into_iter().next() else {
         return Ok(Vec::new());

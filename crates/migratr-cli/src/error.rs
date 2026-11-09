@@ -12,6 +12,20 @@ pub enum CliError {
 
     #[error("{0}")]
     Usage(String),
+
+    /// smugglr is missing or has no exec.
+    #[error("{0}")]
+    NoSmugglr(String),
+
+    /// smugglr ran and refused or failed, in its own words.
+    #[error("{0}")]
+    Smugglr(String),
+
+    #[error("{}: {source}", path.display())]
+    Io {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
 }
 
 impl CliError {
@@ -39,6 +53,9 @@ impl CliError {
             },
             CliError::Database(_) => "database",
             CliError::Usage(_) => "usage",
+            CliError::NoSmugglr(_) => "smugglr_missing",
+            CliError::Smugglr(_) => "smugglr",
+            CliError::Io { .. } => "io",
         }
     }
 }

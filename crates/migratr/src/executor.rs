@@ -367,8 +367,8 @@ mod rusqlite_executor {
             ex.run_atomic(
                 &[
                     s("CREATE TABLE _migratr_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL)"),
-                    s("INSERT INTO _migratr_migrations VALUES (2, 'b', 'cb', 't')"),
-                    s("INSERT INTO _migratr_migrations VALUES (1, 'a', 'ca', 't')"),
+                    s("INSERT INTO _migratr_migrations VALUES (3, 'b', 'cb', 't')"),
+                    s("INSERT INTO _migratr_migrations VALUES (2, 'a', 'ca', 't')"),
                 ],
                 false,
             )
@@ -378,14 +378,14 @@ mod rusqlite_executor {
                 rows,
                 vec![
                     LedgerRow {
-                        version: 1,
+                        version: 2,
                         name: "a".into(),
                         checksum: "ca".into(),
                         up_hash: None,
                         down_hash: None,
                     },
                     LedgerRow {
-                        version: 2,
+                        version: 3,
                         name: "b".into(),
                         checksum: "cb".into(),
                         up_hash: None,
