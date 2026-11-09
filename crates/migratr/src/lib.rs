@@ -12,6 +12,7 @@ mod reader;
 mod rebuild;
 mod scaffold;
 mod schema_file;
+mod shape;
 mod snapshot;
 mod sql_ddl;
 mod up;

@@ -7,7 +7,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use migratr::{DevSnapshot, Note, RusqliteExecutor, record_note, snapshot_for_dev};
+use migratr::{DevSnapshot, Note, RusqliteExecutor, load_dir, record_note, snapshot_for_dev, up};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -25,27 +25,75 @@ const EXEC_USAGE: &str = "smugglr exec <database-or-place> --read";
 /// D1's own table, which is not the place's.
 const D1_TABLE: &str = "_cf_KV";
 
+/// migratr's ledger table.
+const LEDGER_TABLE: &str = "_migratr_migrations";
+
 /// Copies the place's tables, then its rows through `smugglr sync`, then its indexes, triggers
 /// and views to a new database, and puts it in place of the local database `db`, keeping the
 /// old one as a snapshot. The result is snapshotted, checked against the local database with
 /// `smugglr sync --dryrun`, and recorded in the ledger as the rewind point, beside the place's
 /// fingerprint. Nothing changes until smugglr has been found with exec and the place read.
-pub fn dev(db: &Path, settings: &Settings) -> Result<Outcome, CliError> {
-    let place = settings.smuggl.as_deref().ok_or_else(|| {
-        CliError::Usage(format!(
-            "migratr dev needs a place: set \"smuggl\" in {FILE_NAME} to a file path, an \
-             https:// address or d1://<name>; nothing changed"
-        ))
-    })?;
+///
+/// The first dev against a place with tables and no ledger adopts it when its shape, compared by
+/// structure, is what the migrations in `dir` make, and records every migration; otherwise it
+/// stops naming the difference. A later dev compares the place's fingerprint with the ledger's
+/// and stops when they differ. Either stop changes nothing.
+pub fn dev(db: &Path, dir: &Path, settings: &Settings) -> Result<Outcome, CliError> {
+    let place = place(settings)?;
     let smugglr = Smugglr::find();
     // The read form on the local database is the check for exec; a local database not made yet
     // is checked by the read of the place, which dev needs anyway.
-    if db.exists() {
-        smugglr.read(db.as_os_str())?;
-    }
+    let local = if db.exists() {
+        Some(smugglr.read(db.as_os_str())?)
+    } else {
+        None
+    };
     let read = smugglr.read(OsStr::new(place))?;
     let objects = objects(&read)?;
     let fingerprint = read["fingerprint"].as_str().unwrap_or_default().to_string();
+
+    let local_ledger = local
+        .as_ref()
+        .and_then(|l| l["ledger"].as_array())
+        .cloned()
+        .unwrap_or_default();
+    let recorded = recorded_fingerprint(&local_ledger);
+    if let Some((recorded, _)) = &recorded
+        && *recorded != fingerprint
+    {
+        return Err(CliError::ShapeChanged(format!(
+            "the place's shape changed outside migratr: its fingerprint is {fingerprint}, and \
+             the ledger recorded {recorded}; run migratr dev --discover to see why; nothing \
+             changed"
+        )));
+    }
+    let place_has_ledger = objects
+        .iter()
+        .any(|o| o.kind == "table" && o.name == LEDGER_TABLE);
+    let (ledger, adopted) = if place_has_ledger {
+        (read["ledger"].as_array().cloned().unwrap_or_default(), None)
+    } else if let Some((_, versions)) = &recorded {
+        // Discovered by an earlier dev: the migration rows the place held then are carried, not
+        // adopted again. A migration applied locally since is not the place's and reads as
+        // pending again.
+        let carried = local_ledger
+            .into_iter()
+            .filter(|row| {
+                row["version"]
+                    .as_u64()
+                    .is_some_and(|v| versions.contains(&v))
+            })
+            .collect();
+        (carried, None)
+    } else {
+        match adopt(dir, &objects)? {
+            Some(rows) => {
+                let count = rows.len();
+                (rows, Some(count))
+            }
+            None => (Vec::new(), None),
+        }
+    };
 
     let work = work_dir(db);
     let fresh = |e: io::Error| CliError::Io {
@@ -57,12 +105,121 @@ pub fn dev(db: &Path, settings: &Settings) -> Result<Outcome, CliError> {
         fs::remove_dir_all(&work).map_err(fresh)?;
     }
     fs::create_dir_all(&work).map_err(fresh)?;
-    let ledger = read["ledger"].as_array().cloned().unwrap_or_default();
     let made = make(db, place, &smugglr, &work, &objects, &ledger, &fingerprint);
     let removed = fs::remove_dir_all(&work).map_err(fresh);
-    let outcome = made?;
+    let mut outcome = made?;
     removed?;
+    outcome.fields["adopted"] = json!(adopted.is_some());
+    if let Some(count) = adopted {
+        outcome.text = format!(
+            "adopted the place: its shape is what the migrations make; recorded {count} \
+             migration(s)\n{}",
+            outcome.text
+        );
+    }
     Ok(outcome)
+}
+
+/// `migratr dev --discover`: smugglr's --discover report of the local database and the place,
+/// as JSON when `json`. Nothing changes on either side.
+pub fn discover(db: &Path, settings: &Settings, json: bool) -> Result<Outcome, CliError> {
+    let place = place(settings)?;
+    Smugglr::find().discover(db.as_os_str(), OsStr::new(place), json)
+}
+
+fn place(settings: &Settings) -> Result<&str, CliError> {
+    settings.smuggl.as_deref().ok_or_else(|| {
+        CliError::Usage(format!(
+            "migratr dev needs a place: set \"smuggl\" in {FILE_NAME} to a file path, an \
+             https:// address or d1://<name>; nothing changed"
+        ))
+    })
+}
+
+/// The fingerprint an earlier dev recorded in the ledger `rows`, as the read form gives them,
+/// with the versions of the migrations the place held when it was recorded.
+fn recorded_fingerprint(rows: &[Value]) -> Option<(String, Vec<u64>)> {
+    let row = rows
+        .iter()
+        .find(|r| r["version"].as_u64() == Some(Note::Fingerprint.version()))?;
+    let note: Value = serde_json::from_str(row["checksum"].as_str()?).ok()?;
+    let versions = note["migrations"]
+        .as_array()
+        .map(|vs| vs.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default();
+    note["fingerprint"]
+        .as_str()
+        .map(|f| (f.to_string(), versions))
+}
+
+/// The versions of the migration rows in `ledger`, leaving out notes.
+fn migration_versions(ledger: &[Value]) -> Vec<u64> {
+    ledger
+        .iter()
+        .filter_map(|row| row["version"].as_u64())
+        .filter(|v| Note::ALL.iter().all(|n| n.version() != *v))
+        .collect()
+}
+
+/// Adopts a place with tables and no ledger: the place's schema, replayed in memory, is compared
+/// by structure with what the migrations in `dir` make. The same gives the ledger rows of every
+/// migration; a difference stops, naming it. `None` when there is nothing to adopt: a place with
+/// no tables, or no migrations to compare it with.
+fn adopt(dir: &Path, objects: &[Object]) -> Result<Option<Vec<Value>>, CliError> {
+    let has_tables = objects.iter().any(|o| {
+        o.kind == "table"
+            && o.name != D1_TABLE
+            && !o.name.to_ascii_lowercase().starts_with("sqlite_")
+    });
+    if !has_tables || !dir.is_dir() {
+        return Ok(None);
+    }
+    let migrations = load_dir(dir)?;
+    if migrations.is_empty() {
+        return Ok(None);
+    }
+    let mut made = RusqliteExecutor::new(Connection::open_in_memory()?);
+    up(&mut made, &migrations, None)?;
+    let place = Connection::open_in_memory()?;
+    replay(&place, objects, |_| true)?;
+    let differences = RusqliteExecutor::new(place).shape_differences(&made)?;
+    if !differences.is_empty() {
+        return Err(CliError::NotAdoptable(format!(
+            "the place has tables and no migratr ledger, and its shape is not what the \
+             migrations make: {}; nothing changed",
+            differences.join("; ")
+        )));
+    }
+    ledger_rows(made.connection()).map(Some)
+}
+
+/// The migration rows of `conn`'s ledger, each as an object of its columns.
+fn ledger_rows(conn: &Connection) -> Result<Vec<Value>, CliError> {
+    use rusqlite::types::ValueRef;
+    let notes: Vec<String> = Note::ALL.iter().map(|n| n.version().to_string()).collect();
+    let mut statement = conn.prepare(&format!(
+        "SELECT * FROM {LEDGER_TABLE} WHERE version NOT IN ({}) ORDER BY version",
+        notes.join(", ")
+    ))?;
+    let names: Vec<String> = statement
+        .column_names()
+        .iter()
+        .map(|n| (*n).to_string())
+        .collect();
+    let rows = statement.query_map([], |row| {
+        let mut columns = serde_json::Map::new();
+        for (at, name) in names.iter().enumerate() {
+            let value = match row.get_ref(at)? {
+                ValueRef::Integer(n) => json!(n),
+                ValueRef::Real(n) => json!(n),
+                ValueRef::Text(t) => json!(String::from_utf8_lossy(t)),
+                ValueRef::Null | ValueRef::Blob(_) => Value::Null,
+            };
+            columns.insert(name.clone(), value);
+        }
+        Ok(Value::Object(columns))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 fn make(
@@ -81,17 +238,21 @@ fn make(
     replay(&Connection::open(&staged)?, objects, |kind| kind == "table")?;
     smugglr.sync(OsStr::new(place), staged.as_os_str(), work, false)?;
     {
-        let conn = Connection::open(&staged)?;
-        copy_ledger(&conn, ledger)?;
-        replay(&conn, objects, |kind| {
-            matches!(kind, "index" | "trigger" | "view")
-        })?;
-        let mut exec = RusqliteExecutor::new(conn);
+        // The note comes first: it makes the ledger when the place has none.
+        let mut exec = RusqliteExecutor::new(Connection::open(&staged)?);
         record_note(
             &mut exec,
             Note::Fingerprint,
-            &json!({ "fingerprint": fingerprint }).to_string(),
+            &json!({
+                "fingerprint": fingerprint,
+                "migrations": migration_versions(ledger),
+            })
+            .to_string(),
         )?;
+        copy_ledger(exec.connection(), ledger)?;
+        replay(exec.connection(), objects, |kind| {
+            matches!(kind, "index" | "trigger" | "view")
+        })?;
     }
 
     let kept = if db.exists() {
@@ -142,9 +303,8 @@ fn make(
     })
 }
 
-/// Writes the place's migration rows, every column as the read form gives it, into the staged
-/// ledger, which the replay made from the place's own: sync leaves the ledger out. The place's
-/// notes are its own and are not copied.
+/// Writes migration rows, every column as the read form gives it, into the staged ledger: sync
+/// leaves the ledger out. Notes are not copied.
 fn copy_ledger(conn: &Connection, ledger: &[Value]) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
     for row in ledger {
@@ -320,6 +480,40 @@ impl Smugglr {
             )));
         }
         Err(self.missing("has no exec"))
+    }
+
+    /// `smugglr sync local place --discover`: its report, which changes nothing. Exit 3 is a
+    /// report too: a sync would stop.
+    fn discover(&self, local: &OsStr, place: &OsStr, json: bool) -> Result<Outcome, CliError> {
+        let mut command = Command::new(&self.bin);
+        command.arg("sync").arg(local).arg(place).arg("--discover");
+        if json {
+            command.arg("--json");
+        }
+        let output = command
+            .output()
+            .map_err(|e| self.missing(&format!("could not be run: {e}")))?;
+        let report = String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_string();
+        let parsed = if json {
+            serde_json::from_str(&report).ok()
+        } else {
+            Some(Value::Null)
+        };
+        match (output.status.code(), parsed) {
+            (Some(0 | 3), Some(value)) => Ok(Outcome {
+                fields: json!({ "discover": value }),
+                text: report,
+            }),
+            _ => Err(CliError::Smugglr(format!(
+                "smugglr sync {} {} --discover: {}{}",
+                Path::new(local).display(),
+                Path::new(place).display(),
+                report,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))),
+        }
     }
 
     /// `smugglr sync source target`, reading its config and keeping its memory in `work`. A

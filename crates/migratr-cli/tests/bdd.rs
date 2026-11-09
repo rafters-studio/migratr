@@ -33,6 +33,9 @@ struct World {
     smugglrs: Vec<(String, Option<PathBuf>)>,
     /// The exit code and stderr of each run of a dev step.
     runs: Vec<(Option<i32>, String)>,
+    /// The bytes of the place and of the local database before a dev step, `None` for a file
+    /// not there.
+    files: Vec<(PathBuf, Option<Vec<u8>>)>,
 }
 
 #[rstest::fixture]
@@ -52,6 +55,7 @@ fn world() -> World {
         place: None,
         smugglrs: Vec::new(),
         runs: Vec::new(),
+        files: Vec::new(),
     }
 }
 
@@ -453,7 +457,7 @@ fn ensure_place(world: &mut World) {
     name_place(world);
 }
 
-fn dev_command(world: &World, smugglr: &str, path: Option<&Path>) -> Command {
+fn dev_command(world: &World, smugglr: &str, path: Option<&Path>, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_migratr"));
     command
         .arg("--db")
@@ -461,6 +465,7 @@ fn dev_command(world: &World, smugglr: &str, path: Option<&Path>) -> Command {
         .arg("--dir")
         .arg(world.root.path().join("migrations"))
         .arg("dev")
+        .args(args)
         .current_dir(&world.cwd)
         .env("SMUGGLR", smugglr)
         .env("XDG_CONFIG_HOME", world.root.path().join("cfg"))
@@ -472,14 +477,19 @@ fn dev_command(world: &World, smugglr: &str, path: Option<&Path>) -> Command {
 }
 
 fn run_dev(world: &mut World) {
+    run_dev_with(world, &[]);
+}
+
+fn run_dev_with(world: &mut World, args: &[&str]) {
     world.before = tree(world.root.path());
+    world.files = files(world);
     let smugglrs = if world.smugglrs.is_empty() {
         vec![(smugglr_bin(), None)]
     } else {
         world.smugglrs.clone()
     };
     for (smugglr, path) in &smugglrs {
-        let output = dev_command(world, smugglr, path.as_deref())
+        let output = dev_command(world, smugglr, path.as_deref(), args)
             .output()
             .expect("run migratr dev");
         record(world, &output);
@@ -755,6 +765,265 @@ fn up_and_down_run(world: &mut World) {
     let down = migratr(world, &["down"]);
     let doc: Value = serde_json::from_slice(&down.stdout).expect("down document");
     assert_eq!(doc["reverted"].as_array().map(Vec::len), Some(1), "{doc}");
+}
+
+/// org, member and the org_name index, as a migration writes them.
+const ADOPT_MIGRATION: &str = r#"{"up": [
+  {"op": "create_table", "table": "org", "columns": [
+    {"name": "id", "type": "TEXT", "primary_key": 1},
+    {"name": "name", "type": "TEXT", "not_null": true}]},
+  {"op": "create_index", "name": "org_name", "table": "org", "columns": ["name"]},
+  {"op": "create_table", "table": "member", "columns": [
+    {"name": "id", "type": "TEXT", "primary_key": 1},
+    {"name": "org", "type": "TEXT", "not_null": true,
+     "references": {"table": "org", "column": "id"}},
+    {"name": "email", "type": "TEXT", "not_null": true},
+    {"name": "qty", "type": "INTEGER", "not_null": true, "default": "0"}],
+   "checks": ["qty >= 0"], "unique": [["org", "email"]]}
+]}"#;
+
+/// The same schema written by hand, in other quoting, case and whitespace, with rows.
+const ADOPT_PLACE: &str = "
+  create table org (id text primary key, name text not null);
+  CREATE INDEX org_name ON org (name);
+  create table member (
+    id text PRIMARY KEY,
+    org text not null references org,
+    email text NOT NULL,
+    qty integer not null default 0,
+    check(qty >= 0),
+    unique(org,email));
+  insert into org values ('o1', 'acme');
+  insert into member values ('m1', 'o1', 'a@acme.test', 2);";
+
+/// The place file and the local database, with their bytes, `None` for a file not there.
+fn files(world: &World) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    let mut paths = vec![app_db(world)];
+    paths.extend(world.place.clone());
+    paths
+        .into_iter()
+        .map(|path| {
+            let bytes = std::fs::read(&path).ok();
+            (path, bytes)
+        })
+        .collect()
+}
+
+fn unchanged(world: &World) {
+    assert_eq!(files(world), world.files, "a file changed");
+    assert_eq!(tree(world.root.path()), world.before);
+}
+
+fn write_migration(world: &World, text: &str) {
+    let dir = world.root.path().join("migrations");
+    for entry in std::fs::read_dir(&dir).expect("migrations") {
+        std::fs::remove_file(entry.expect("entry").path()).expect("remove migration");
+    }
+    std::fs::write(dir.join("20260101000001_init.json"), text).expect("migration");
+}
+
+/// A place file made from `batch` and named in migratr.jsonc, replacing any earlier place.
+fn fresh_place(world: &mut World, batch: &str) {
+    let place = world.root.path().join("place.db");
+    if place.exists() {
+        std::fs::remove_file(&place).expect("remove place");
+    }
+    make_place(world, batch);
+    name_place(world);
+}
+
+fn place_fingerprint(world: &World) -> String {
+    let output = Command::new(smugglr_bin())
+        .arg("exec")
+        .arg(world.place.as_ref().expect("a place"))
+        .arg("--read")
+        .output()
+        .expect("run smugglr");
+    let read: Value = serde_json::from_slice(&output.stdout).expect("read form");
+    read["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string()
+}
+
+fn migration_rows(world: &World) -> Vec<String> {
+    rows(
+        &app_db(world),
+        "SELECT CAST(version AS TEXT) FROM _migratr_migrations WHERE version NOT IN (0, 1) \
+         ORDER BY version",
+    )
+}
+
+#[given(
+    "a place file with tables and no migratr ledger whose schema by structure is what the migrations make"
+)]
+fn adoptable_place(world: &mut World) {
+    write_migration(world, ADOPT_MIGRATION);
+    fresh_place(world, ADOPT_PLACE);
+}
+
+#[then("the ledger records every migration and the place's fingerprint")]
+fn ledger_records_adoption(world: &mut World) {
+    dev_ready(world);
+    assert!(
+        world.stdout.contains("adopted the place"),
+        "{}",
+        world.stdout
+    );
+    assert_eq!(migration_rows(world), vec!["20260101000001"]);
+    let found = rows(
+        &app_db(world),
+        "SELECT checksum FROM _migratr_migrations WHERE version = 1 AND name = 'fingerprint'",
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    let note: Value = serde_json::from_str(&found[0]).expect("JSON");
+    assert_eq!(
+        note["fingerprint"].as_str(),
+        Some(place_fingerprint(world).as_str())
+    );
+    assert_eq!(rows(&app_db(world), "SELECT name FROM org"), vec!["acme"]);
+}
+
+#[given("instead a place file whose table t lacks a CHECK the migrations make")]
+fn place_lacking_check(world: &mut World) {
+    // A new start: no local database and no snapshots from the run before.
+    std::fs::remove_file(app_db(world)).expect("remove local database");
+    std::fs::remove_dir_all(world.root.path().join(".migratr")).expect("remove .migratr");
+    write_migration(
+        world,
+        r#"{"up": [{"op": "create_table", "table": "t", "columns": [
+          {"name": "id", "type": "TEXT", "primary_key": 1},
+          {"name": "qty", "type": "INTEGER"}], "checks": ["qty >= 0"]}]}"#,
+    );
+    fresh_place(
+        world,
+        "CREATE TABLE t (id TEXT PRIMARY KEY, qty INTEGER); INSERT INTO t VALUES ('1', 5);",
+    );
+    sql(
+        &app_db(world),
+        "CREATE TABLE mine (x TEXT); INSERT INTO mine VALUES ('local');",
+    );
+}
+
+#[then("the output names table t and the missing CHECK")]
+fn names_missing_check(world: &mut World) {
+    assert_eq!(world.exit, Some(1), "{}", world.stderr);
+    assert!(
+        world
+            .stderr
+            .contains("table t: the place lacks CHECK check(qty >= 0)"),
+        "{}",
+        world.stderr
+    );
+}
+
+#[then("neither the place nor the local database has changed")]
+fn neither_changed(world: &mut World) {
+    unchanged(world);
+}
+
+#[given("migratr dev has run against a place file")]
+fn dev_has_run(world: &mut World) {
+    adoptable_place(world);
+    run_dev(world);
+    dev_ready(world);
+    assert!(
+        world.stdout.contains("adopted the place"),
+        "{}",
+        world.stdout
+    );
+}
+
+#[when("the agent runs migratr dev again")]
+fn runs_dev_again(world: &mut World) {
+    // Two devs in the same second name their snapshots alike, which rafters-studio/migratr#86
+    // fixes; this one starts in the next second.
+    let second = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    while std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+        == second
+    {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    run_dev(world);
+}
+
+#[then("no adoption runs and the output ends with Dev ready")]
+fn no_adoption(world: &mut World) {
+    dev_ready(world);
+    assert!(!world.stdout.contains("adopted"), "{}", world.stdout);
+    assert_eq!(migration_rows(world), vec!["20260101000001"]);
+}
+
+#[given("a column added to the place outside migratr")]
+fn column_added(world: &mut World) {
+    sql(
+        world.place.as_ref().expect("a place"),
+        "ALTER TABLE org ADD COLUMN extra TEXT",
+    );
+}
+
+#[then("nothing has changed on either side")]
+fn nothing_changed_either_side(world: &mut World) {
+    assert_eq!(world.exit, Some(1), "{}", world.stderr);
+    unchanged(world);
+}
+
+#[then("the output says the place's shape changed outside migratr and names --discover")]
+fn says_shape_changed(world: &mut World) {
+    assert!(
+        world
+            .stderr
+            .contains("the place's shape changed outside migratr"),
+        "{}",
+        world.stderr
+    );
+    assert!(world.stderr.contains("--discover"), "{}", world.stderr);
+}
+
+#[when("the agent runs migratr dev --discover against a place file")]
+fn runs_dev_discover(world: &mut World) {
+    ensure_place(world);
+    sql(
+        &app_db(world),
+        "CREATE TABLE mine (x TEXT); INSERT INTO mine VALUES ('local');",
+    );
+    run_dev_with(world, &["--discover"]);
+}
+
+#[then("the --discover report of the local database and the place is printed")]
+fn discover_printed(world: &mut World) {
+    assert_eq!(world.exit, Some(0), "{}", world.stderr);
+    let place = world.place.clone().expect("a place");
+    for line in [
+        format!("source: file {}", app_db(world).display()),
+        format!("target: file {}", place.display()),
+        "shapes: differ".to_string(),
+    ] {
+        assert!(
+            world.stdout.lines().any(|l| l == line),
+            "missing {line:?} in {}",
+            world.stdout
+        );
+    }
+    assert!(
+        world
+            .stdout
+            .lines()
+            .any(|l| l.starts_with("  table mine: 1 rows")),
+        "{}",
+        world.stdout
+    );
+}
+
+#[then("neither has changed")]
+fn neither_has_changed(world: &mut World) {
+    unchanged(world);
 }
 
 scenarios!("tests", fixtures = [world: World]);

@@ -524,3 +524,90 @@ fn dev_brings_the_places_ledger_so_its_migrations_come_down_applied() {
     let up = project.run(&["--json", "--config", config, "up"]).json();
     assert_eq!(up["applied"], serde_json::json!([]), "{up}");
 }
+
+#[test]
+fn a_later_dev_carries_only_the_migrations_the_place_held() {
+    let Some(smugglr) = std::env::var_os("SMUGGLR").filter(|s| !s.is_empty()) else {
+        panic!("set SMUGGLR to a smugglr with exec");
+    };
+    let project = Project::new();
+    // The place: what migration N makes, with no ledger, so the first dev adopts it.
+    assert_eq!(
+        project.run(&["new", "create_users", "id:integer:pk"]).code,
+        0
+    );
+    assert_eq!(project.run(&["up"]).code, 0);
+    let place = project.root.path().join("place.db");
+    rusqlite::Connection::open(&place)
+        .expect("open place")
+        .execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY)")
+        .expect("place");
+    fs::remove_file(project.db()).expect("start with no local database");
+    let config = project.root.path().join("migratr.jsonc");
+    fs::write(
+        &config,
+        serde_json::json!({ "smuggl": place, "loud": false }).to_string(),
+    )
+    .expect("settings");
+    let config = config.to_str().expect("utf8 path");
+    let dev = || {
+        Command::new(env!("CARGO_BIN_EXE_migratr"))
+            .arg("--db")
+            .arg(project.db())
+            .arg("--dir")
+            .arg(project.dir())
+            .args(["--config", config, "dev"])
+            .env("SMUGGLR", &smugglr)
+            .env("XDG_CONFIG_HOME", project.root.path().join("cfg"))
+            .env("HOME", project.root.path().join("home"))
+            .output()
+            .expect("run migratr dev")
+    };
+    let first = dev();
+    assert!(first.status.success(), "{first:?}");
+    assert!(String::from_utf8_lossy(&first.stdout).contains("adopted the place"));
+
+    // N+1, applied to the local database only.
+    assert_eq!(
+        project
+            .run(&["--config", config, "new", "create_widgets", "id:integer:pk"])
+            .code,
+        0
+    );
+    let up = project.run(&["--json", "--config", config, "up"]).json();
+    assert_eq!(up["applied"].as_array().map(Vec::len), Some(1), "{up}");
+
+    // Two devs in the same second name their snapshots alike (rafters-studio/migratr#86).
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let second = dev();
+    assert!(second.status.success(), "{second:?}");
+
+    let status = project
+        .run(&["--json", "--config", config, "status"])
+        .json();
+    let states: Vec<(&str, &str)> = status["migrations"]
+        .as_array()
+        .expect("migrations")
+        .iter()
+        .map(|m| {
+            (
+                m["name"].as_str().expect("name"),
+                m["state"].as_str().expect("state"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        states,
+        vec![("create_users", "applied"), ("create_widgets", "pending")],
+        "{status}"
+    );
+    let tables: i64 = rusqlite::Connection::open(project.db())
+        .expect("open local")
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'widgets'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(tables, 0, "the local schema has no widgets table");
+}

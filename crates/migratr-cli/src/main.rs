@@ -84,7 +84,12 @@ enum Command {
         yes: bool,
     },
     /// Make the local database from the place smuggl names and record the rewind point.
-    Dev,
+    Dev {
+        /// Print smugglr's --discover report of the local database and the place, and change
+        /// nothing.
+        #[arg(long)]
+        discover: bool,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -196,7 +201,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Status => "status",
         Command::Plan { .. } => "plan",
         Command::Restore { .. } => "restore",
-        Command::Dev => "dev",
+        Command::Dev { .. } => "dev",
     }
 }
 
@@ -306,7 +311,8 @@ fn run(cli: &Cli, settings: &Settings) -> Result<Outcome, CliError> {
                 fields,
             })
         }
-        Command::Dev => dev::dev(db_path(cli)?, settings),
+        Command::Dev { discover: true } => dev::discover(db_path(cli)?, settings, cli.json),
+        Command::Dev { discover: false } => dev::dev(db_path(cli)?, &cli.dir, settings),
         Command::Restore { snapshot, yes } => {
             let db = db_path(cli)?;
             let report = restore(db, snapshot.as_deref(), *yes)?;
