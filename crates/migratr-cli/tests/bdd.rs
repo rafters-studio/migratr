@@ -2107,4 +2107,97 @@ fn failed_run_leaves_local(world: &mut World) {
     }
 }
 
+// Tests of FR-MIGRATR-023's criteria beyond the generated scenarios.
+
+/// Every migratr ledger row, every column.
+fn ledger_rows(world: &World) -> Vec<String> {
+    rows(
+        &app_db(world),
+        "SELECT json_array(version, name, checksum, applied_at, up_hash, down_hash) \
+         FROM _migratr_migrations ORDER BY version",
+    )
+}
+
+/// Every file of the pair's memory, with its bytes.
+fn pair_files(world: &World) -> Vec<(PathBuf, Vec<u8>)> {
+    tree(&world.root.path().join(".migratr").join("pair"))
+        .into_iter()
+        .filter(|p| p.is_file())
+        .map(|p| {
+            let bytes = std::fs::read(&p).expect("pair file");
+            (p, bytes)
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dev_whose_remember_fails_puts_the_old_local_database_and_memory_back() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut world = world();
+    ensure_place(&mut world);
+    run_dev(&mut world);
+    dev_ready(&world);
+    sql(&app_db(&world), "INSERT INTO a VALUES ('3', 'local');");
+    let before = world.root.path().join("before.db");
+    sql(
+        &app_db(&world),
+        &format!("VACUUM INTO '{}'", before.display()),
+    );
+    let ledger = ledger_rows(&world);
+    let pair = pair_files(&world);
+    assert!(!pair.is_empty());
+    let rewinds = snapshots(&world, "_dev.db");
+
+    // A smugglr that fails only the sync that makes the pair's memory, after the rename.
+    let wrapper = world.root.path().join("smugglr-failing-remember");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\ncase \"$XDG_CONFIG_HOME\" in */.migratr/pair) \
+             echo 'remember refused' >&2; exit 1;; esac\nexec '{}' \"$@\"\n",
+            smugglr_bin()
+        ),
+    )
+    .expect("wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let output = dev_command(&world, wrapper.to_str().expect("utf-8"), None, &[])
+        .output()
+        .expect("run migratr dev");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("remember refused"), "{stderr}");
+
+    in_step(&world, &before);
+    assert_eq!(
+        rows(&app_db(&world), "SELECT id || ':' || v FROM a ORDER BY id"),
+        vec!["1:x", "2:y", "3:local"]
+    );
+    assert_eq!(ledger_rows(&world), ledger);
+    assert_eq!(pair_files(&world), pair);
+    assert_eq!(snapshots(&world, "_dev.db"), rewinds);
+}
+
+#[test]
+fn dev_brings_a_table_with_a_generated_virtual_column() {
+    let mut world = world();
+    make_place(
+        &mut world,
+        "CREATE TABLE g (id TEXT PRIMARY KEY, a INTEGER, \
+         b INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL); \
+         INSERT INTO g (id, a) VALUES ('1', 1), ('2', 5);",
+    );
+    name_place(&world);
+    run_dev(&mut world);
+    dev_ready(&world);
+    assert_eq!(
+        rows(
+            &app_db(&world),
+            "SELECT id || ':' || a || ':' || b FROM g ORDER BY id"
+        ),
+        vec!["1:1:2", "2:5:10"]
+    );
+}
+
 scenarios!("tests", fixtures = [world: World]);

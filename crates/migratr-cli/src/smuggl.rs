@@ -102,7 +102,8 @@ pub fn smuggl(
         fs::remove_dir_all(&work).map_err(at(&work))?;
     }
     copy_tree(&pair, &work)?;
-    dev::copy_config(&work, &[])?;
+    let objects = dev::objects(&there)?;
+    dev::copy_config(&work, &dev::virtual_tables(&objects))?;
 
     let kept = snapshot_for_dev(db, db, DevSnapshot::Replaced)?;
     let mut lines = vec![format!("kept the working database as {}", kept.display())];

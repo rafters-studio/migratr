@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use migratr::{
-    DevSnapshot, Note, RusqliteExecutor, has_keyword, load_dir, record_note, snapshot_for_dev, up,
+    DevSnapshot, Note, RusqliteExecutor, has_keyword, load_dir, record_note, restore,
+    snapshot_for_dev, up,
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -37,7 +38,7 @@ const LEDGER_TABLE: &str = "_migratr_migrations";
 /// fingerprint. Nothing changes until smugglr has been found with exec and the place read, and
 /// a place with an AUTOINCREMENT table is refused before anything changes. The rewind point is
 /// recorded on the new database before it replaces the local one; only the pair's memory is made
-/// after.
+/// after, and when that fails the old local database and the old pair's memory are put back.
 ///
 /// The first dev against a place with tables and no ledger adopts it when its shape, compared by
 /// structure, is what the migrations in `dir` make, and records every migration; otherwise it
@@ -112,8 +113,8 @@ pub fn dev(db: &Path, dir: &Path, settings: &Settings) -> Result<Outcome, CliErr
     }
     fs::create_dir_all(&work).map_err(fresh)?;
     let made = make(db, place, &smugglr, &work, &objects, &ledger, &fingerprint);
-    // The local database has been replaced by now, so a work directory that cannot be removed
-    // fails nothing: the next run clears it.
+    // The work directory is dev's own, so one that cannot be removed fails nothing: the next run
+    // clears it.
     let _ = fs::remove_dir_all(&work);
     let mut outcome = made?;
     outcome.fields["adopted"] = json!(adopted.is_some());
@@ -156,6 +157,27 @@ fn tables_with<'a>(objects: &'a [Object], keyword: &str) -> Vec<&'a str> {
                 && o.sql
                     .as_deref()
                     .is_some_and(|sql| has_keyword(sql, keyword))
+        })
+        .map(|o| o.name.as_str())
+        .collect()
+}
+
+/// The names of the virtual tables, those made with CREATE VIRTUAL TABLE: a table with a
+/// generated VIRTUAL column is an ordinary table.
+pub(crate) fn virtual_tables(objects: &[Object]) -> Vec<&str> {
+    objects
+        .iter()
+        .filter(|o| {
+            o.kind == "table"
+                && o.sql.as_deref().is_some_and(|sql| {
+                    let mut words = sql.split_whitespace();
+                    words
+                        .next()
+                        .is_some_and(|w| w.eq_ignore_ascii_case("CREATE"))
+                        && words
+                            .next()
+                            .is_some_and(|w| w.eq_ignore_ascii_case("VIRTUAL"))
+                })
         })
         .map(|o| o.name.as_str())
         .collect()
@@ -263,7 +285,7 @@ fn make(
 ) -> Result<Outcome, CliError> {
     // A virtual table, such as a full-text table, has no primary key for smugglr to sync by: its
     // rows come through its shadow tables, and it is ignored.
-    let virtual_tables = tables_with(objects, "VIRTUAL");
+    let virtual_tables = virtual_tables(objects);
     copy_config(work, &virtual_tables)?;
     let staged = work.join("dev.db");
     // Tables first, rows second, then indexes, triggers and views, so no trigger fires on a
@@ -290,41 +312,35 @@ fn make(
 
     // The rewind point is snapshotted, checked and recorded on the staged database, so only the
     // pair's memory, which needs the local database at its own path, is made after it is
-    // replaced.
+    // replaced. A rewind point that never became the local database's is removed.
     let rewind = snapshot_for_dev(db, &staged, DevSnapshot::RewindPoint)?;
-    let bytes = fs::read(&rewind).map_err(|source| CliError::Io {
-        path: rewind.clone(),
-        source,
-    })?;
-    let sha256 = format!("{:x}", Sha256::digest(&bytes));
-    smugglr.sync(rewind.as_os_str(), staged.as_os_str(), work, SyncRun::Check)?;
-    let point = json!({ "snapshot": rewind, "sha256": sha256 });
-    {
-        let mut exec = RusqliteExecutor::new(Connection::open(&staged)?);
-        record_note(&mut exec, Note::RewindPoint, &point.to_string())?;
-    }
-
+    let unused = |error: CliError| {
+        let _ = fs::remove_file(&rewind);
+        error
+    };
+    let point = record_rewind_point(&rewind, &staged, smugglr, work).map_err(unused)?;
     let kept = if db.exists() {
-        Some(snapshot_for_dev(db, db, DevSnapshot::Replaced)?)
+        Some(snapshot_for_dev(db, db, DevSnapshot::Replaced).map_err(|e| unused(e.into()))?)
     } else {
         None
     };
-    // Journal files of the replaced database do not belong to the new one.
-    for suffix in ["-wal", "-shm"] {
-        let mut name = db.as_os_str().to_owned();
-        name.push(suffix);
-        let path = PathBuf::from(name);
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => return Err(CliError::Io { path, source }),
-        }
+
+    // From here the local database and the pair's memory change, so a failure puts both back:
+    // the old database from its snapshot, the old memory from where it was set aside.
+    let set_aside = work.join("pair");
+    if let Err(error) = replace(db, &staged, place, smugglr, &set_aside, &virtual_tables) {
+        return Err(match put_back(db, kept.as_deref(), &set_aside) {
+            Ok(()) => unused(error),
+            Err(e) => CliError::Smugglr(format!(
+                "{error}; putting the old local database back also failed: {e}; the old local \
+                 database is kept as {}",
+                kept.as_deref().map_or_else(
+                    || "nothing: there was none".to_string(),
+                    |k| k.display().to_string()
+                )
+            )),
+        });
     }
-    fs::rename(&staged, db).map_err(|source| CliError::Io {
-        path: db.to_path_buf(),
-        source,
-    })?;
-    remember(db, place, smugglr, &virtual_tables)?;
 
     let mut lines = Vec::new();
     if let Some(path) = &kept {
@@ -340,6 +356,102 @@ fn make(
         }),
         text: lines.join("\n"),
     })
+}
+
+/// Checks the rewind point `rewind`, a snapshot of the staged database, against it with
+/// `smugglr sync --dryrun` and records it, with its file's SHA-256, in the staged ledger.
+fn record_rewind_point(
+    rewind: &Path,
+    staged: &Path,
+    smugglr: &Smugglr,
+    work: &Path,
+) -> Result<Value, CliError> {
+    let bytes = fs::read(rewind).map_err(|source| CliError::Io {
+        path: rewind.to_path_buf(),
+        source,
+    })?;
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    smugglr.sync(rewind.as_os_str(), staged.as_os_str(), work, SyncRun::Check)?;
+    let point = json!({ "snapshot": rewind, "sha256": sha256 });
+    let mut exec = RusqliteExecutor::new(Connection::open(staged)?);
+    record_note(&mut exec, Note::RewindPoint, &point.to_string())?;
+    Ok(point)
+}
+
+/// Puts the staged database in place of the local database `db`, setting the pair's memory
+/// aside at `set_aside`, and makes the new pair's memory.
+fn replace(
+    db: &Path,
+    staged: &Path,
+    place: &str,
+    smugglr: &Smugglr,
+    set_aside: &Path,
+    ignored: &[&str],
+) -> Result<(), CliError> {
+    // Journal files of the replaced database do not belong to the new one.
+    remove_journals(db)?;
+    fs::rename(staged, db).map_err(|source| CliError::Io {
+        path: db.to_path_buf(),
+        source,
+    })?;
+    let pair = pair_dir(db);
+    if pair.exists() {
+        fs::rename(&pair, set_aside).map_err(|source| CliError::Io {
+            path: pair.clone(),
+            source,
+        })?;
+    }
+    remember(db, place, smugglr, ignored)
+}
+
+/// Puts the old local database back at `db` from its snapshot `kept`, or removes `db` when there
+/// was none, and the old pair's memory back from `set_aside`.
+fn put_back(db: &Path, kept: Option<&Path>, set_aside: &Path) -> Result<(), CliError> {
+    match kept {
+        Some(kept) => {
+            restore(db, Some(kept), true)?;
+        }
+        None => {
+            match fs::remove_file(db) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(CliError::Io {
+                        path: db.to_path_buf(),
+                        source,
+                    });
+                }
+            }
+            remove_journals(db)?;
+        }
+    }
+    let pair = pair_dir(db);
+    let at = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source: io::Error| CliError::Io { path, source }
+    };
+    if pair.exists() {
+        fs::remove_dir_all(&pair).map_err(at(&pair))?;
+    }
+    if set_aside.exists() {
+        fs::rename(set_aside, &pair).map_err(at(set_aside))?;
+    }
+    Ok(())
+}
+
+/// Removes the -wal and -shm files of the database `db`, any there are.
+fn remove_journals(db: &Path) -> Result<(), CliError> {
+    for suffix in ["-wal", "-shm"] {
+        let mut name = db.as_os_str().to_owned();
+        name.push(suffix);
+        let path = PathBuf::from(name);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(CliError::Io { path, source }),
+        }
+    }
+    Ok(())
 }
 
 /// Syncs the local database `db`, just made from the place and equal to it, with the place once,
@@ -443,14 +555,14 @@ pub(crate) fn migratr_dir(db: &Path) -> PathBuf {
 }
 
 /// One row of the place's `sqlite_master`, as the read form gives it.
-struct Object {
+pub(crate) struct Object {
     kind: String,
     name: String,
     tbl_name: String,
     sql: Option<String>,
 }
 
-fn objects(read: &Value) -> Result<Vec<Object>, CliError> {
+pub(crate) fn objects(read: &Value) -> Result<Vec<Object>, CliError> {
     let malformed = || CliError::Smugglr("smugglr exec --read gave no schema".to_string());
     let text = |row: &Value, key: &str| row[key].as_str().map(str::to_string);
     read["schema"]
@@ -795,7 +907,26 @@ fn moves_nothing(output: &Output) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::with_ignored;
+    use super::{Object, virtual_tables, with_ignored};
+
+    #[test]
+    fn only_a_create_virtual_table_is_virtual() {
+        let table = |name: &str, sql: &str| Object {
+            kind: "table".to_string(),
+            name: name.to_string(),
+            tbl_name: name.to_string(),
+            sql: Some(sql.to_string()),
+        };
+        let objects = [
+            table("docs", "CREATE VIRTUAL TABLE docs USING fts5(body)"),
+            table(
+                "g",
+                "CREATE TABLE g (id TEXT PRIMARY KEY, a INTEGER, \
+                 b INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+            ),
+        ];
+        assert_eq!(virtual_tables(&objects), vec!["docs"]);
+    }
 
     #[test]
     fn ignored_names_join_an_ignore_list_or_make_one() {
