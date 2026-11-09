@@ -35,8 +35,9 @@ const LEDGER_TABLE: &str = "_migratr_migrations";
 /// old one as a snapshot. The result is snapshotted, checked against the local database with
 /// `smugglr sync --dryrun`, and recorded in the ledger as the rewind point, beside the place's
 /// fingerprint. Nothing changes until smugglr has been found with exec and the place read, and
-/// a place with an AUTOINCREMENT table is refused before anything changes. The local database
-/// is replaced last, so a failure at any step leaves it and its ledger as they were.
+/// a place with an AUTOINCREMENT table is refused before anything changes. The rewind point is
+/// recorded on the new database before it replaces the local one; only the pair's memory is made
+/// after.
 ///
 /// The first dev against a place with tables and no ledger adopts it when its shape, compared by
 /// structure, is what the migrations in `dir` make, and records every migration; otherwise it
@@ -287,8 +288,9 @@ fn make(
         })?;
     }
 
-    // The rewind point is snapshotted and checked on the staged database, so nothing that can
-    // fail comes after the local database is replaced.
+    // The rewind point is snapshotted, checked and recorded on the staged database, so only the
+    // pair's memory, which needs the local database at its own path, is made after it is
+    // replaced.
     let rewind = snapshot_for_dev(db, &staged, DevSnapshot::RewindPoint)?;
     let bytes = fs::read(&rewind).map_err(|source| CliError::Io {
         path: rewind.clone(),
