@@ -137,7 +137,7 @@ pub fn discover(db: &Path, settings: &Settings, json: bool) -> Result<Outcome, C
 
 /// Refuses a place with an AUTOINCREMENT table, naming each: migratr allows no auto columns.
 fn refuse_autoincrement(objects: &[Object]) -> Result<(), CliError> {
-    let tables = tables_with(objects, "AUTOINCREMENT");
+    let tables = tables_whose(objects, |sql| has_keyword(sql, "AUTOINCREMENT"));
     if tables.is_empty() {
         return Ok(());
     }
@@ -148,16 +148,11 @@ fn refuse_autoincrement(objects: &[Object]) -> Result<(), CliError> {
     )))
 }
 
-/// The names of the tables whose statement has `keyword` as a bare word.
-fn tables_with<'a>(objects: &'a [Object], keyword: &str) -> Vec<&'a str> {
+/// The names of the tables whose statement `wanted` takes.
+fn tables_whose(objects: &[Object], wanted: impl Fn(&str) -> bool) -> Vec<&str> {
     objects
         .iter()
-        .filter(|o| {
-            o.kind == "table"
-                && o.sql
-                    .as_deref()
-                    .is_some_and(|sql| has_keyword(sql, keyword))
-        })
+        .filter(|o| o.kind == "table" && o.sql.as_deref().is_some_and(&wanted))
         .map(|o| o.name.as_str())
         .collect()
 }
@@ -165,22 +160,15 @@ fn tables_with<'a>(objects: &'a [Object], keyword: &str) -> Vec<&'a str> {
 /// The names of the virtual tables, those made with CREATE VIRTUAL TABLE: a table with a
 /// generated VIRTUAL column is an ordinary table.
 pub(crate) fn virtual_tables(objects: &[Object]) -> Vec<&str> {
-    objects
-        .iter()
-        .filter(|o| {
-            o.kind == "table"
-                && o.sql.as_deref().is_some_and(|sql| {
-                    let mut words = sql.split_whitespace();
-                    words
-                        .next()
-                        .is_some_and(|w| w.eq_ignore_ascii_case("CREATE"))
-                        && words
-                            .next()
-                            .is_some_and(|w| w.eq_ignore_ascii_case("VIRTUAL"))
-                })
-        })
-        .map(|o| o.name.as_str())
-        .collect()
+    tables_whose(objects, |sql| {
+        let mut words = sql.split_whitespace();
+        words
+            .next()
+            .is_some_and(|w| w.eq_ignore_ascii_case("CREATE"))
+            && words
+                .next()
+                .is_some_and(|w| w.eq_ignore_ascii_case("VIRTUAL"))
+    })
 }
 
 pub(crate) fn place<'a>(settings: &'a Settings, command: &str) -> Result<&'a str, CliError> {
@@ -412,16 +400,7 @@ fn put_back(db: &Path, kept: Option<&Path>, set_aside: &Path) -> Result<(), CliE
             restore(db, Some(kept), true)?;
         }
         None => {
-            match fs::remove_file(db) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(CliError::Io {
-                        path: db.to_path_buf(),
-                        source,
-                    });
-                }
-            }
+            remove_if_there(db.to_path_buf())?;
             remove_journals(db)?;
         }
     }
@@ -444,14 +423,18 @@ fn remove_journals(db: &Path) -> Result<(), CliError> {
     for suffix in ["-wal", "-shm"] {
         let mut name = db.as_os_str().to_owned();
         name.push(suffix);
-        let path = PathBuf::from(name);
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => return Err(CliError::Io { path, source }),
-        }
+        remove_if_there(PathBuf::from(name))?;
     }
     Ok(())
+}
+
+/// Removes the file at `path`, when there is one.
+fn remove_if_there(path: PathBuf) -> Result<(), CliError> {
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(CliError::Io { path, source }),
+    }
 }
 
 /// Syncs the local database `db`, just made from the place and equal to it, with the place once,
