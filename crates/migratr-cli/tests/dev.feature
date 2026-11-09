@@ -30,12 +30,38 @@ Feature: migratr dev gets the local database ready to work against the place
     And that file's SHA-256 is the one recorded
     And smugglr sync --dryrun between the snapshot and the local database moves nothing
 
+  @criterion-01a1b3a8-887e-74e3-b23b-9a5023b3e936 @module-migratr-cli
+  Scenario: dev adopts a place whose shape is what the migrations make, and stops on one that is not
+    Given a place file with tables and no migratr ledger whose schema by structure is what the migrations make
+    When the agent runs migratr dev
+    Then the ledger records every migration and the place's fingerprint
+    Given instead a place file whose table t lacks a CHECK the migrations make
+    When the agent runs migratr dev
+    Then the output names table t and the missing CHECK
+    And neither the place nor the local database has changed
+
   @criterion-01a1b3a8-887e-74e3-b23b-9a67502f9626 @module-migratr-cli
   Scenario: dev needs smugglr with exec
     Given no smugglr on the path, or a smugglr whose exec read form is refused
     When the agent runs migratr dev
     Then nothing has changed
     And the output names smugglr 0.6.3 to install
+
+  @criterion-01a1b8aa-b111-74c1-be0e-204e0f4da497 @module-migratr-cli
+  Scenario: a second dev does not rediscover, and stops on a shape changed outside migratr
+    Given migratr dev has run against a place file
+    When the agent runs migratr dev again
+    Then no adoption runs and the output ends with Dev ready
+    Given a column added to the place outside migratr
+    When the agent runs migratr dev
+    Then nothing has changed on either side
+    And the output says the place's shape changed outside migratr and names --discover
+
+  @criterion-01a1b8aa-b111-74c1-be0e-2054b46cc56b @module-migratr-cli
+  Scenario: dev --discover reports and changes nothing
+    When the agent runs migratr dev --discover against a place file
+    Then the --discover report of the local database and the place is printed
+    And neither has changed
 
   @criterion-01a1b8aa-b111-74c1-be0e-20600eafac30 @module-migratr-cli
   Scenario: dev without a place names the setting

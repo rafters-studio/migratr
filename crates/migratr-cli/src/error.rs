@@ -17,6 +17,14 @@ pub enum CliError {
     #[error("{0}")]
     NoSmugglr(String),
 
+    /// The place has tables and no ledger, and its shape is not what the migrations make.
+    #[error("{0}")]
+    NotAdoptable(String),
+
+    /// The place's fingerprint is not the one the ledger recorded.
+    #[error("{0}")]
+    ShapeChanged(String),
+
     /// smugglr ran and refused or failed, in its own words.
     #[error("{0}")]
     Smugglr(String),
@@ -54,6 +62,8 @@ impl CliError {
             CliError::Database(_) => "database",
             CliError::Usage(_) => "usage",
             CliError::NoSmugglr(_) => "smugglr_missing",
+            CliError::NotAdoptable(_) => "not_adoptable",
+            CliError::ShapeChanged(_) => "shape_changed",
             CliError::Smugglr(_) => "smugglr",
             CliError::Io { .. } => "io",
         }

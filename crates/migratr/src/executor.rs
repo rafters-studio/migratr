@@ -170,6 +170,14 @@ mod rusqlite_executor {
         pub fn connection(&self) -> &Connection {
             &self.conn
         }
+
+        /// Each way this database's schema differs by structure from `made`'s, the schema the
+        /// migrations make, as one line naming the table and the difference: columns, foreign
+        /// keys, indexes, CHECK and UNIQUE items, and trigger and view text, each normalized.
+        /// Empty when they are the same.
+        pub fn shape_differences(&self, made: &RusqliteExecutor) -> rusqlite::Result<Vec<String>> {
+            crate::shape::differences_through(&mut Reader(&self.conn), &mut Reader(&made.conn))
+        }
     }
 
     fn foreign_keys_enabled(conn: &Connection) -> rusqlite::Result<bool> {
