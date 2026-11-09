@@ -6,6 +6,7 @@ description = "The migratr migration file format: types, parser and checksum."
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+rust-version.workspace = true
 readme = "../../README.md"
 
 [dependencies]
