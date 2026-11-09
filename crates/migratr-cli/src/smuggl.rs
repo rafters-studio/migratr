@@ -245,7 +245,12 @@ pub fn discover(
         .as_ref()
         .map_or(&point.snapshot, |copy| &copy.db);
     let (sync_stops, report) = smugglr.report(local.as_os_str(), OsStr::new(place), true)?;
-    let report: Value = serde_json::from_str(&report).unwrap_or(Value::Null);
+    let report: Value = serde_json::from_str(&report).map_err(|_| {
+        CliError::Smugglr(format!(
+            "smugglr sync {} {place} --discover --json gave no JSON: {report}",
+            local.display()
+        ))
+    })?;
     if sync_stops {
         stops.push("smugglr's --discover says a sync with the place would stop".to_string());
     }
