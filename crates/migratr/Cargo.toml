@@ -6,6 +6,7 @@ description = "Schema migrations for SQLite: JSON migration files, safe table re
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+rust-version.workspace = true
 readme = "../../README.md"
 
 [features]

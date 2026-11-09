@@ -201,11 +201,7 @@ fn ledger_rows(conn: &Connection) -> Result<Vec<Value>, CliError> {
         "SELECT * FROM {LEDGER_TABLE} WHERE version NOT IN ({}) ORDER BY version",
         notes.join(", ")
     ))?;
-    let names: Vec<String> = statement
-        .column_names()
-        .iter()
-        .map(|n| (*n).to_string())
-        .collect();
+    let names: Vec<String> = statement.column_names().map(str::to_string).collect();
     let rows = statement.query_map([], |row| {
         let mut columns = serde_json::Map::new();
         for (at, name) in names.iter().enumerate() {
