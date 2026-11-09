@@ -57,7 +57,8 @@ pub fn dev(db: &Path, settings: &Settings) -> Result<Outcome, CliError> {
         fs::remove_dir_all(&work).map_err(fresh)?;
     }
     fs::create_dir_all(&work).map_err(fresh)?;
-    let made = make(db, place, &smugglr, &work, &objects, &fingerprint);
+    let ledger = read["ledger"].as_array().cloned().unwrap_or_default();
+    let made = make(db, place, &smugglr, &work, &objects, &ledger, &fingerprint);
     let removed = fs::remove_dir_all(&work).map_err(fresh);
     let outcome = made?;
     removed?;
@@ -70,6 +71,7 @@ fn make(
     smugglr: &Smugglr,
     work: &Path,
     objects: &[Object],
+    ledger: &[Value],
     fingerprint: &str,
 ) -> Result<Outcome, CliError> {
     copy_config(work)?;
@@ -80,6 +82,7 @@ fn make(
     smugglr.sync(OsStr::new(place), staged.as_os_str(), work, false)?;
     {
         let conn = Connection::open(&staged)?;
+        copy_ledger(&conn, ledger)?;
         replay(&conn, objects, |kind| {
             matches!(kind, "index" | "trigger" | "view")
         })?;
@@ -137,6 +140,54 @@ fn make(
         }),
         text: lines.join("\n"),
     })
+}
+
+/// Writes the place's migration rows, every column as the read form gives it, into the staged
+/// ledger, which the replay made from the place's own: sync leaves the ledger out. The place's
+/// notes are its own and are not copied.
+fn copy_ledger(conn: &Connection, ledger: &[Value]) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for row in ledger {
+        let Some(columns) = row.as_object() else {
+            continue;
+        };
+        let note = columns
+            .get("version")
+            .and_then(Value::as_u64)
+            .is_some_and(|v| v == Note::RewindPoint.version() || v == Note::Fingerprint.version());
+        if note {
+            continue;
+        }
+        let names: Vec<String> = columns
+            .keys()
+            .map(|k| format!("\"{}\"", k.replace('"', "\"\"")))
+            .collect();
+        let values: Vec<rusqlite::types::Value> = columns.values().map(sql_value).collect();
+        let marks = vec!["?"; values.len()].join(", ");
+        tx.execute(
+            &format!(
+                "INSERT INTO _migratr_migrations ({}) VALUES ({marks})",
+                names.join(", ")
+            ),
+            rusqlite::params_from_iter(values),
+        )?;
+    }
+    tx.commit()
+}
+
+fn sql_value(value: &Value) -> rusqlite::types::Value {
+    use rusqlite::types::Value as Sql;
+    match value {
+        Value::Null => Sql::Null,
+        Value::Number(n) => n
+            .as_i64()
+            .map(Sql::Integer)
+            .or_else(|| n.as_f64().map(Sql::Real))
+            .unwrap_or(Sql::Null),
+        Value::String(s) => Sql::Text(s.clone()),
+        Value::Bool(b) => Sql::Integer(i64::from(*b)),
+        other => Sql::Text(other.to_string()),
+    }
 }
 
 /// Where dev builds the new database: beside migratr's snapshots, so it is renamed into place
