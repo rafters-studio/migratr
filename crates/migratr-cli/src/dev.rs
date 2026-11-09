@@ -196,10 +196,10 @@ fn adopt(dir: &Path, objects: &[Object]) -> Result<Option<Vec<Value>>, CliError>
 /// The migration rows of `conn`'s ledger, each as an object of its columns.
 fn ledger_rows(conn: &Connection) -> Result<Vec<Value>, CliError> {
     use rusqlite::types::ValueRef;
+    let notes: Vec<String> = Note::ALL.iter().map(|n| n.version().to_string()).collect();
     let mut statement = conn.prepare(&format!(
-        "SELECT * FROM {LEDGER_TABLE} WHERE version NOT IN ({}, {}) ORDER BY version",
-        Note::RewindPoint.version(),
-        Note::Fingerprint.version()
+        "SELECT * FROM {LEDGER_TABLE} WHERE version NOT IN ({}) ORDER BY version",
+        notes.join(", ")
     ))?;
     let names: Vec<String> = statement
         .column_names()

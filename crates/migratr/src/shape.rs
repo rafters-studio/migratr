@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 
 use crate::executor::{SchemaObject, SchemaSnapshot};
+use crate::ledger::LEDGER;
 use crate::reader::{SqlReader, read_schema_through};
 use crate::sql_ddl::{quote_ident, table_body};
 
@@ -53,7 +54,7 @@ struct Shape {
 
 fn skipped(table: &str) -> bool {
     let lower = table.to_ascii_lowercase();
-    lower.starts_with("sqlite_") || lower == "_migratr_migrations" || table == D1_TABLE
+    lower.starts_with("sqlite_") || lower == LEDGER || table == D1_TABLE
 }
 
 impl Shape {
