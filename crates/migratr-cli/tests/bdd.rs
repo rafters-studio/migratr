@@ -36,6 +36,8 @@ struct World {
     smugglrs: Vec<(String, Option<PathBuf>)>,
     /// The exit code and stderr of each run of a dev step.
     runs: Vec<(Option<i32>, String)>,
+    /// The stdout of each run of a ship step.
+    stdouts: Vec<String>,
     /// The bytes of the place and of the local database before a dev step, `None` for a file
     /// not there.
     files: Vec<(PathBuf, Option<Vec<u8>>)>,
@@ -62,6 +64,7 @@ fn world() -> World {
         place: None,
         smugglrs: Vec::new(),
         runs: Vec::new(),
+        stdouts: Vec::new(),
         files: Vec::new(),
         env: Vec::new(),
         rewind: None,
@@ -994,9 +997,15 @@ fn no_adoption(world: &mut World) {
 
 #[given("a column added to the place outside migratr")]
 fn column_added(world: &mut World) {
+    let place = world.place.clone().expect("a place");
+    let table = rows(
+        &place,
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('org', 'notes')",
+    );
+    let table = table.first().expect("a table of the place");
     sql(
-        world.place.as_ref().expect("a place"),
-        "ALTER TABLE org ADD COLUMN extra TEXT",
+        &place,
+        &format!("ALTER TABLE {table} ADD COLUMN extra TEXT"),
     );
 }
 
@@ -1090,10 +1099,12 @@ fn run_smuggl(world: &mut World, runs: &[&[&str]]) {
     world.files = files(world);
     world.rewind = recorded_rewind(world);
     world.runs.clear();
+    world.stdouts.clear();
     for args in runs {
         let output = smuggl_command(world, args).output().expect("run migratr");
         record(world, &output);
         world.runs.push((world.exit, world.stderr.clone()));
+        world.stdouts.push(world.stdout.clone());
     }
 }
 
@@ -1350,8 +1361,17 @@ fn dev_and_drop(world: &mut World) {
 
 #[given("the place will not end with the expected fingerprint")]
 fn place_off_shape(world: &mut World) {
-    // An index made outside migratr: smugglr exec refuses every batch on the fingerprint.
-    sql(&place_file(world), "CREATE INDEX outside ON notes (body);");
+    // A place ledger that refuses the migration's row. The ledger is not part of the
+    // fingerprint, so the shape stop passes, and smugglr exec's batch, which writes the row,
+    // fails whole: the place never gets the migration's shape.
+    sql(
+        &place_file(world),
+        &format!(
+            "CREATE TABLE _migratr_migrations (version INTEGER PRIMARY KEY \
+             CHECK (version <> {SHIPPED}), name TEXT NOT NULL, checksum TEXT NOT NULL, \
+             applied_at TEXT NOT NULL, up_hash TEXT, down_hash TEXT);"
+        ),
+    );
 }
 
 #[then("the local database's hashes equal the rewind point's")]
@@ -1409,7 +1429,7 @@ fn snapshots_remain(world: &mut World) {
 
 #[when("the place is fixed and the agent runs migratr up --smuggl again")]
 fn fixed_and_again(world: &mut World) {
-    sql(&place_file(world), "DROP INDEX outside;");
+    sql(&place_file(world), "DROP TABLE _migratr_migrations;");
     next_second();
     runs_up_smuggl(world);
 }
@@ -1451,17 +1471,158 @@ fn runs_up_and_down_smuggl(world: &mut World) {
 #[then("nothing has changed anywhere")]
 fn nothing_anywhere(world: &mut World) {
     assert_eq!(world.runs.len(), 2);
-    for (exit, stderr) in &world.runs {
-        assert_eq!(*exit, Some(1), "{stderr}");
-    }
     unchanged(world);
 }
 
 #[then("each says to run migratr dev")]
 fn each_says_dev(world: &mut World) {
-    for (_, stderr) in &world.runs {
+    for (exit, stderr) in &world.runs {
+        assert_eq!(*exit, Some(1), "{stderr}");
         assert!(stderr.contains("run migratr dev"), "{stderr}");
     }
+}
+
+#[then("each says the place's shape changed outside migratr and names --discover")]
+fn each_says_shape_changed(world: &mut World) {
+    for ((exit, stderr), command) in world.runs.iter().zip(["up", "down"]) {
+        assert_eq!(*exit, Some(1), "{stderr}");
+        assert!(
+            stderr.contains("error [shape_changed]: the place's shape changed outside migratr"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("run migratr {command} --smuggl --discover")),
+            "{stderr}"
+        );
+    }
+}
+
+#[given(
+    "migratr dev against a place file and a local migration that drops table old holding 3 rows"
+)]
+fn dev_and_drop_old(world: &mut World) {
+    dev_against(
+        world,
+        &format!(
+            "{NOTES_PLACE} CREATE TABLE old (id TEXT PRIMARY KEY); \
+             INSERT INTO old VALUES ('o1'), ('o2'), ('o3');"
+        ),
+    );
+    add_migration(
+        world,
+        SHIPPED,
+        "drop_old",
+        r#"{"up": [{"op": "drop_table", "table": "old", "definition": {"name": "old",
+          "columns": [{"name": "id", "type": "TEXT", "primary_key": 1}],
+          "sql": "CREATE TABLE old (id TEXT PRIMARY KEY)"}}]}"#,
+    );
+}
+
+#[when("the agent runs migratr up --smuggl --discover, and then migratr down --smuggl --discover")]
+fn runs_discover(world: &mut World) {
+    run_smuggl(
+        world,
+        &[
+            &["up", "--smuggl", "--discover"],
+            &["down", "--smuggl", "--discover"],
+        ],
+    );
+}
+
+#[then(
+    "each prints the place's --discover report and the migrations it would send with their statements"
+)]
+fn discover_reports(world: &mut World) {
+    let target = format!("target: file {}", place_file(world).display());
+    for (stdout, command) in world.stdouts.iter().zip(["up", "down"]) {
+        assert!(stdout.lines().any(|l| l == target), "{stdout}");
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l == format!("migratr {command} --smuggl would send:")),
+            "{stdout}"
+        );
+    }
+    let up = &world.stdouts[0];
+    assert!(
+        up.lines().any(|l| l
+            == format!("  {SHIPPED}_drop_old DESTRUCTIVE, snapshot {SHIPPED}_up.db")
+            || l.starts_with(&format!("  {SHIPPED}_drop_old"))),
+        "{up}"
+    );
+    assert!(up.lines().any(|l| l == "    DROP TABLE \"old\""), "{up}");
+    // Dev recorded no migration the place held, so down would send none.
+    assert!(
+        world.stdouts[1].contains("nothing to do"),
+        "{}",
+        world.stdouts[1]
+    );
+}
+
+#[then("the up report names table old and 3 rows destroyed")]
+fn names_old_destroyed(world: &mut World) {
+    let up = &world.stdouts[0];
+    assert!(
+        up.lines()
+            .any(|l| l == format!("{SHIPPED} destroys table old on the place: 3 rows")),
+        "{up}"
+    );
+}
+
+#[then("each exits 0, or 3 when the run would stop")]
+fn exits_zero_or_three(world: &mut World) {
+    for ((exit, stderr), stdout) in world.runs.iter().zip(&world.stdouts) {
+        let stops = stdout.lines().any(|l| l.starts_with("the run would stop"));
+        assert_eq!(*exit, Some(if stops { 3 } else { 0 }), "{stdout}{stderr}");
+    }
+    // Here neither run would stop.
+    assert!(world.runs.iter().all(|(exit, _)| *exit == Some(0)));
+}
+
+#[given("migratr dev, a new local migration, and migratr up --smuggl")]
+fn dev_migration_and_up(world: &mut World) {
+    dev_and_migration(world);
+    next_second();
+    runs_up_smuggl(world);
+    shipped(world);
+    place_holds_shipped(world);
+}
+
+#[given("migratr dev again")]
+fn dev_again(world: &mut World) {
+    next_second();
+    run_dev(world);
+    dev_ready(world);
+}
+
+#[when("the agent runs migratr down --smuggl")]
+fn runs_down_smuggl(world: &mut World) {
+    next_second();
+    run_smuggl(world, &[&["down", "--smuggl"]]);
+}
+
+#[then("the place's ledger no longer holds that migration")]
+fn place_lacks_migration(world: &mut World) {
+    shipped(world);
+    assert!(
+        rows(
+            &place_file(world),
+            &format!("SELECT name FROM _migratr_migrations WHERE version = {SHIPPED}")
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        rows(
+            &place_file(world),
+            "SELECT name FROM pragma_table_info('notes')"
+        ),
+        vec!["id", "body"]
+    );
+    assert!(
+        migration_rows(world).is_empty(),
+        "{:?}",
+        migration_rows(world)
+    );
 }
 
 /// parent and child, child referencing parent, as the first migration makes them. note is
