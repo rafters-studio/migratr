@@ -15,3 +15,11 @@ Feature: Ledger of applied migrations
     Given a pending migration that adds a column
     When the agent runs migratr up
     Then its ledger row's down hash equals the SHA-256 of what migratr plan down printed for it right after
+
+  @criterion-01a1b8aa-b0a5-7423-9ad4-7ad33d8ca71d @module-migratr-cli
+  Scenario: a successful smuggl run tidies the ledger
+    Given migratr dev against a local place file and one new local migration
+    And autoclean left at its default
+    When the agent runs migratr up --smuggl
+    Then the ledger holds no rewind-point row
+    And the fingerprint row holds the place's new fingerprint

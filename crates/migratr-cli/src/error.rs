@@ -25,6 +25,14 @@ pub enum CliError {
     #[error("{0}")]
     ShapeChanged(String),
 
+    /// The ledger holds no rewind point, so there is nothing to ship from.
+    #[error("{0}")]
+    NoRewindPoint(String),
+
+    /// A --smuggl run failed and put the local database back at the rewind point.
+    #[error("{0}")]
+    ShipFailed(String),
+
     /// smugglr ran and refused or failed, in its own words.
     #[error("{0}")]
     Smugglr(String),
@@ -64,6 +72,8 @@ impl CliError {
             CliError::NoSmugglr(_) => "smugglr_missing",
             CliError::NotAdoptable(_) => "not_adoptable",
             CliError::ShapeChanged(_) => "shape_changed",
+            CliError::NoRewindPoint(_) => "no_rewind_point",
+            CliError::ShipFailed(_) => "ship_failed",
             CliError::Smugglr(_) => "smugglr",
             CliError::Io { .. } => "io",
         }

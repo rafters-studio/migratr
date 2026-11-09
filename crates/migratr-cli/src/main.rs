@@ -2,6 +2,7 @@ mod dev;
 mod error;
 mod plan;
 mod settings;
+mod smuggl;
 mod status;
 
 use std::collections::VecDeque;
@@ -57,11 +58,19 @@ enum Command {
         /// Stop after this version.
         #[arg(long)]
         to: Option<u64>,
+        /// Ship the migrations to the place smuggl names, through the rewind point migratr dev
+        /// recorded.
+        #[arg(long)]
+        smuggl: bool,
     },
     /// Reverse the newest applied migrations.
     Down {
         #[arg(long, default_value_t = 1)]
         steps: usize,
+        /// Ship the revert to the place smuggl names, through the rewind point migratr dev
+        /// recorded.
+        #[arg(long)]
+        smuggl: bool,
     },
     /// List every migration as applied or pending.
     Status,
@@ -233,7 +242,11 @@ fn run(cli: &Cli, settings: &Settings) -> Result<Outcome, CliError> {
                 text: format!("created {}", path.display()),
             })
         }
-        Command::Up { to } => {
+        Command::Up { to, smuggl: true } => {
+            smuggl::up_smuggl(db_path(cli)?, &cli.dir, settings, *to)
+        }
+        Command::Down { smuggl: true, .. } => smuggl::down_smuggl(db_path(cli)?),
+        Command::Up { to, smuggl: false } => {
             let db = db_path(cli)?;
             let migrations = load_dir(&cli.dir)?;
             let mut exec = loud(settings, Connection::open(db)?);
@@ -258,7 +271,10 @@ fn run(cli: &Cli, settings: &Settings) -> Result<Outcome, CliError> {
                 fields: json!({ "applied": report.applied }),
             })
         }
-        Command::Down { steps } => {
+        Command::Down {
+            steps,
+            smuggl: false,
+        } => {
             let db = db_path(cli)?;
             let migrations = load_dir(&cli.dir)?;
             let mut exec = loud(settings, Connection::open(db)?);
