@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use rstest_bdd_macros::{given, scenarios, then, when};
+
+#[path = "support/d1.rs"]
+mod d1;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -36,6 +39,10 @@ struct World {
     /// The bytes of the place and of the local database before a dev step, `None` for a file
     /// not there.
     files: Vec<(PathBuf, Option<Vec<u8>>)>,
+    /// What migratr and smugglr are run with besides, such as how to reach the D1 stand-in.
+    env: Vec<(String, String)>,
+    /// The rewind point dev recorded, before the step under test.
+    rewind: Option<PathBuf>,
 }
 
 #[rstest::fixture]
@@ -56,6 +63,8 @@ fn world() -> World {
         smugglrs: Vec::new(),
         runs: Vec::new(),
         files: Vec::new(),
+        env: Vec::new(),
+        rewind: None,
     }
 }
 
@@ -469,7 +478,8 @@ fn dev_command(world: &World, smugglr: &str, path: Option<&Path>, args: &[&str])
         .current_dir(&world.cwd)
         .env("SMUGGLR", smugglr)
         .env("XDG_CONFIG_HOME", world.root.path().join("cfg"))
-        .env("HOME", world.root.path().join("home"));
+        .env("HOME", world.root.path().join("home"))
+        .envs(world.env.iter().cloned());
     if let Some(path) = path {
         command.env("PATH", path);
     }
@@ -660,9 +670,17 @@ fn rewind_sha(world: &mut World) {
 #[then("smugglr sync --dryrun between the snapshot and the local database moves nothing")]
 fn dryrun_moves_nothing(world: &mut World) {
     let point = rewind_point(world);
+    in_step(
+        world,
+        Path::new(point["snapshot"].as_str().expect("snapshot")),
+    );
+}
+
+/// A dry-run sync between `snapshot` and the local database has every table in step.
+fn in_step(world: &World, snapshot: &Path) {
     let output = Command::new(smugglr_bin())
         .arg("sync")
-        .arg(point["snapshot"].as_str().expect("snapshot"))
+        .arg(snapshot)
         .arg(app_db(world))
         .args(["--dryrun", "--json"])
         .env("XDG_CONFIG_HOME", world.root.path().join("dryrun-cfg"))
@@ -833,10 +851,16 @@ fn fresh_place(world: &mut World, batch: &str) {
 }
 
 fn place_fingerprint(world: &World) -> String {
+    fingerprint_of(world, world.place.as_ref().expect("a place").as_os_str())
+}
+
+/// The fingerprint smugglr exec's read form gives for the database or place `address`.
+fn fingerprint_of(world: &World, address: &std::ffi::OsStr) -> String {
     let output = Command::new(smugglr_bin())
         .arg("exec")
-        .arg(world.place.as_ref().expect("a place"))
+        .arg(address)
         .arg("--read")
+        .envs(world.env.iter().cloned())
         .output()
         .expect("run smugglr");
     let read: Value = serde_json::from_slice(&output.stdout).expect("read form");
@@ -936,8 +960,13 @@ fn dev_has_run(world: &mut World) {
 
 #[when("the agent runs migratr dev again")]
 fn runs_dev_again(world: &mut World) {
-    // Two devs in the same second name their snapshots alike, which rafters-studio/migratr#86
-    // fixes; this one starts in the next second.
+    next_second();
+    run_dev(world);
+}
+
+/// Waits for the next second. Two runs in the same second name their snapshots alike, which
+/// rafters-studio/migratr#86 fixes.
+fn next_second() {
     let second = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
@@ -950,7 +979,6 @@ fn runs_dev_again(world: &mut World) {
     {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    run_dev(world);
 }
 
 #[then("no adoption runs and the output ends with Dev ready")]
@@ -1024,6 +1052,564 @@ fn discover_printed(world: &mut World) {
 #[then("neither has changed")]
 fn neither_has_changed(world: &mut World) {
     unchanged(world);
+}
+
+// up --smuggl (FR-MIGRATR-024) and the ledger it tidies (FR-MIGRATR-003).
+
+/// The place the ship scenarios start from.
+const NOTES_PLACE: &str = "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT); \
+     INSERT INTO notes VALUES ('p1', 'one'), ('p2', 'two'), ('p3', 'three');";
+
+/// The version of the migration a ship scenario adds after dev.
+const SHIPPED: &str = "20260201000000";
+
+/// migratr run in the root with the smugglr the tests were given.
+fn smuggl_command(world: &World, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_migratr"));
+    command
+        .arg("--db")
+        .arg(app_db(world))
+        .arg("--dir")
+        .arg(world.root.path().join("migrations"))
+        .args(args)
+        .current_dir(&world.cwd)
+        .env("SMUGGLR", smugglr_bin())
+        .env("XDG_CONFIG_HOME", world.root.path().join("cfg"))
+        .env("HOME", world.root.path().join("home"))
+        .envs(world.env.iter().cloned());
+    command
+}
+
+/// Runs each of `runs` in turn, after noting the files, the tree and the rewind point.
+fn run_smuggl(world: &mut World, runs: &[&[&str]]) {
+    world.before = tree(world.root.path());
+    world.files = files(world);
+    world.rewind = recorded_rewind(world);
+    world.runs.clear();
+    for args in runs {
+        let output = smuggl_command(world, args).output().expect("run migratr");
+        record(world, &output);
+        world.runs.push((world.exit, world.stderr.clone()));
+    }
+}
+
+/// The snapshot the ledger's rewind-point row names, if it has one.
+fn recorded_rewind(world: &World) -> Option<PathBuf> {
+    if !app_db(world).exists() {
+        return None;
+    }
+    let found = rows(
+        &app_db(world),
+        "SELECT checksum FROM sqlite_master, _migratr_migrations \
+         WHERE sqlite_master.name = '_migratr_migrations' AND version = 0 LIMIT 1",
+    );
+    let point: Value = serde_json::from_str(found.first()?).ok()?;
+    point["snapshot"].as_str().map(PathBuf::from)
+}
+
+fn place_file(world: &World) -> PathBuf {
+    world.place.clone().expect("a place")
+}
+
+/// The snapshots among migratr's whose names end with `suffix`.
+fn snapshots(world: &World, suffix: &str) -> Vec<PathBuf> {
+    let dir = world.root.path().join(".migratr").join("snapshots");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.to_string_lossy().ends_with(suffix))
+        .collect()
+}
+
+/// Writes the migration `version`_`name` beside any there are.
+fn add_migration(world: &World, version: &str, name: &str, text: &str) {
+    std::fs::write(
+        world
+            .root
+            .path()
+            .join("migrations")
+            .join(format!("{version}_{name}.json")),
+        text,
+    )
+    .expect("migration");
+}
+
+fn dev_against(world: &mut World, place: &str) {
+    fresh_place(world, place);
+    run_dev(world);
+    dev_ready(world);
+}
+
+fn add_tag(world: &World) {
+    add_migration(
+        world,
+        SHIPPED,
+        "add_tag",
+        r#"{"up": [{"op": "add_column", "table": "notes", "column": {"name": "tag", "type": "TEXT"}}]}"#,
+    );
+}
+
+fn shipped(world: &World) {
+    assert_eq!(world.exit, Some(0), "{}{}", world.stdout, world.stderr);
+    assert_eq!(
+        world.stdout.trim_end().lines().last(),
+        Some("done"),
+        "{}",
+        world.stdout
+    );
+}
+
+fn place_holds_shipped(world: &World) {
+    assert_eq!(
+        rows(
+            &place_file(world),
+            &format!("SELECT name FROM _migratr_migrations WHERE version = {SHIPPED}")
+        ),
+        vec!["add_tag"]
+    );
+}
+
+#[given("migratr dev against a place file and one new local migration")]
+fn dev_and_migration(world: &mut World) {
+    dev_against(world, NOTES_PLACE);
+    add_tag(world);
+}
+
+#[given("migratr dev against a local place file and one new local migration")]
+fn dev_local_and_migration(world: &mut World) {
+    dev_and_migration(world);
+}
+
+#[given("migratr dev against a place file")]
+fn dev_against_place(world: &mut World) {
+    dev_against(world, NOTES_PLACE);
+}
+
+#[when("the agent runs migratr up --smuggl")]
+fn runs_up_smuggl(world: &mut World) {
+    run_smuggl(world, &[&["up", "--smuggl"]]);
+}
+
+#[when("the agent runs migratr up --smuggl with autoclean left on")]
+fn runs_up_smuggl_autoclean(world: &mut World) {
+    let settings =
+        std::fs::read_to_string(world.root.path().join("migratr.jsonc")).expect("settings");
+    assert!(!settings.contains("autoclean"), "{settings}");
+    runs_up_smuggl(world);
+}
+
+#[then("the place holds the migration in its ledger")]
+fn place_holds_migration(world: &mut World) {
+    shipped(world);
+    place_holds_shipped(world);
+}
+
+#[then("the place's fingerprint equals the local database's")]
+fn fingerprints_equal(world: &mut World) {
+    assert_eq!(
+        place_fingerprint(world),
+        fingerprint_of(world, app_db(world).as_os_str())
+    );
+}
+
+#[given("the place then inserts one row, updates one and deletes one")]
+fn place_changes(world: &mut World) {
+    sql(
+        &place_file(world),
+        "INSERT INTO notes VALUES ('p4', 'four'); UPDATE notes SET body = 'ONE' WHERE id = 'p1'; \
+         DELETE FROM notes WHERE id = 'p2';",
+    );
+}
+
+#[given("the working database gains a row of its own")]
+fn working_row(world: &mut World) {
+    sql(&app_db(world), "INSERT INTO notes VALUES ('w', 'work');");
+}
+
+const NOTES_ROWS: &str = "SELECT id || ':' || body FROM notes ORDER BY id";
+
+#[then("the local database holds the place's insert and update and not its deleted row")]
+fn local_has_place_changes(world: &mut World) {
+    shipped(world);
+    assert_eq!(
+        rows(&app_db(world), NOTES_ROWS),
+        vec!["p1:ONE", "p3:three", "p4:four"]
+    );
+}
+
+#[then("the place does not hold the working database's row")]
+fn place_lacks_working_row(world: &mut World) {
+    assert_eq!(
+        rows(&place_file(world), NOTES_ROWS),
+        vec!["p1:ONE", "p3:three", "p4:four"]
+    );
+}
+
+/// The working database's snapshot the output names.
+fn named_kept(world: &World) -> PathBuf {
+    let line = world
+        .stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("kept the working database as "))
+        .expect("the output names the working database's snapshot");
+    PathBuf::from(line)
+}
+
+fn rewind_rows(world: &World) -> Vec<String> {
+    rows(
+        &app_db(world),
+        "SELECT name FROM _migratr_migrations WHERE version = 0",
+    )
+}
+
+#[then("the rewind-point snapshot, its ledger row and the working database's snapshot are gone")]
+fn three_gone(world: &mut World) {
+    shipped(world);
+    let rewind = world.rewind.clone().expect("dev recorded a rewind point");
+    assert!(!rewind.exists(), "{}", rewind.display());
+    assert!(rewind_rows(world).is_empty());
+    assert!(!named_kept(world).exists());
+    assert!(snapshots(world, "_kept.db").is_empty());
+    assert!(snapshots(world, "_dev.db").is_empty());
+}
+
+#[then("the output names each")]
+fn names_each(world: &mut World) {
+    let rewind = world.rewind.clone().expect("rewind point");
+    for line in [
+        format!("removed the rewind point {}", rewind.display()),
+        "removed the rewind point's ledger row".to_string(),
+        format!(
+            "removed the working database's snapshot {}",
+            named_kept(world).display()
+        ),
+    ] {
+        assert!(
+            world.stdout.lines().any(|l| l == line),
+            "missing {line:?} in {}",
+            world.stdout
+        );
+    }
+}
+
+#[given("the same with autoclean false in migratr.jsonc")]
+fn same_without_autoclean(world: &mut World) {
+    std::fs::remove_file(app_db(world)).expect("remove local database");
+    std::fs::remove_dir_all(world.root.path().join(".migratr")).expect("remove .migratr");
+    std::fs::remove_file(
+        world
+            .root
+            .path()
+            .join("migrations")
+            .join(format!("{SHIPPED}_add_tag.json")),
+    )
+    .expect("remove migration");
+    fresh_place(world, NOTES_PLACE);
+    let place = place_file(world);
+    write_settings(
+        world.root.path(),
+        &serde_json::json!({ "smuggl": place, "loud": false, "autoclean": false }).to_string(),
+    );
+    run_dev(world);
+    dev_ready(world);
+    add_tag(world);
+}
+
+#[then("all three remain")]
+fn three_remain(world: &mut World) {
+    shipped(world);
+    place_holds_shipped(world);
+    let rewind = world.rewind.clone().expect("rewind point");
+    assert!(rewind.is_file(), "{}", rewind.display());
+    assert_eq!(rewind_rows(world), vec!["rewind_point"]);
+    assert!(named_kept(world).is_file());
+}
+
+#[given(
+    "migratr dev against a place file and a new local migration that drops a column, so migratr snapshots before it runs"
+)]
+fn dev_and_drop(world: &mut World) {
+    dev_against(
+        world,
+        "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT, extra TEXT); \
+         INSERT INTO notes VALUES ('p1', 'one', 'x'), ('p2', 'two', 'y');",
+    );
+    add_migration(
+        world,
+        SHIPPED,
+        "drop_extra",
+        r#"{"up": [{"op": "drop_column", "table": "notes", "column": {"name": "extra", "type": "TEXT"}}]}"#,
+    );
+}
+
+#[given("the place will not end with the expected fingerprint")]
+fn place_off_shape(world: &mut World) {
+    // An index made outside migratr: smugglr exec refuses every batch on the fingerprint.
+    sql(&place_file(world), "CREATE INDEX outside ON notes (body);");
+}
+
+#[then("the local database's hashes equal the rewind point's")]
+fn local_is_rewind(world: &mut World) {
+    let rewind = world.rewind.clone().expect("rewind point");
+    in_step(world, &rewind);
+    let columns = rows(
+        &app_db(world),
+        "SELECT name FROM pragma_table_info('notes')",
+    );
+    assert_eq!(columns, vec!["id", "body", "extra"]);
+}
+
+#[then("its ledger holds the rewind-point and fingerprint rows")]
+fn ledger_has_notes(world: &mut World) {
+    assert_eq!(
+        Some(PathBuf::from(
+            rewind_point(world)["snapshot"].as_str().expect("snapshot")
+        )),
+        world.rewind
+    );
+    assert_eq!(
+        rows(
+            &app_db(world),
+            "SELECT name FROM _migratr_migrations WHERE version = 1"
+        ),
+        vec!["fingerprint"]
+    );
+    assert!(
+        migration_rows(world).is_empty(),
+        "{:?}",
+        migration_rows(world)
+    );
+}
+
+#[then("the errors are printed and the exit code is non-zero")]
+fn errors_printed(world: &mut World) {
+    assert_ne!(world.exit, Some(0), "{}", world.stdout);
+    assert!(
+        world.stderr.contains("error [ship_failed]"),
+        "{}",
+        world.stderr
+    );
+    assert!(world.stderr.contains("fingerprint"), "{}", world.stderr);
+}
+
+#[then("the rewind point snapshot and the working database's snapshot remain")]
+fn snapshots_remain(world: &mut World) {
+    let rewind = world.rewind.clone().expect("rewind point");
+    assert!(rewind.is_file(), "{}", rewind.display());
+    assert_eq!(snapshots(world, "_kept.db").len(), 1);
+    // The drop's own snapshot was taken, and its prune kept dev's.
+    assert_eq!(snapshots(world, "_up.db").len(), 1);
+}
+
+#[when("the place is fixed and the agent runs migratr up --smuggl again")]
+fn fixed_and_again(world: &mut World) {
+    sql(&place_file(world), "DROP INDEX outside;");
+    next_second();
+    runs_up_smuggl(world);
+}
+
+#[then("the migration reaches the place")]
+fn migration_reaches_place(world: &mut World) {
+    shipped(world);
+    assert_eq!(
+        rows(
+            &place_file(world),
+            &format!("SELECT name FROM _migratr_migrations WHERE version = {SHIPPED}")
+        ),
+        vec!["drop_extra"]
+    );
+    assert_eq!(
+        rows(
+            &place_file(world),
+            "SELECT name FROM pragma_table_info('notes')"
+        ),
+        vec!["id", "body"]
+    );
+    fingerprints_equal(world);
+}
+
+#[given("a ledger with no rewind point")]
+fn ledger_without_rewind(world: &mut World) {
+    fresh_place(world, NOTES_PLACE);
+    add_tag(world);
+    sql(&app_db(world), NOTES_PLACE);
+    let up = migratr(world, &["up"]);
+    assert!(up.status.success(), "{up:?}");
+}
+
+#[when("the agent runs migratr up --smuggl, and then migratr down --smuggl")]
+fn runs_up_and_down_smuggl(world: &mut World) {
+    run_smuggl(world, &[&["up", "--smuggl"], &["down", "--smuggl"]]);
+}
+
+#[then("nothing has changed anywhere")]
+fn nothing_anywhere(world: &mut World) {
+    assert_eq!(world.runs.len(), 2);
+    for (exit, stderr) in &world.runs {
+        assert_eq!(*exit, Some(1), "{stderr}");
+    }
+    unchanged(world);
+}
+
+#[then("each says to run migratr dev")]
+fn each_says_dev(world: &mut World) {
+    for (_, stderr) in &world.runs {
+        assert!(stderr.contains("run migratr dev"), "{stderr}");
+    }
+}
+
+/// parent and child, child referencing parent, as the first migration makes them. note is
+/// UNIQUE, so dropping it rebuilds parent with child rather than running an in-place DROP COLUMN.
+const FAMILY: &str = r#"{"up": [
+  {"op": "create_table", "table": "parent", "columns": [
+    {"name": "id", "type": "INTEGER", "primary_key": 1},
+    {"name": "name", "type": "TEXT", "not_null": true},
+    {"name": "note", "type": "TEXT", "unique": true}]},
+  {"op": "create_index", "name": "parent_name", "table": "parent", "columns": ["name"]},
+  {"op": "create_table", "table": "child", "columns": [
+    {"name": "id", "type": "INTEGER", "primary_key": 1},
+    {"name": "parent", "type": "INTEGER", "not_null": true,
+     "references": {"table": "parent", "column": "id"}},
+    {"name": "v", "type": "TEXT"}]},
+  {"op": "create_index", "name": "child_parent", "table": "child", "columns": ["parent"]}
+]}"#;
+
+const PARENT_ROWS: &str = "SELECT id || ':' || name FROM parent ORDER BY id";
+const CHILD_ROWS: &str = "SELECT id || ':' || parent || ':' || v FROM child ORDER BY id";
+
+#[given("migratr dev against a d1:// place whose table parent is referenced by child")]
+fn dev_against_d1(world: &mut World) {
+    add_migration(world, "20260101000001", "family", FAMILY);
+    let place = world.root.path().join("d1.db");
+    let made = Command::new(env!("CARGO_BIN_EXE_migratr"))
+        .arg("--db")
+        .arg(&place)
+        .arg("--dir")
+        .arg(world.root.path().join("migrations"))
+        .arg("up")
+        .current_dir(&world.cwd)
+        .env("HOME", world.root.path().join("home"))
+        .output()
+        .expect("make the place");
+    assert!(made.status.success(), "{made:?}");
+    let mut batch = String::new();
+    for p in 1..=20 {
+        batch.push_str(&format!(
+            "INSERT INTO parent VALUES ({p}, 'parent {p}', 'note {p}');"
+        ));
+    }
+    for c in 1..=50 {
+        batch.push_str(&format!(
+            "INSERT INTO child VALUES ({c}, {}, 'child {c}');",
+            c % 20 + 1
+        ));
+    }
+    sql(&place, &batch);
+    world.env = d1::serve("shop", place.to_str().expect("UTF-8 path"));
+    world.place = Some(place);
+    write_settings(
+        world.root.path(),
+        &serde_json::json!({ "smuggl": "d1://shop", "loud": false }).to_string(),
+    );
+    run_dev(world);
+    dev_ready(world);
+    world.planned.1 = rows(&place_file(world), PARENT_ROWS);
+    world.planned.1.extend(rows(&place_file(world), CHILD_ROWS));
+}
+
+#[given("a local migration that rebuilds parent")]
+fn rebuild_parent(world: &mut World) {
+    add_migration(
+        world,
+        SHIPPED,
+        "drop_parent_note",
+        r#"{"up": [{"op": "drop_column", "table": "parent", "column": {"name": "note", "type": "TEXT"}}]}"#,
+    );
+}
+
+#[then("parent and child are rebuilt on the place")]
+fn family_rebuilt(world: &mut World) {
+    shipped(world);
+    let place = place_file(world);
+    assert_eq!(
+        rows(&place, "SELECT name FROM pragma_table_info('parent')"),
+        vec!["id", "name"]
+    );
+    assert_eq!(
+        rows(
+            &place,
+            "SELECT \"table\" FROM pragma_foreign_key_list('child')"
+        ),
+        vec!["parent"]
+    );
+    assert!(
+        rows(
+            &place,
+            "SELECT name FROM sqlite_master WHERE name LIKE '%migratr_new%'"
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        rows(
+            &place,
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL ORDER BY name"
+        ),
+        vec!["child_parent", "parent_name"]
+    );
+    assert!(rows(&place, "SELECT \"table\" FROM pragma_foreign_key_check").is_empty());
+    assert_eq!(
+        rows(
+            &place,
+            &format!("SELECT name FROM _migratr_migrations WHERE version = {SHIPPED}")
+        ),
+        vec!["drop_parent_note"]
+    );
+    assert_eq!(
+        fingerprint_of(world, std::ffi::OsStr::new("d1://shop")),
+        fingerprint_of(world, app_db(world).as_os_str())
+    );
+}
+
+#[then("every row of both is there")]
+fn every_row(world: &mut World) {
+    let place = place_file(world);
+    let mut found = rows(&place, PARENT_ROWS);
+    assert_eq!(found.len(), 20);
+    let children = rows(&place, CHILD_ROWS);
+    assert_eq!(children.len(), 50);
+    found.extend(children);
+    assert_eq!(found, world.planned.1);
+}
+
+#[given("autoclean left at its default")]
+fn autoclean_default(world: &mut World) {
+    let settings =
+        std::fs::read_to_string(world.root.path().join("migratr.jsonc")).expect("settings");
+    assert!(!settings.contains("autoclean"), "{settings}");
+}
+
+#[then("the ledger holds no rewind-point row")]
+fn no_rewind_row(world: &mut World) {
+    shipped(world);
+    assert!(rewind_rows(world).is_empty());
+}
+
+#[then("the fingerprint row holds the place's new fingerprint")]
+fn fingerprint_row_new(world: &mut World) {
+    let found = rows(
+        &app_db(world),
+        "SELECT checksum FROM _migratr_migrations WHERE version = 1 AND name = 'fingerprint'",
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    let note: Value = serde_json::from_str(&found[0]).expect("JSON");
+    let now = place_fingerprint(world);
+    assert_eq!(note["fingerprint"].as_str(), Some(now.as_str()));
+    assert_eq!(
+        note["migrations"],
+        serde_json::json!([SHIPPED.parse::<u64>().expect("version")])
+    );
 }
 
 scenarios!("tests", fixtures = [world: World]);

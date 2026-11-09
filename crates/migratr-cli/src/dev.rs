@@ -39,7 +39,7 @@ const LEDGER_TABLE: &str = "_migratr_migrations";
 /// stops naming the difference. A later dev compares the place's fingerprint with the ledger's
 /// and stops when they differ. Either stop changes nothing.
 pub fn dev(db: &Path, dir: &Path, settings: &Settings) -> Result<Outcome, CliError> {
-    let place = place(settings)?;
+    let place = place(settings, "dev")?;
     let smugglr = Smugglr::find();
     // The read form on the local database is the check for exec; a local database not made yet
     // is checked by the read of the place, which dev needs anyway.
@@ -123,14 +123,14 @@ pub fn dev(db: &Path, dir: &Path, settings: &Settings) -> Result<Outcome, CliErr
 /// `migratr dev --discover`: smugglr's --discover report of the local database and the place,
 /// as JSON when `json`. Nothing changes on either side.
 pub fn discover(db: &Path, settings: &Settings, json: bool) -> Result<Outcome, CliError> {
-    let place = place(settings)?;
+    let place = place(settings, "dev")?;
     Smugglr::find().discover(db.as_os_str(), OsStr::new(place), json)
 }
 
-fn place(settings: &Settings) -> Result<&str, CliError> {
+pub(crate) fn place<'a>(settings: &'a Settings, command: &str) -> Result<&'a str, CliError> {
     settings.smuggl.as_deref().ok_or_else(|| {
         CliError::Usage(format!(
-            "migratr dev needs a place: set \"smuggl\" in {FILE_NAME} to a file path, an \
+            "migratr {command} needs a place: set \"smuggl\" in {FILE_NAME} to a file path, an \
              https:// address or d1://<name>; nothing changed"
         ))
     })
@@ -153,7 +153,7 @@ fn recorded_fingerprint(rows: &[Value]) -> Option<(String, Vec<u64>)> {
 }
 
 /// The versions of the migration rows in `ledger`, leaving out notes.
-fn migration_versions(ledger: &[Value]) -> Vec<u64> {
+pub(crate) fn migration_versions(ledger: &[Value]) -> Vec<u64> {
     ledger
         .iter()
         .filter_map(|row| row["version"].as_u64())
@@ -275,6 +275,7 @@ fn make(
         path: db.to_path_buf(),
         source,
     })?;
+    remember(db, place, smugglr)?;
 
     let rewind = snapshot_for_dev(db, DevSnapshot::RewindPoint)?;
     let bytes = fs::read(&rewind).map_err(|source| CliError::Io {
@@ -301,6 +302,39 @@ fn make(
         }),
         text: lines.join("\n"),
     })
+}
+
+/// Syncs the local database `db`, just made from the place and equal to it, with the place once,
+/// so the pair's memory, kept in [`pair_dir`], holds the rows the rewind point holds. up --smuggl
+/// syncs the rewind point, put back at `db`'s own path, with that memory, so the place's changes
+/// since dev arrive, deletes included. The memory starts empty.
+fn remember(db: &Path, place: &str, smugglr: &Smugglr) -> Result<(), CliError> {
+    let pair = pair_dir(db);
+    let fresh = |e: io::Error| CliError::Io {
+        path: pair.clone(),
+        source: e,
+    };
+    if pair.exists() {
+        fs::remove_dir_all(&pair).map_err(fresh)?;
+    }
+    fs::create_dir_all(&pair).map_err(fresh)?;
+    copy_config(&pair)?;
+    smugglr.sync(address(db)?.as_os_str(), OsStr::new(place), &pair, false)
+}
+
+/// The local database's address as smugglr is given it whenever the pair's memory is used: the
+/// memory is kept by the two addresses.
+pub(crate) fn address(db: &Path) -> Result<PathBuf, CliError> {
+    fs::canonicalize(db).map_err(|source| CliError::Io {
+        path: db.to_path_buf(),
+        source,
+    })
+}
+
+/// Where the memory of the pair of the local database `db` and the place is kept, as smugglr's
+/// config home: beside migratr's snapshots.
+pub(crate) fn pair_dir(db: &Path) -> PathBuf {
+    migratr_dir(db).join("pair")
 }
 
 /// Writes migration rows, every column as the read form gives it, into the staged ledger: sync
@@ -353,11 +387,16 @@ fn sql_value(value: &Value) -> rusqlite::types::Value {
 /// Where dev builds the new database: beside migratr's snapshots, so it is renamed into place
 /// on the same filesystem.
 fn work_dir(db: &Path) -> PathBuf {
+    migratr_dir(db).join("dev")
+}
+
+/// migratr's directory beside the database `db`.
+pub(crate) fn migratr_dir(db: &Path) -> PathBuf {
     let parent = match db.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    parent.join(".migratr").join("dev")
+    parent.join(".migratr")
 }
 
 /// One row of the place's `sqlite_master`, as the read form gives it.
@@ -409,7 +448,7 @@ fn replay(
 /// Copies smugglr's config file, which holds its ignore list, into `work`, where dev's syncs
 /// read it. Their memory then stays in `work` and goes with it: a remembered pair would take a
 /// new, empty database for rows deleted and delete them from the place.
-fn copy_config(work: &Path) -> Result<(), CliError> {
+pub(crate) fn copy_config(work: &Path) -> Result<(), CliError> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
@@ -432,12 +471,12 @@ fn copy_config(work: &Path) -> Result<(), CliError> {
 }
 
 /// The smugglr binary: the one SMUGGLR names, else `smugglr` on PATH.
-struct Smugglr {
+pub(crate) struct Smugglr {
     bin: OsString,
 }
 
 impl Smugglr {
-    fn find() -> Self {
+    pub(crate) fn find() -> Self {
         Self {
             bin: std::env::var_os("SMUGGLR")
                 .filter(|bin| !bin.is_empty())
@@ -454,7 +493,7 @@ impl Smugglr {
     }
 
     /// The read form of exec on `target`: its schema, ledger and fingerprint.
-    fn read(&self, target: &OsStr) -> Result<Value, CliError> {
+    pub(crate) fn read(&self, target: &OsStr) -> Result<Value, CliError> {
         let output = Command::new(&self.bin)
             .arg("exec")
             .arg(target)
@@ -480,6 +519,74 @@ impl Smugglr {
             )));
         }
         Err(self.missing("has no exec"))
+    }
+
+    /// `smugglr exec local place --version v --up --expect fingerprint`, the statements `batch`
+    /// on stdin: smugglr runs them on the place only when their hash is the one the local ledger
+    /// recorded for `version` and the place's fingerprint is `expect`. Returns the place's
+    /// fingerprint after them.
+    pub(crate) fn exec(
+        &self,
+        local: &OsStr,
+        place: &OsStr,
+        version: u64,
+        expect: &str,
+        batch: &[String],
+    ) -> Result<String, CliError> {
+        use std::io::Write as _;
+        use std::process::Stdio;
+
+        let mut child = Command::new(&self.bin)
+            .arg("exec")
+            .arg(local)
+            .arg(place)
+            .args([
+                "--version",
+                &version.to_string(),
+                "--up",
+                "--expect",
+                expect,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| self.missing(&format!("could not be run: {e}")))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(json!(batch).to_string().as_bytes())
+                .map_err(|e| CliError::Smugglr(format!("smugglr exec: {e}")))?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|e| CliError::Smugglr(format!("smugglr exec: {e}")))?;
+        let said: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+        if output.status.success()
+            && let Some(fingerprint) = said["fingerprint"].as_str()
+        {
+            return Ok(fingerprint.to_string());
+        }
+        let why = if let Some(detail) = said["detail"].as_str() {
+            format!(
+                "refused ({}): {detail}",
+                said["refused"].as_str().unwrap_or_default()
+            )
+        } else if let Some(error) = said["error"].as_str() {
+            format!(
+                "failed at {:?}: {error}",
+                said["failed"].as_str().unwrap_or_default()
+            )
+        } else {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        };
+        Err(CliError::Smugglr(format!(
+            "smugglr exec of version {version} on {}: {why}",
+            Path::new(place).display()
+        )))
     }
 
     /// `smugglr sync local place --discover`: its report, which changes nothing. Exit 3 is a
@@ -518,7 +625,7 @@ impl Smugglr {
 
     /// `smugglr sync source target`, reading its config and keeping its memory in `work`. A
     /// dry run must move nothing.
-    fn sync(
+    pub(crate) fn sync(
         &self,
         source: &OsStr,
         target: &OsStr,
