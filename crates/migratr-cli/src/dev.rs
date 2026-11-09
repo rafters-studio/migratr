@@ -566,14 +566,19 @@ pub(crate) fn objects(read: &Value) -> Result<Vec<Object>, CliError> {
 /// Runs, in one transaction and in the place's order, the place's own statement of each object
 /// whose type `wanted` takes. An object with no statement, such as a `sqlite_autoindex`, and
 /// D1's own table are not the place's and are skipped, and so is one the replay has already
-/// made, such as a full-text table's shadow tables.
+/// made, such as a full-text table's shadow tables. Virtual tables run first: each makes its
+/// own shadow tables, which a place written by VACUUM INTO lists before it.
 fn replay(
     conn: &Connection,
     objects: &[Object],
     wanted: impl Fn(&str) -> bool,
 ) -> rusqlite::Result<()> {
+    let virtual_tables = virtual_tables(objects);
+    let (first, rest): (Vec<&Object>, Vec<&Object>) = objects
+        .iter()
+        .partition(|o| o.kind == "table" && virtual_tables.contains(&o.name.as_str()));
     let tx = conn.unchecked_transaction()?;
-    for object in objects {
+    for object in first.into_iter().chain(rest) {
         if !wanted(&object.kind) || object.name == D1_TABLE || object.tbl_name == D1_TABLE {
             continue;
         }
