@@ -310,7 +310,7 @@ pub(crate) fn index_names_column(sql: &str, ident: &str) -> bool {
 
 /// Whether `sql` contains `keyword` as a bare word. A quoted identifier spelled the same way
 /// does not count.
-pub(crate) fn has_keyword(sql: &str, keyword: &str) -> bool {
+pub fn has_keyword(sql: &str, keyword: &str) -> bool {
     tokens(sql).iter().any(|t| t.is_keyword(keyword))
 }
 

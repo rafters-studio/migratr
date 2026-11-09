@@ -7,7 +7,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use migratr::{DevSnapshot, Note, RusqliteExecutor, load_dir, record_note, snapshot_for_dev, up};
+use migratr::{
+    DevSnapshot, Note, RusqliteExecutor, has_keyword, load_dir, record_note, snapshot_for_dev, up,
+};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -32,7 +34,9 @@ const LEDGER_TABLE: &str = "_migratr_migrations";
 /// and views to a new database, and puts it in place of the local database `db`, keeping the
 /// old one as a snapshot. The result is snapshotted, checked against the local database with
 /// `smugglr sync --dryrun`, and recorded in the ledger as the rewind point, beside the place's
-/// fingerprint. Nothing changes until smugglr has been found with exec and the place read.
+/// fingerprint. Nothing changes until smugglr has been found with exec and the place read, and
+/// a place with an AUTOINCREMENT table is refused before anything changes. The local database
+/// is replaced last, so a failure at any step leaves it and its ledger as they were.
 ///
 /// The first dev against a place with tables and no ledger adopts it when its shape, compared by
 /// structure, is what the migrations in `dir` make, and records every migration; otherwise it
@@ -50,6 +54,7 @@ pub fn dev(db: &Path, dir: &Path, settings: &Settings) -> Result<Outcome, CliErr
     };
     let read = smugglr.read(OsStr::new(place))?;
     let objects = objects(&read)?;
+    refuse_autoincrement(&objects)?;
     let fingerprint = read["fingerprint"].as_str().unwrap_or_default().to_string();
 
     let local_ledger = local
@@ -106,9 +111,10 @@ pub fn dev(db: &Path, dir: &Path, settings: &Settings) -> Result<Outcome, CliErr
     }
     fs::create_dir_all(&work).map_err(fresh)?;
     let made = make(db, place, &smugglr, &work, &objects, &ledger, &fingerprint);
-    let removed = fs::remove_dir_all(&work).map_err(fresh);
+    // The local database has been replaced by now, so a work directory that cannot be removed
+    // fails nothing: the next run clears it.
+    let _ = fs::remove_dir_all(&work);
     let mut outcome = made?;
-    removed?;
     outcome.fields["adopted"] = json!(adopted.is_some());
     if let Some(count) = adopted {
         outcome.text = format!(
@@ -125,6 +131,28 @@ pub fn dev(db: &Path, dir: &Path, settings: &Settings) -> Result<Outcome, CliErr
 pub fn discover(db: &Path, settings: &Settings, json: bool) -> Result<Outcome, CliError> {
     let place = place(settings, "dev")?;
     Smugglr::find().discover(db.as_os_str(), OsStr::new(place), json)
+}
+
+/// Refuses a place with an AUTOINCREMENT table, naming each: migratr allows no auto columns.
+fn refuse_autoincrement(objects: &[Object]) -> Result<(), CliError> {
+    let tables: Vec<&str> = objects
+        .iter()
+        .filter(|o| {
+            o.kind == "table"
+                && o.sql
+                    .as_deref()
+                    .is_some_and(|sql| has_keyword(sql, "AUTOINCREMENT"))
+        })
+        .map(|o| o.name.as_str())
+        .collect();
+    if tables.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::AutoIncrement(format!(
+        "the place has AUTOINCREMENT in table {}, and migratr allows no auto columns; nothing \
+         changed",
+        tables.join(", table ")
+    )))
 }
 
 pub(crate) fn place<'a>(settings: &'a Settings, command: &str) -> Result<&'a str, CliError> {
@@ -227,7 +255,19 @@ fn make(
     ledger: &[Value],
     fingerprint: &str,
 ) -> Result<Outcome, CliError> {
-    copy_config(work)?;
+    // A virtual table, such as a full-text table, has no primary key for smugglr to sync by: its
+    // rows come through its shadow tables, and it is ignored.
+    let virtual_tables: Vec<&str> = objects
+        .iter()
+        .filter(|o| {
+            o.kind == "table"
+                && o.sql
+                    .as_deref()
+                    .is_some_and(|sql| has_keyword(sql, "VIRTUAL"))
+        })
+        .map(|o| o.name.as_str())
+        .collect();
+    copy_config(work, &virtual_tables)?;
     let staged = work.join("dev.db");
     // Tables first, rows second, then indexes, triggers and views, so no trigger fires on a
     // copied row.
@@ -251,8 +291,23 @@ fn make(
         })?;
     }
 
+    // The rewind point is snapshotted and checked on the staged database, so nothing that can
+    // fail comes after the local database is replaced.
+    let rewind = snapshot_for_dev(db, &staged, DevSnapshot::RewindPoint)?;
+    let bytes = fs::read(&rewind).map_err(|source| CliError::Io {
+        path: rewind.clone(),
+        source,
+    })?;
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    smugglr.sync(rewind.as_os_str(), staged.as_os_str(), work, true)?;
+    let point = json!({ "snapshot": rewind, "sha256": sha256 });
+    {
+        let mut exec = RusqliteExecutor::new(Connection::open(&staged)?);
+        record_note(&mut exec, Note::RewindPoint, &point.to_string())?;
+    }
+
     let kept = if db.exists() {
-        Some(snapshot_for_dev(db, DevSnapshot::Replaced)?)
+        Some(snapshot_for_dev(db, db, DevSnapshot::Replaced)?)
     } else {
         None
     };
@@ -271,18 +326,7 @@ fn make(
         path: db.to_path_buf(),
         source,
     })?;
-    remember(db, place, smugglr)?;
-
-    let rewind = snapshot_for_dev(db, DevSnapshot::RewindPoint)?;
-    let bytes = fs::read(&rewind).map_err(|source| CliError::Io {
-        path: rewind.clone(),
-        source,
-    })?;
-    let sha256 = format!("{:x}", Sha256::digest(&bytes));
-    smugglr.sync(rewind.as_os_str(), db.as_os_str(), work, true)?;
-    let point = json!({ "snapshot": rewind, "sha256": sha256 });
-    let mut exec = RusqliteExecutor::new(Connection::open(db)?);
-    record_note(&mut exec, Note::RewindPoint, &point.to_string())?;
+    remember(db, place, smugglr, &virtual_tables)?;
 
     let mut lines = Vec::new();
     if let Some(path) = &kept {
@@ -304,7 +348,7 @@ fn make(
 /// so the pair's memory, kept in [`pair_dir`], holds the rows the rewind point holds. up --smuggl
 /// syncs the rewind point, put back at `db`'s own path, with that memory, so the place's changes
 /// since dev arrive, deletes included. The memory starts empty.
-fn remember(db: &Path, place: &str, smugglr: &Smugglr) -> Result<(), CliError> {
+fn remember(db: &Path, place: &str, smugglr: &Smugglr, ignored: &[&str]) -> Result<(), CliError> {
     let pair = pair_dir(db);
     let fresh = |e: io::Error| CliError::Io {
         path: pair.clone(),
@@ -314,7 +358,7 @@ fn remember(db: &Path, place: &str, smugglr: &Smugglr) -> Result<(), CliError> {
         fs::remove_dir_all(&pair).map_err(fresh)?;
     }
     fs::create_dir_all(&pair).map_err(fresh)?;
-    copy_config(&pair)?;
+    copy_config(&pair, ignored)?;
     smugglr.sync(address(db)?.as_os_str(), OsStr::new(place), &pair, false)
 }
 
@@ -423,7 +467,8 @@ fn objects(read: &Value) -> Result<Vec<Object>, CliError> {
 
 /// Runs, in one transaction and in the place's order, the place's own statement of each object
 /// whose type `wanted` takes. An object with no statement, such as a `sqlite_autoindex`, and
-/// D1's own table are not the place's and are skipped.
+/// D1's own table are not the place's and are skipped, and so is one the replay has already
+/// made, such as a full-text table's shadow tables.
 fn replay(
     conn: &Connection,
     objects: &[Object],
@@ -434,7 +479,12 @@ fn replay(
         if !wanted(&object.kind) || object.name == D1_TABLE || object.tbl_name == D1_TABLE {
             continue;
         }
-        if let Some(sql) = &object.sql {
+        let made: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = ?1)",
+            [&object.name],
+            |row| row.get(0),
+        )?;
+        if let Some(sql) = object.sql.as_ref().filter(|_| !made) {
             tx.execute_batch(sql)?;
         }
     }
@@ -442,28 +492,62 @@ fn replay(
 }
 
 /// Copies smugglr's config file, which holds its ignore list, into `work`, where dev's syncs
-/// read it. Their memory then stays in `work` and goes with it: a remembered pair would take a
-/// new, empty database for rows deleted and delete them from the place.
-pub(crate) fn copy_config(work: &Path) -> Result<(), CliError> {
+/// read it, with `ignored` added to the list. Their memory then stays in `work` and goes with
+/// it: a remembered pair would take a new, empty database for rows deleted and delete them from
+/// the place.
+pub(crate) fn copy_config(work: &Path, ignored: &[&str]) -> Result<(), CliError> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
-    let Some(source) = base.map(|b| b.join("smugglr").join("config.toml")) else {
-        return Ok(());
+    let source = base
+        .map(|b| b.join("smugglr").join("config.toml"))
+        .filter(|s| s.is_file());
+    let text = match &source {
+        Some(path) => fs::read_to_string(path).map_err(|e| CliError::Io {
+            path: path.clone(),
+            source: e,
+        })?,
+        None if ignored.is_empty() => return Ok(()),
+        None => String::new(),
     };
-    if !source.is_file() {
-        return Ok(());
-    }
     let dir = work.join("smugglr");
     let target = dir.join("config.toml");
     fs::create_dir_all(&dir)
-        .and_then(|()| fs::copy(&source, &target))
-        .map(|_| ())
+        .and_then(|()| fs::write(&target, with_ignored(&text, ignored)))
         .map_err(|e| CliError::Io {
             path: target,
             source: e,
         })
+}
+
+/// The config `text` with `names` added to its top-level ignore list, which is made when it has
+/// none.
+fn with_ignored(text: &str, names: &[&str]) -> String {
+    if names.is_empty() {
+        return text.to_string();
+    }
+    let quoted: Vec<String> = names
+        .iter()
+        .map(|n| format!("\"{}\"", n.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    let quoted = quoted.join(", ");
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    for line in &mut lines {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            // A table header: the top level, where ignore lives, has ended.
+            break;
+        }
+        let is_ignore = trimmed
+            .strip_prefix("ignore")
+            .is_some_and(|rest| rest.trim_start().starts_with('='));
+        if let Some(open) = line.find('[').filter(|_| is_ignore) {
+            line.insert_str(open + 1, &format!("{quoted}, "));
+            return lines.join("\n") + "\n";
+        }
+    }
+    format!("ignore = [{quoted}]\n{text}")
 }
 
 /// The smugglr binary: the one SMUGGLR names, else `smugglr` on PATH.
@@ -653,6 +737,10 @@ impl Smugglr {
         command.arg("sync").arg(source).arg(target).arg("--json");
         if dryrun {
             command.arg("--dryrun");
+        } else {
+            // The target holds only the rows its replay made, such as a full-text table's
+            // shadow rows, and the place's copy is the one dev brings.
+            command.args(["--sync-mode", "source"]);
         }
         let output = command
             .env("XDG_CONFIG_HOME", work)
@@ -685,4 +773,26 @@ fn moves_nothing(output: &Output) -> bool {
             .as_object()
             .is_some_and(|tables| tables.values().all(|t| t["status"] == "in step"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_ignored;
+
+    #[test]
+    fn ignored_names_join_an_ignore_list_or_make_one() {
+        assert_eq!(
+            with_ignored("ignore = [\"b\"]\n[mesh]\nport = 1\n", &["docs"]),
+            "ignore = [\"docs\", \"b\"]\n[mesh]\nport = 1\n"
+        );
+        assert_eq!(
+            with_ignored("[mesh]\nignore = [\"x\"]\n", &["docs", "notes"]),
+            "ignore = [\"docs\", \"notes\"]\n[mesh]\nignore = [\"x\"]\n"
+        );
+        assert_eq!(with_ignored("", &["docs"]), "ignore = [\"docs\"]\n");
+        assert_eq!(
+            with_ignored("steering = \"t\"\n", &[]),
+            "steering = \"t\"\n"
+        );
+    }
 }

@@ -38,6 +38,7 @@ pub use rebuild::rebuild_tables;
 pub use scaffold::scaffold;
 pub use schema_file::write_schema;
 pub use snapshot::{DevSnapshot, RestoreReport};
+pub use sql_ddl::has_keyword;
 pub use up::{UpReport, up};
 
 #[cfg(feature = "rusqlite")]

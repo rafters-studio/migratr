@@ -45,6 +45,18 @@ struct World {
     env: Vec<(String, String)>,
     /// The rewind point dev recorded, before the step under test.
     rewind: Option<PathBuf>,
+    /// Each run of a step that runs dev more than once, with the local database before and
+    /// after it.
+    dev_runs: Vec<DevRun>,
+}
+
+/// One run of migratr dev, with the local database's bytes and rewind-point rows before and
+/// after it.
+struct DevRun {
+    exit: Option<i32>,
+    output: String,
+    before: (Option<Vec<u8>>, Vec<String>),
+    after: (Option<Vec<u8>>, Vec<String>),
 }
 
 #[rstest::fixture]
@@ -68,6 +80,7 @@ fn world() -> World {
         files: Vec::new(),
         env: Vec::new(),
         rewind: None,
+        dev_runs: Vec::new(),
     }
 }
 
@@ -967,12 +980,10 @@ fn dev_has_run(world: &mut World) {
 
 #[when("the agent runs migratr dev again")]
 fn runs_dev_again(world: &mut World) {
-    next_second();
     run_dev(world);
 }
 
-/// Waits for the next second. Two runs in the same second name their snapshots alike, which
-/// rafters-studio/migratr#86 fixes.
+/// Waits for the start of the next second.
 fn next_second() {
     let second = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1983,6 +1994,117 @@ fn a_down_from_a_rewind_point_behind_the_place_stops(mut world: World) {
         vec![20_260_201_000_000]
     );
     assert_eq!(rows(&place, "SELECT tag FROM notes LIMIT 1"), vec!["keep"]);
+}
+
+#[given("a place file with an AUTOINCREMENT table")]
+fn place_with_autoincrement(world: &mut World) {
+    fresh_place(
+        world,
+        "CREATE TABLE counter (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+         INSERT INTO counter (v) VALUES ('x');",
+    );
+}
+
+#[then("the output names the AUTOINCREMENT table")]
+fn names_autoincrement_table(world: &mut World) {
+    assert_eq!(world.exit, Some(1), "{}", world.stderr);
+    assert!(
+        world
+            .stderr
+            .contains("the place has AUTOINCREMENT in table counter"),
+        "{}",
+        world.stderr
+    );
+}
+
+#[given("instead a place file with an FTS5 table holding two rows")]
+fn place_with_fts5(world: &mut World) {
+    fresh_place(
+        world,
+        "CREATE VIRTUAL TABLE docs USING fts5(body);
+         INSERT INTO docs (body) VALUES ('first note'), ('second note');",
+    );
+}
+
+#[then("the local database holds the FTS5 table and its two rows")]
+fn holds_fts5_rows(world: &mut World) {
+    dev_ready(world);
+    assert_eq!(
+        rows(&app_db(world), "SELECT body FROM docs ORDER BY body"),
+        vec!["first note", "second note"]
+    );
+    assert_eq!(
+        rows(
+            &app_db(world),
+            "SELECT body FROM docs WHERE docs MATCH 'second'"
+        ),
+        vec!["second note"]
+    );
+}
+
+#[given("a local database after migratr dev")]
+fn a_local_after_dev(world: &mut World) {
+    ensure_place(world);
+    // At the top of a fresh second, so the runs after it fall in the same second.
+    next_second();
+    run_dev(world);
+    dev_ready(world);
+}
+
+/// The local database's bytes and its rewind-point rows.
+fn local_state(world: &World) -> (Option<Vec<u8>>, Vec<String>) {
+    let db = app_db(world);
+    let bytes = std::fs::read(&db).ok();
+    let points = rows(
+        &db,
+        "SELECT checksum FROM _migratr_migrations WHERE version = 0 AND name = 'rewind_point'",
+    );
+    (bytes, points)
+}
+
+#[when("the agent runs migratr dev twice in the same second")]
+fn runs_dev_twice(world: &mut World) {
+    for _ in 0..2 {
+        let before = local_state(world);
+        let output = dev_command(world, &smugglr_bin(), None, &[])
+            .output()
+            .expect("run migratr dev");
+        let after = local_state(world);
+        world.dev_runs.push(DevRun {
+            exit: output.status.code(),
+            output: format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            before,
+            after,
+        });
+    }
+}
+
+#[then(
+    "both runs end with Dev ready, or the one that fails leaves the local database's hashes and its ledger's rewind-point row as they were before it"
+)]
+fn failed_run_leaves_local(world: &mut World) {
+    assert_eq!(world.dev_runs.len(), 2);
+    for run in &world.dev_runs {
+        if run.exit == Some(0) {
+            assert_eq!(
+                run.output.trim_end().lines().last(),
+                Some("Dev ready"),
+                "{}",
+                run.output
+            );
+        } else {
+            assert!(
+                run.after.0 == run.before.0,
+                "a failed dev changed the local database: {}",
+                run.output
+            );
+            assert_eq!(run.after.1, run.before.1, "{}", run.output);
+        }
+    }
 }
 
 scenarios!("tests", fixtures = [world: World]);
