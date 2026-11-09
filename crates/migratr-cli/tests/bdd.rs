@@ -788,6 +788,7 @@ fn migration_files(dir: &Path) -> Vec<PathBuf> {
 #[given("a migratr.jsonc with smuggl set to a local place file and safe left at its default")]
 fn settings_smuggl_safe_default(world: &mut World) {
     let place = world.root.path().join("place.db");
+    sql(&place, "CREATE TABLE a (id TEXT PRIMARY KEY);");
     let settings = serde_json::json!({ "smuggl": place }).to_string();
     write_settings(world.root.path(), &settings);
 }
@@ -827,6 +828,7 @@ fn says_no_rewind_point(world: &mut World) {
 )]
 fn each_case(world: &mut World) {
     let place = world.root.path().join("place.db");
+    sql(&place, "CREATE TABLE a (id TEXT PRIMARY KEY);");
     let cases = [
         (
             "safe_off",
