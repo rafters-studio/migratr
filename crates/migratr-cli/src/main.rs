@@ -222,6 +222,12 @@ fn error_document(command: Option<&str>, error: &CliError) -> Value {
 fn run(cli: &Cli, settings: &Settings) -> Result<Outcome, CliError> {
     match &cli.command {
         Command::New { name, specs } => {
+            if settings.safe
+                && settings.smuggl.is_some()
+                && !dev::has_rewind_point(cli.db.as_deref())?
+            {
+                return Err(CliError::NoRewindPoint);
+            }
             let path = scaffold(&cli.dir, name, specs)?;
             Ok(Outcome {
                 fields: json!({ "path": path }),

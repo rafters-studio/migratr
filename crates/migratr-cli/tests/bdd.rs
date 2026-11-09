@@ -33,6 +33,8 @@ struct World {
     smugglrs: Vec<(String, Option<PathBuf>)>,
     /// The exit code and stderr of each run of a dev step.
     runs: Vec<(Option<i32>, String)>,
+    /// The project directories a step runs migratr in, one per case.
+    cases: Vec<PathBuf>,
 }
 
 #[rstest::fixture]
@@ -52,6 +54,7 @@ fn world() -> World {
         place: None,
         smugglrs: Vec::new(),
         runs: Vec::new(),
+        cases: Vec::new(),
     }
 }
 
@@ -755,6 +758,126 @@ fn up_and_down_run(world: &mut World) {
     let down = migratr(world, &["down"]);
     let doc: Value = serde_json::from_slice(&down.stdout).expect("down document");
     assert_eq!(doc["reverted"].as_array().map(Vec::len), Some(1), "{doc}");
+}
+
+/// The ledger migratr makes, as `CREATE_LEDGER` writes it.
+const LEDGER: &str = "CREATE TABLE _migratr_migrations (version INTEGER PRIMARY KEY, \
+    name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL, up_hash TEXT, \
+    down_hash TEXT);";
+
+/// A ledger in `db` holding a rewind point, as migratr dev records it.
+fn ledger_with_rewind_point(db: &Path) {
+    sql(
+        db,
+        &format!(
+            "{LEDGER} INSERT INTO _migratr_migrations VALUES (0, 'rewind_point', \
+             '{{\"snapshot\":\"s.db\",\"sha256\":\"x\"}}', '2026-11-08T00:00:00.000Z', NULL, NULL);"
+        ),
+    );
+}
+
+fn migration_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .expect("migrations dir")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    files.sort();
+    files
+}
+
+#[given("a migratr.jsonc with smuggl set to a local place file and safe left at its default")]
+fn settings_smuggl_safe_default(world: &mut World) {
+    let place = world.root.path().join("place.db");
+    let settings = serde_json::json!({ "smuggl": place }).to_string();
+    write_settings(world.root.path(), &settings);
+}
+
+#[given("a ledger holding no rewind point")]
+fn ledger_without_rewind_point(world: &mut World) {
+    sql(&app_db(world), LEDGER);
+}
+
+#[when("the agent runs migratr new add_title")]
+fn runs_new_add_title(world: &mut World) {
+    let output = migratr(world, &["new", "add_title"]);
+    record(world, &output);
+}
+
+#[then("no migration file is written")]
+fn no_migration_written(world: &mut World) {
+    assert_eq!(world.exit, Some(1), "{}", world.stdout);
+    assert!(
+        migration_files(&world.root.path().join("migrations")).is_empty(),
+        "{}",
+        world.stdout
+    );
+}
+
+#[then("the output says there is no rewind point and to run migratr dev")]
+fn says_no_rewind_point(world: &mut World) {
+    let doc: Value = serde_json::from_str(&world.stdout).expect("stdout is one JSON document");
+    assert_eq!(doc["code"], "no_rewind_point", "{doc}");
+    let message = doc["message"].as_str().expect("message");
+    assert!(message.contains("no rewind point"), "{message}");
+    assert!(message.contains("run migratr dev"), "{message}");
+}
+
+#[given(
+    "each of: a migratr.jsonc with safe false and smuggl set; a migratr.jsonc with no smuggl; a migratr.jsonc with smuggl set and a ledger holding a rewind point"
+)]
+fn each_case(world: &mut World) {
+    let place = world.root.path().join("place.db");
+    let cases = [
+        (
+            "safe_off",
+            serde_json::json!({ "smuggl": place, "safe": false }),
+        ),
+        ("no_smuggl", serde_json::json!({ "loud": false })),
+        ("rewind_point", serde_json::json!({ "smuggl": place })),
+    ];
+    for (name, settings) in cases {
+        let dir = world.root.path().join(name);
+        std::fs::create_dir_all(dir.join("migrations")).expect("migrations dir");
+        write_settings(&dir, &settings.to_string());
+        world.cases.push(dir);
+    }
+    ledger_with_rewind_point(&world.root.path().join("rewind_point").join("app.db"));
+}
+
+#[when("the agent runs migratr new add_title in each")]
+fn runs_new_in_each(world: &mut World) {
+    for dir in &world.cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_migratr"))
+            .arg("--json")
+            .arg("--db")
+            .arg(dir.join("app.db"))
+            .arg("--dir")
+            .arg(dir.join("migrations"))
+            .args(["new", "add_title"])
+            .current_dir(dir)
+            .output()
+            .expect("run migratr");
+        world.runs.push((
+            output.status.code(),
+            String::from_utf8(output.stdout).expect("utf8 stdout"),
+        ));
+    }
+}
+
+#[then("each writes one migration file as new did before")]
+fn each_writes_one(world: &mut World) {
+    assert_eq!(world.runs.len(), 3);
+    for (dir, (exit, stdout)) in world.cases.iter().zip(&world.runs) {
+        assert_eq!(*exit, Some(0), "{}: {stdout}", dir.display());
+        let doc: Value = serde_json::from_str(stdout).expect("new document");
+        let files = migration_files(&dir.join("migrations"));
+        assert_eq!(files.len(), 1, "{}: {files:?}", dir.display());
+        assert_eq!(doc["path"].as_str(), files[0].to_str(), "{doc}");
+        assert!(
+            files[0].to_string_lossy().ends_with("_add_title.json"),
+            "{files:?}"
+        );
+    }
 }
 
 scenarios!("tests", fixtures = [world: World]);

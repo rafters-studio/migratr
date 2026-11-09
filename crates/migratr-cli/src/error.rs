@@ -21,6 +21,10 @@ pub enum CliError {
     #[error("{0}")]
     Smugglr(String),
 
+    /// Safe is on, smuggl is set and the ledger holds no rewind point.
+    #[error("there is no rewind point; run migratr dev to make one. No file was written")]
+    NoRewindPoint,
+
     #[error("{}: {source}", path.display())]
     Io {
         path: std::path::PathBuf,
@@ -55,6 +59,7 @@ impl CliError {
             CliError::Usage(_) => "usage",
             CliError::NoSmugglr(_) => "smugglr_missing",
             CliError::Smugglr(_) => "smugglr",
+            CliError::NoRewindPoint => "no_rewind_point",
             CliError::Io { .. } => "io",
         }
     }

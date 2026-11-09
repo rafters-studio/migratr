@@ -12,9 +12,9 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::Outcome;
 use crate::error::CliError;
 use crate::settings::{FILE_NAME, Settings};
+use crate::{Outcome, open_existing};
 
 /// The first smugglr release with exec.
 const SMUGGLR_WITH_EXEC: &str = "0.6.3";
@@ -63,6 +63,30 @@ pub fn dev(db: &Path, settings: &Settings) -> Result<Outcome, CliError> {
     let outcome = made?;
     removed?;
     Ok(outcome)
+}
+
+/// Whether the ledger of `db` holds the rewind point dev records. A database that is not named,
+/// does not exist or has no ledger holds none.
+pub fn has_rewind_point(db: Option<&Path>) -> Result<bool, CliError> {
+    let Some(conn) = db.map(open_existing).transpose()?.flatten() else {
+        return Ok(false);
+    };
+    let ledger: bool = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '_migratr_migrations'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !ledger {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        &format!(
+            "SELECT count(*) FROM _migratr_migrations WHERE version = {}",
+            Note::RewindPoint.version()
+        ),
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 fn make(
