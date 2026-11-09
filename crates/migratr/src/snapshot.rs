@@ -241,7 +241,7 @@ impl DevSnapshot {
     }
 }
 
-/// Copies the database at `db_path`, which no connection may hold open, among its snapshots,
+/// Copies the database at `db_path`, its WAL included, among its snapshots,
 /// named for the newest migration its ledger holds, and returns the copy's path. A rewind point
 /// sorts after any other snapshot of the same second, and pruning never removes either kind.
 #[cfg(feature = "rusqlite")]
@@ -252,7 +252,8 @@ pub fn snapshot_for_dev(db_path: &Path, kind: DevSnapshot) -> Result<PathBuf, Mi
     let conn =
         rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(executor)?;
-    let version = RusqliteExecutor::new(conn)
+    let mut exec = RusqliteExecutor::new(conn);
+    let version = exec
         .read_ledger()
         .map_err(executor)?
         .iter()
@@ -270,7 +271,16 @@ pub fn snapshot_for_dev(db_path: &Path, kind: DevSnapshot) -> Result<PathBuf, Mi
         source: Box::new(source),
     };
     fs::create_dir_all(&dir).map_err(failed)?;
-    fs::copy(db_path, &path).map_err(failed)?;
+    // VACUUM INTO, not a file copy, so writes still in a WAL are in the snapshot.
+    let target = path.to_str().ok_or_else(|| {
+        failed(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "snapshot path is not UTF-8",
+        ))
+    })?;
+    exec.connection()
+        .execute("VACUUM INTO ?1", [target])
+        .map_err(executor)?;
     Ok(path)
 }
 
@@ -401,6 +411,28 @@ mod tests {
         assert!(!old.exists());
         assert!(newest.exists());
         assert!(live.exists());
+    }
+
+    #[cfg(feature = "rusqlite")]
+    #[test]
+    fn a_dev_snapshot_holds_writes_still_in_the_wal() {
+        let dir = tempfile::TempDir::new().expect("tmp");
+        let db = dir.path().join("app.db");
+        let writer = rusqlite::Connection::open(&db).expect("open");
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;
+                 CREATE TABLE t (x TEXT); INSERT INTO t VALUES ('in the wal');",
+            )
+            .expect("write");
+
+        let copy = snapshot_for_dev(&db, DevSnapshot::Replaced).expect("snapshot");
+        let got: String = rusqlite::Connection::open(&copy)
+            .expect("open copy")
+            .query_row("SELECT x FROM t", [], |r| r.get(0))
+            .expect("row");
+        assert_eq!(got, "in the wal");
+        drop(writer);
     }
 
     #[test]
