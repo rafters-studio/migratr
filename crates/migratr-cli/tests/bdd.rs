@@ -1460,12 +1460,13 @@ fn each_says_dev(world: &mut World) {
     }
 }
 
-/// parent and child, child referencing parent, as the first migration makes them.
+/// parent and child, child referencing parent, as the first migration makes them. note is
+/// UNIQUE, so dropping it rebuilds parent with child rather than running an in-place DROP COLUMN.
 const FAMILY: &str = r#"{"up": [
   {"op": "create_table", "table": "parent", "columns": [
     {"name": "id", "type": "INTEGER", "primary_key": 1},
     {"name": "name", "type": "TEXT", "not_null": true},
-    {"name": "note", "type": "TEXT"}]},
+    {"name": "note", "type": "TEXT", "unique": true}]},
   {"op": "create_index", "name": "parent_name", "table": "parent", "columns": ["name"]},
   {"op": "create_table", "table": "child", "columns": [
     {"name": "id", "type": "INTEGER", "primary_key": 1},
