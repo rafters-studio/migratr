@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::CliError;
 use crate::settings::{FILE_NAME, Settings};
-use crate::{Outcome, open_existing};
+use crate::{Outcome, has_ledger, open_existing};
 
 /// The first smugglr release with exec.
 const SMUGGLR_WITH_EXEC: &str = "0.6.3";
@@ -71,20 +71,12 @@ pub fn has_rewind_point(db: Option<&Path>) -> Result<bool, CliError> {
     let Some(conn) = db.map(open_existing).transpose()?.flatten() else {
         return Ok(false);
     };
-    let ledger: bool = conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '_migratr_migrations'",
-        [],
-        |row| row.get(0),
-    )?;
-    if !ledger {
+    if !has_ledger(&conn)? {
         return Ok(false);
     }
     Ok(conn.query_row(
-        &format!(
-            "SELECT count(*) FROM _migratr_migrations WHERE version = {}",
-            Note::RewindPoint.version()
-        ),
-        [],
+        "SELECT count(*) > 0 FROM _migratr_migrations WHERE version = ?1",
+        [i64::try_from(Note::RewindPoint.version()).unwrap_or(i64::MAX)],
         |row| row.get(0),
     )?)
 }

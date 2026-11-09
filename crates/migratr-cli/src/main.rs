@@ -359,6 +359,15 @@ fn open_existing(db: &Path) -> Result<Option<Connection>, CliError> {
     )?))
 }
 
+/// Whether `conn` holds migratr's ledger table.
+fn has_ledger(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = '_migratr_migrations'",
+        [],
+        |row| row.get(0),
+    )
+}
+
 fn version_list(versions: &[u64]) -> String {
     if versions.is_empty() {
         return String::new();

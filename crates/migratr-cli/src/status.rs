@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Value, json};
 
 use crate::error::CliError;
-use crate::{Outcome, open_existing};
+use crate::{Outcome, has_ledger, open_existing};
 
 /// Every migration file as applied or pending, ledger rows whose file is gone, and the latest
 /// snapshot. A database that does not exist yet has nothing applied.
@@ -87,12 +87,7 @@ pub fn status(db: &Path, migrations: &[Migration]) -> Result<Outcome, CliError> 
 /// The ledger's notes, each as its kind and its JSON, in version order. None when there is no
 /// ledger.
 fn notes(conn: &Connection) -> rusqlite::Result<Vec<(String, Value)>> {
-    let ledger: bool = conn.query_row(
-        "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = '_migratr_migrations'",
-        [],
-        |row| row.get(0),
-    )?;
-    if !ledger {
+    if !has_ledger(conn)? {
         return Ok(Vec::new());
     }
     let mut found = Vec::new();
