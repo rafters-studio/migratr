@@ -1848,4 +1848,76 @@ fn a_ship_that_failed_partway_finishes_when_run_again(mut world: World) {
     assert_eq!(place, ledger_of(&world, app_db(&world).as_os_str()));
 }
 
+/// FR-MIGRATR-024, migratr#82: a down whose second revert fails on the place after the first
+/// reached it finishes when run again, once the cause is fixed.
+#[rstest::rstest]
+fn a_down_that_failed_partway_finishes_when_run_again(mut world: World) {
+    // b is in smugglr's ignore list, so its rows stay on the place: a duplicate there breaks the
+    // unique index the second revert puts back, on the place alone.
+    let config = world.root.path().join("cfg").join("smugglr");
+    std::fs::create_dir_all(&config).expect("config dir");
+    std::fs::write(config.join("config.toml"), "ignore = [\"b\"]\n").expect("config");
+    dev_against(
+        &mut world,
+        &format!(
+            "{NOTES_PLACE} CREATE TABLE b (id TEXT PRIMARY KEY, v TEXT); \
+             INSERT INTO b VALUES ('3', 'z');"
+        ),
+    );
+    add_migration(
+        &world,
+        "20260201000000",
+        "unique_b",
+        r#"{"up": [{"op": "create_index", "name": "b_v", "table": "b", "columns": ["v"], "unique": true}]}"#,
+    );
+    add_migration(
+        &world,
+        "20260202000000",
+        "drop_b_v",
+        r#"{"up": [{"op": "drop_index", "definition": {"name": "b_v", "table": "b", "columns": ["v"], "unique": true}}]}"#,
+    );
+    add_migration(
+        &world,
+        "20260203000000",
+        "add_tag",
+        r#"{"up": [{"op": "add_column", "table": "notes", "column": {"name": "tag", "type": "TEXT"}}]}"#,
+    );
+    next_second();
+    runs_up_smuggl(&mut world);
+    shipped(&world);
+    next_second();
+    run_dev(&mut world);
+    dev_ready(&world);
+
+    sql(&place_file(&world), "INSERT INTO b VALUES ('4', 'z');");
+    next_second();
+    run_smuggl(&mut world, &[&["down", "--smuggl", "--steps", "2"]]);
+    assert_ne!(world.exit, Some(0), "{}", world.stdout);
+    assert_eq!(
+        ledger_of(&world, place_file(&world).as_os_str()),
+        vec![20_260_201_000_000, 20_260_202_000_000]
+    );
+
+    sql(&place_file(&world), "DELETE FROM b WHERE id = '4';");
+    next_second();
+    run_smuggl(
+        &mut world,
+        &[&["down", "--smuggl", "--steps", "2", "--discover"]],
+    );
+    assert_eq!(world.exit, Some(0), "{}{}", world.stdout, world.stderr);
+    assert!(world.stdout.contains("20260202000000"), "{}", world.stdout);
+    assert!(!world.stdout.contains("20260203000000"), "{}", world.stdout);
+    run_smuggl(&mut world, &[&["down", "--smuggl", "--steps", "2"]]);
+    shipped(&world);
+    assert!(
+        world.stdout.contains("shipped 1 migration(s)"),
+        "{}",
+        world.stdout
+    );
+    fingerprints_equal(&mut world);
+    let place = ledger_of(&world, place_file(&world).as_os_str());
+    assert_eq!(place, vec![20_260_201_000_000]);
+    assert_eq!(place, ledger_of(&world, app_db(&world).as_os_str()));
+}
+
 scenarios!("tests", fixtures = [world: World]);

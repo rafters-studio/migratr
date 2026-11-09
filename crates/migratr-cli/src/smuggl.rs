@@ -234,8 +234,13 @@ pub fn discover(
             expected.fingerprint
         ));
     }
-    let (sync_stops, report) =
-        smugglr.report(point.snapshot.as_os_str(), OsStr::new(place), true)?;
+    // The run puts the rewind point back as the local database, with what a run that failed
+    // partway took to the place caught up on it, so the report and the plan are of that.
+    let local = expected
+        .copy
+        .as_ref()
+        .map_or(&point.snapshot, |copy| &copy.db);
+    let (sync_stops, report) = smugglr.report(local.as_os_str(), OsStr::new(place), true)?;
     let report: Value = serde_json::from_str(&report).unwrap_or(Value::Null);
     if sync_stops {
         stops.push("smugglr's --discover says a sync with the place would stop".to_string());
@@ -244,17 +249,19 @@ pub fn discover(
         String::new()
     } else {
         smugglr
-            .report(point.snapshot.as_os_str(), OsStr::new(place), false)?
+            .report(local.as_os_str(), OsStr::new(place), false)?
             .1
     };
 
-    // The run puts the rewind point back as the local database, with what a run that failed
-    // partway took to the place caught up on it, so it plans against that.
     let planned = {
-        let local = expected.copy.as_ref().map_or(&point.snapshot, |copy| &copy.db);
         let conn = Connection::open_with_flags(local, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let bytes = fs::metadata(local).map_or(0, |m| m.len());
-        match plan::plan(&conn, bytes, &migrations, expected.catch_up.after(direction)) {
+        match plan::plan(
+            &conn,
+            bytes,
+            &migrations,
+            expected.catch_up.after(direction),
+        ) {
             Ok(planned) => planned,
             Err(error) => {
                 stops.push(error.to_string());
@@ -522,9 +529,7 @@ impl CatchUp {
             Direction::Up { to } => migrations
                 .iter()
                 .map(|m| m.version)
-                .filter(|v| {
-                    held.contains(v) && !local.contains(v) && to.is_none_or(|to| *v <= to)
-                })
+                .filter(|v| held.contains(v) && !local.contains(v) && to.is_none_or(|to| *v <= to))
                 .max()
                 .map_or(CatchUp::Nothing, CatchUp::UpTo),
             Direction::Down { steps } => {
