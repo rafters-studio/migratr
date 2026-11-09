@@ -1,4 +1,4 @@
-# Generated from FR-MIGRATR-023 rev 6. Do not hand-edit: change the requirement and regenerate.
+# Generated from FR-MIGRATR-023 rev 11. Do not hand-edit: change the requirement and regenerate.
 Feature: migratr dev gets the local database ready to work against the place
 
   @criterion-01a1b3a8-887e-74e3-b23b-9a144be8724b @module-migratr-cli
@@ -69,3 +69,19 @@ Feature: migratr dev gets the local database ready to work against the place
     When the agent runs migratr dev
     Then nothing has changed
     And the output names the smuggl setting
+
+  @criterion-01a1be0b-3272-7f71-ba5b-cb6af40a6561 @module-migratr-cli
+  Scenario: dev refuses AUTOINCREMENT and brings full-text tables
+    Given a place file with an AUTOINCREMENT table
+    When the agent runs migratr dev
+    Then nothing has changed
+    And the output names the AUTOINCREMENT table
+    Given instead a place file with an FTS5 table holding two rows
+    When the agent runs migratr dev
+    Then the local database holds the FTS5 table and its two rows
+
+  @criterion-01a1be0b-3272-7f71-ba5b-cb7eeab89acb @module-migratr-cli
+  Scenario: a failed dev leaves the local database as it was
+    Given a local database after migratr dev
+    When the agent runs migratr dev twice in the same second
+    Then both runs end with Dev ready, or the one that fails leaves the local database's hashes and its ledger's rewind-point row as they were before it

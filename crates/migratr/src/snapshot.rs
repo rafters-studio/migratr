@@ -241,16 +241,22 @@ impl DevSnapshot {
     }
 }
 
-/// Copies the database at `db_path`, its WAL included, among its snapshots,
-/// named for the newest migration its ledger holds, and returns the copy's path. A rewind point
-/// sorts after any other snapshot of the same second, and pruning never removes either kind.
+/// Copies the database at `source`, its WAL included, among the snapshots of the database at
+/// `db_path`, named for the newest migration `source`'s ledger holds, and returns the copy's
+/// path. A rewind point sorts after any other snapshot of the same second, and pruning never
+/// removes either kind. When a snapshot of this second already has the name, the copy waits for
+/// the next second, so no two copies take the same name.
 #[cfg(feature = "rusqlite")]
-pub fn snapshot_for_dev(db_path: &Path, kind: DevSnapshot) -> Result<PathBuf, MigrateError> {
+pub fn snapshot_for_dev(
+    db_path: &Path,
+    source: &Path,
+    kind: DevSnapshot,
+) -> Result<PathBuf, MigrateError> {
     use crate::executor::RusqliteExecutor;
 
     let executor = |e: rusqlite::Error| MigrateError::Executor(Box::new(e));
     let conn =
-        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        rusqlite::Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(executor)?;
     let mut exec = RusqliteExecutor::new(conn);
     let version = exec
@@ -261,11 +267,23 @@ pub fn snapshot_for_dev(db_path: &Path, kind: DevSnapshot) -> Result<PathBuf, Mi
         .max()
         .unwrap_or(0);
     let dir = snapshot_dir(db_path);
-    let path = dir.join(format!(
-        "{}_{version}_{}.db",
-        timestamp(SystemTime::now()),
-        kind.as_str()
-    ));
+    let name = || {
+        dir.join(format!(
+            "{}_{version}_{}.db",
+            timestamp(SystemTime::now()),
+            kind.as_str()
+        ))
+    };
+    let mut path = name();
+    while path.exists() {
+        let into_second = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        std::thread::sleep(std::time::Duration::from_nanos(u64::from(
+            1_000_000_000 - into_second,
+        )));
+        path = name();
+    }
     let failed = |source: io::Error| MigrateError::SnapshotFailed {
         path: path.clone(),
         source: Box::new(source),
@@ -426,13 +444,32 @@ mod tests {
             )
             .expect("write");
 
-        let copy = snapshot_for_dev(&db, DevSnapshot::Replaced).expect("snapshot");
+        let copy = snapshot_for_dev(&db, &db, DevSnapshot::Replaced).expect("snapshot");
         let got: String = rusqlite::Connection::open(&copy)
             .expect("open copy")
             .query_row("SELECT x FROM t", [], |r| r.get(0))
             .expect("row");
         assert_eq!(got, "in the wal");
         drop(writer);
+    }
+
+    #[cfg(feature = "rusqlite")]
+    #[test]
+    fn two_dev_snapshots_of_one_second_take_two_names() {
+        let dir = tempfile::TempDir::new().expect("tmp");
+        let db = dir.path().join("app.db");
+        let staged = dir.path().join("staged.db");
+        rusqlite::Connection::open(&staged)
+            .expect("open")
+            .execute_batch("CREATE TABLE t (x TEXT)")
+            .expect("write");
+
+        let first = snapshot_for_dev(&db, &staged, DevSnapshot::RewindPoint).expect("first");
+        let second = snapshot_for_dev(&db, &staged, DevSnapshot::RewindPoint).expect("second");
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), Some(snapshot_dir(&db).as_path()));
+        assert!(first.exists() && second.exists());
     }
 
     #[test]

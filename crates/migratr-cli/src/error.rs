@@ -21,6 +21,10 @@ pub enum CliError {
     #[error("{0}")]
     NotAdoptable(String),
 
+    /// The place has an AUTOINCREMENT table; migratr allows no auto columns.
+    #[error("{0}")]
+    AutoIncrement(String),
+
     /// The place's fingerprint is not the one the ledger recorded.
     #[error("{0}")]
     ShapeChanged(String),
@@ -71,6 +75,7 @@ impl CliError {
             CliError::Usage(_) => "usage",
             CliError::NoSmugglr(_) => "smugglr_missing",
             CliError::NotAdoptable(_) => "not_adoptable",
+            CliError::AutoIncrement(_) => "autoincrement",
             CliError::ShapeChanged(_) => "shape_changed",
             CliError::NoRewindPoint(_) => "no_rewind_point",
             CliError::ShipFailed(_) => "ship_failed",

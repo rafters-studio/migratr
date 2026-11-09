@@ -15,7 +15,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::dev::{self, Smugglr};
+use crate::dev::{self, Smugglr, SyncRun};
 use crate::error::CliError;
 use crate::settings::{Loud, Settings};
 use crate::{Direction, Outcome, loud, plan};
@@ -102,9 +102,10 @@ pub fn smuggl(
         fs::remove_dir_all(&work).map_err(at(&work))?;
     }
     copy_tree(&pair, &work)?;
-    dev::copy_config(&work)?;
+    let objects = dev::objects(&there)?;
+    dev::copy_config(&work, &dev::virtual_tables(&objects))?;
 
-    let kept = snapshot_for_dev(db, DevSnapshot::Replaced)?;
+    let kept = snapshot_for_dev(db, db, DevSnapshot::Replaced)?;
     let mut lines = vec![format!("kept the working database as {}", kept.display())];
     let shipped = match ship(
         db,
@@ -407,7 +408,7 @@ fn ship(
     }
 
     let local = dev::address(db)?;
-    smugglr.sync(local.as_os_str(), OsStr::new(place), work, false)?;
+    smugglr.sync(local.as_os_str(), OsStr::new(place), work, SyncRun::Sync)?;
 
     let planned = {
         let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
