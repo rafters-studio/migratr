@@ -268,7 +268,7 @@ fn make(
     // Tables first, rows second, then indexes, triggers and views, so no trigger fires on a
     // copied row.
     replay(&Connection::open(&staged)?, objects, |kind| kind == "table")?;
-    smugglr.sync(OsStr::new(place), staged.as_os_str(), work, false)?;
+    smugglr.sync(OsStr::new(place), staged.as_os_str(), work, SyncRun::Bring)?;
     {
         // The note comes first: it makes the ledger when the place has none.
         let mut exec = RusqliteExecutor::new(Connection::open(&staged)?);
@@ -295,7 +295,7 @@ fn make(
         source,
     })?;
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
-    smugglr.sync(rewind.as_os_str(), staged.as_os_str(), work, true)?;
+    smugglr.sync(rewind.as_os_str(), staged.as_os_str(), work, SyncRun::Check)?;
     let point = json!({ "snapshot": rewind, "sha256": sha256 });
     {
         let mut exec = RusqliteExecutor::new(Connection::open(&staged)?);
@@ -355,7 +355,12 @@ fn remember(db: &Path, place: &str, smugglr: &Smugglr, ignored: &[&str]) -> Resu
     }
     fs::create_dir_all(&pair).map_err(fresh)?;
     copy_config(&pair, ignored)?;
-    smugglr.sync(address(db)?.as_os_str(), OsStr::new(place), &pair, false)
+    smugglr.sync(
+        address(db)?.as_os_str(),
+        OsStr::new(place),
+        &pair,
+        SyncRun::Sync,
+    )
 }
 
 /// The local database's address as smugglr is given it whenever the pair's memory is used: the
@@ -720,23 +725,26 @@ impl Smugglr {
         }
     }
 
-    /// `smugglr sync source target`, reading its config and keeping its memory in `work`. A
-    /// dry run must move nothing.
+    /// `smugglr sync source target`, reading its config and keeping its memory in `work`, run
+    /// as `run` says.
     pub(crate) fn sync(
         &self,
         source: &OsStr,
         target: &OsStr,
         work: &Path,
-        dryrun: bool,
+        run: SyncRun,
     ) -> Result<(), CliError> {
+        let dryrun = run == SyncRun::Check;
         let mut command = Command::new(&self.bin);
         command.arg("sync").arg(source).arg(target).arg("--json");
-        if dryrun {
-            command.arg("--dryrun");
-        } else {
-            // The target holds only the rows its replay made, such as a full-text table's
-            // shadow rows, and the place's copy is the one dev brings.
-            command.args(["--sync-mode", "source"]);
+        match run {
+            SyncRun::Check => {
+                command.arg("--dryrun");
+            }
+            SyncRun::Bring => {
+                command.args(["--sync-mode", "source"]);
+            }
+            SyncRun::Sync => {}
         }
         let output = command
             .env("XDG_CONFIG_HOME", work)
@@ -760,6 +768,18 @@ impl Smugglr {
             String::from_utf8_lossy(&output.stderr).trim()
         )))
     }
+}
+
+/// How a smugglr sync is run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncRun {
+    /// A dry run, which must move nothing.
+    Check,
+    /// The source's copy of a row changed in both places is kept: dev's first copy, whose
+    /// target holds only the rows its replay made, such as a full-text table's shadow rows.
+    Bring,
+    /// smugglr's default: a row changed in both places stops the sync.
+    Sync,
 }
 
 /// Whether a dry run's record has every table in step.

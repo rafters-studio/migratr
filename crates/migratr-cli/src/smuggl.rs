@@ -15,7 +15,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::dev::{self, Smugglr};
+use crate::dev::{self, Smugglr, SyncRun};
 use crate::error::CliError;
 use crate::settings::{Loud, Settings};
 use crate::{Direction, Outcome, loud, plan};
@@ -407,7 +407,7 @@ fn ship(
     }
 
     let local = dev::address(db)?;
-    smugglr.sync(local.as_os_str(), OsStr::new(place), work, false)?;
+    smugglr.sync(local.as_os_str(), OsStr::new(place), work, SyncRun::Sync)?;
 
     let planned = {
         let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
