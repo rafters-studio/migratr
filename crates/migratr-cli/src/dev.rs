@@ -135,16 +135,7 @@ pub fn discover(db: &Path, settings: &Settings, json: bool) -> Result<Outcome, C
 
 /// Refuses a place with an AUTOINCREMENT table, naming each: migratr allows no auto columns.
 fn refuse_autoincrement(objects: &[Object]) -> Result<(), CliError> {
-    let tables: Vec<&str> = objects
-        .iter()
-        .filter(|o| {
-            o.kind == "table"
-                && o.sql
-                    .as_deref()
-                    .is_some_and(|sql| has_keyword(sql, "AUTOINCREMENT"))
-        })
-        .map(|o| o.name.as_str())
-        .collect();
+    let tables = tables_with(objects, "AUTOINCREMENT");
     if tables.is_empty() {
         return Ok(());
     }
@@ -153,6 +144,20 @@ fn refuse_autoincrement(objects: &[Object]) -> Result<(), CliError> {
          changed",
         tables.join(", table ")
     )))
+}
+
+/// The names of the tables whose statement has `keyword` as a bare word.
+fn tables_with<'a>(objects: &'a [Object], keyword: &str) -> Vec<&'a str> {
+    objects
+        .iter()
+        .filter(|o| {
+            o.kind == "table"
+                && o.sql
+                    .as_deref()
+                    .is_some_and(|sql| has_keyword(sql, keyword))
+        })
+        .map(|o| o.name.as_str())
+        .collect()
 }
 
 pub(crate) fn place<'a>(settings: &'a Settings, command: &str) -> Result<&'a str, CliError> {
@@ -257,16 +262,7 @@ fn make(
 ) -> Result<Outcome, CliError> {
     // A virtual table, such as a full-text table, has no primary key for smugglr to sync by: its
     // rows come through its shadow tables, and it is ignored.
-    let virtual_tables: Vec<&str> = objects
-        .iter()
-        .filter(|o| {
-            o.kind == "table"
-                && o.sql
-                    .as_deref()
-                    .is_some_and(|sql| has_keyword(sql, "VIRTUAL"))
-        })
-        .map(|o| o.name.as_str())
-        .collect();
+    let virtual_tables = tables_with(objects, "VIRTUAL");
     copy_config(work, &virtual_tables)?;
     let staged = work.join("dev.db");
     // Tables first, rows second, then indexes, triggers and views, so no trigger fires on a
