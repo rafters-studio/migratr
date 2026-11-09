@@ -43,7 +43,9 @@ struct Shipped {
 /// Ships the migrations up to `to` to the place: snapshots the working database, puts the rewind
 /// point back at the local database's own path with dev's two notes, syncs it with the place so
 /// the place's changes since dev arrive, applies the migrations on it one at a time, and sends
-/// each one's statements, as `migratr plan` gives them, through smugglr exec. The place must end
+/// each one's statements, as `migratr plan` gives them, through smugglr exec. Migrations the
+/// place's ledger already holds, left by a run that failed partway, are applied locally before
+/// the sync and not sent again. The place must end
 /// with the local database's fingerprint, which the ledger then records. On success with
 /// autoclean on, the rewind point, its ledger row and the working database's snapshot are
 /// removed. On any failure the local database is put back at the rewind point with both notes
@@ -197,6 +199,37 @@ fn ship(
     settings: &Settings,
 ) -> Result<Shipped, CliError> {
     put_back(db, point, notes)?;
+    let recorded: Value = serde_json::from_str(&notes.fingerprint).unwrap_or(Value::Null);
+    let mut expect = recorded["fingerprint"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    // A run that failed partway left some of its migrations on the place: they are applied
+    // locally first, so both have one shape for the sync, and are not sent again.
+    let held = dev::migration_versions(
+        smugglr.read(OsStr::new(place))?["ledger"]
+            .as_array()
+            .map_or(&[][..], Vec::as_slice),
+    );
+    let applied: Vec<u64> = migratr::RusqliteExecutor::new(Connection::open(db)?)
+        .read_ledger()?
+        .into_iter()
+        .map(|row| row.version)
+        .collect();
+    let last_held = migrations
+        .iter()
+        .map(|m| m.version)
+        .filter(|v| held.contains(v) && !applied.contains(v) && to.is_none_or(|to| *v <= to))
+        .max();
+    if let Some(last_held) = last_held {
+        let mut exec = loud(settings, Connection::open(db)?);
+        up(&mut exec, migrations, Some(last_held))?;
+        write_schema(&mut exec, dir)?;
+        drop(exec);
+        expect = fingerprint(&smugglr.read(db.as_os_str())?);
+    }
+
     let local = dev::address(db)?;
     smugglr.sync(local.as_os_str(), OsStr::new(place), work, false)?;
 
@@ -205,11 +238,6 @@ fn ship(
         let bytes = fs::metadata(db).map_or(0, |m| m.len());
         plan::plan(&conn, bytes, migrations, Direction::Up { to })?
     };
-    let recorded: Value = serde_json::from_str(&notes.fingerprint).unwrap_or(Value::Null);
-    let mut expect = recorded["fingerprint"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
     let mut versions = Vec::new();
     for step in planned["steps"].as_array().into_iter().flatten() {
         let version = step["version"]

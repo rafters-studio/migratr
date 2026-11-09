@@ -854,8 +854,8 @@ fn place_fingerprint(world: &World) -> String {
     fingerprint_of(world, world.place.as_ref().expect("a place").as_os_str())
 }
 
-/// The fingerprint smugglr exec's read form gives for the database or place `address`.
-fn fingerprint_of(world: &World, address: &std::ffi::OsStr) -> String {
+/// smugglr exec's read form of the database or place `address`.
+fn read_of(world: &World, address: &std::ffi::OsStr) -> Value {
     let output = Command::new(smugglr_bin())
         .arg("exec")
         .arg(address)
@@ -863,8 +863,12 @@ fn fingerprint_of(world: &World, address: &std::ffi::OsStr) -> String {
         .envs(world.env.iter().cloned())
         .output()
         .expect("run smugglr");
-    let read: Value = serde_json::from_slice(&output.stdout).expect("read form");
-    read["fingerprint"]
+    serde_json::from_slice(&output.stdout).expect("read form")
+}
+
+/// The fingerprint smugglr exec's read form gives for the database or place `address`.
+fn fingerprint_of(world: &World, address: &std::ffi::OsStr) -> String {
+    read_of(world, address)["fingerprint"]
         .as_str()
         .expect("fingerprint")
         .to_string()
@@ -1610,6 +1614,62 @@ fn fingerprint_row_new(world: &mut World) {
         note["migrations"],
         serde_json::json!([SHIPPED.parse::<u64>().expect("version")])
     );
+}
+
+/// The migration versions in the ledger of the database or place `address`, as smugglr exec's
+/// read form gives them, without migratr dev's two notes.
+fn ledger_of(world: &World, address: &std::ffi::OsStr) -> Vec<u64> {
+    read_of(world, address)["ledger"]
+        .as_array()
+        .expect("a ledger")
+        .iter()
+        .filter_map(|row| row["version"].as_u64())
+        .filter(|v| *v > 1)
+        .collect()
+}
+
+/// FR-MIGRATR-024, migratr#91: a ship whose second migration fails on the place after the first
+/// reached it finishes when run again, once the cause is fixed.
+#[rstest::rstest]
+fn a_ship_that_failed_partway_finishes_when_run_again(mut world: World) {
+    // b is in smugglr's ignore list, so its rows stay on the place: the duplicate there breaks
+    // the second migration's unique index on the place alone.
+    let config = world.root.path().join("cfg").join("smugglr");
+    std::fs::create_dir_all(&config).expect("config dir");
+    std::fs::write(config.join("config.toml"), "ignore = [\"b\"]\n").expect("config");
+    dev_against(
+        &mut world,
+        &format!(
+            "{NOTES_PLACE} CREATE TABLE b (id TEXT PRIMARY KEY, v TEXT); \
+             INSERT INTO b VALUES ('3', 'z'), ('4', 'z');"
+        ),
+    );
+    add_tag(&world);
+    add_migration(
+        &world,
+        "20260202000000",
+        "unique_b",
+        r#"{"up": [{"op": "create_index", "name": "b_v", "table": "b", "columns": ["v"], "unique": true}]}"#,
+    );
+
+    runs_up_smuggl(&mut world);
+    assert_ne!(world.exit, Some(0), "{}", world.stdout);
+    place_holds_shipped(&world);
+    assert_eq!(ledger_of(&world, place_file(&world).as_os_str()).len(), 1);
+
+    sql(&place_file(&world), "DELETE FROM b WHERE id = '4';");
+    next_second();
+    runs_up_smuggl(&mut world);
+    shipped(&world);
+    assert!(
+        world.stdout.contains("shipped 1 migration(s)"),
+        "{}",
+        world.stdout
+    );
+    fingerprints_equal(&mut world);
+    let place = ledger_of(&world, place_file(&world).as_os_str());
+    assert_eq!(place, vec![20_260_201_000_000, 20_260_202_000_000]);
+    assert_eq!(place, ledger_of(&world, app_db(&world).as_os_str()));
 }
 
 scenarios!("tests", fixtures = [world: World]);
