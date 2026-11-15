@@ -84,6 +84,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install the latest release with install.ps1
         run: Get-Content -Raw install.ps1 | Invoke-Expression
+      - name: Install again, replacing the first install
+        run: Get-Content -Raw install.ps1 | Invoke-Expression
       - name: migratr --version from the user PATH
         run: |
           $env:Path = [Environment]::GetEnvironmentVariable('Path', 'User') + ';' + $env:Path

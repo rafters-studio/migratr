@@ -229,7 +229,8 @@
 
     try {
       if (Test-Path -LiteralPath $target) {
-        [System.IO.File]::Replace($staged, $target, $null)
+        # A bare $null would reach .NET as "" and fail; NullString passes a real null (no backup).
+        [System.IO.File]::Replace($staged, $target, [System.Management.Automation.Language.NullString]::Value)
       } else {
         [System.IO.File]::Move($staged, $target)
       }
