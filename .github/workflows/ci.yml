@@ -86,6 +86,27 @@ jobs:
         run: Get-Content -Raw install.ps1 | Invoke-Expression
       - name: Install again, replacing the first install
         run: Get-Content -Raw install.ps1 | Invoke-Expression
+      - name: A failed install leaves the earlier install as it was
+        env:
+          MIGRATR_VERSION: v0.0.0-missing
+        run: |
+          $target = Join-Path $HOME '.local\bin\migratr.exe'
+          $before = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+          $threw = $false
+          try {
+            Get-Content -Raw install.ps1 | Invoke-Expression
+          } catch {
+            $threw = $true
+            Write-Host "caught: $($_.Exception.Message)"
+          }
+          if (-not $threw) { throw 'install.ps1 did not stop on a missing release' }
+          $after = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+          Write-Host "sha256 before: $before"
+          Write-Host "sha256 after:  $after"
+          if ($after -ne $before) { throw 'migratr.exe changed after a failed install' }
+          $left = Get-ChildItem -LiteralPath (Split-Path $target) -Filter 'migratr.staged*'
+          if ($left) { throw "staged file left behind: $($left.Name)" }
+          Write-Host 'no staged file left beside migratr.exe'
       - name: migratr --version from the user PATH
         run: |
           $env:Path = [Environment]::GetEnvironmentVariable('Path', 'User') + ';' + $env:Path
