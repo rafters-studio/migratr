@@ -71,3 +71,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bash scripts/test-install.sh
+
+  install-test-windows:
+    strategy:
+      matrix:
+        shell: [powershell, pwsh]
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the latest release with install.ps1
+        run: Get-Content -Raw install.ps1 | Invoke-Expression
+      - name: migratr --version from the user PATH
+        run: |
+          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'User') + ';' + $env:Path
+          migratr --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
